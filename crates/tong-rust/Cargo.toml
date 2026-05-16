@@ -1,13 +1,12 @@
 [package]
-name = "tong"
+name = "tong-rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A Rust-first hermetic build system with declarative manifests and extensible language rules."
+description = "Rust language backend for Tong."
 
 [dependencies]
 tong-core.workspace = true
 tong-graph.workspace = true
 tong-manifest.workspace = true
-tong-rust.workspace = true

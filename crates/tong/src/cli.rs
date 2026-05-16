@@ -1,11 +1,11 @@
-use crate::error::{IoContext, Result, TongError};
-use crate::graph::ProjectGraph;
-use crate::language::{BuildProfile, BuildRequest, LanguageBackend};
-use crate::manifest::Manifest;
-use crate::paths;
-use crate::rust_backend::RustBackend;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tong_core::error::{IoContext, Result, TongError};
+use tong_core::language::{BuildProfile, BuildRequest, LanguageBackend};
+use tong_core::paths;
+use tong_graph::ProjectGraph;
+use tong_manifest::Manifest;
+use tong_rust::RustBackend;
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let args: Vec<String> = args.collect();
@@ -353,9 +353,8 @@ impl BuildCliOptions {
 
         if path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
             || path.file_name().and_then(|name| name.to_str()) == Some("Tong.toml")
+            || Path::new(&path).exists()
         {
-            path = paths::canonicalize(&path)?;
-        } else if Path::new(&path).exists() {
             path = paths::canonicalize(&path)?;
         }
 

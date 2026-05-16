@@ -1,16 +1,16 @@
-use crate::action::Action;
-use crate::cache::ActionCache;
-use crate::error::{IoContext, Result, TongError};
-use crate::exec::Executor;
-use crate::graph::{PackageKey, PackageNode, ProjectGraph};
-use crate::hash;
-use crate::language::{BuildOutput, BuildProfile, BuildRequest, LanguageBackend};
-use crate::manifest::{BinTarget, LibTarget};
-use crate::paths;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tong_core::action::Action;
+use tong_core::cache::ActionCache;
+use tong_core::error::{IoContext, Result, TongError};
+use tong_core::exec::Executor;
+use tong_core::hash;
+use tong_core::language::{BuildOutput, BuildProfile, BuildRequest, LanguageBackend};
+use tong_core::paths;
+use tong_graph::{PackageKey, PackageNode, ProjectGraph};
+use tong_manifest::{BinTarget, LibTarget};
 
 #[derive(Debug)]
 pub struct RustBackend {
@@ -37,6 +37,17 @@ struct BuildScriptOutput {
     link_search: Vec<String>,
     link_libs: Vec<String>,
     generated_inputs: Vec<PathBuf>,
+}
+
+struct RustActionSpec<'a> {
+    id: String,
+    mnemonic: &'a str,
+    args: Vec<String>,
+    inputs: Vec<PathBuf>,
+    outputs: Vec<PathBuf>,
+    workdir: &'a Path,
+    request: &'a BuildRequest,
+    extra_env: &'a BTreeMap<String, String>,
 }
 
 impl RustBackend {
@@ -188,16 +199,16 @@ impl RustBackend {
 
         let extra_env = build_script_env(build_script);
 
-        let action = self.rust_action(
-            format!("rust-lib:{}", node.manifest.package.name),
-            "RustLib",
+        let action = self.rust_action(RustActionSpec {
+            id: format!("rust-lib:{}", node.manifest.package.name),
+            mnemonic: "RustLib",
             args,
             inputs,
-            vec![output.clone()],
-            &node.manifest.root,
+            outputs: vec![output.clone()],
+            workdir: &node.manifest.root,
             request,
-            &extra_env,
-        )?;
+            extra_env: &extra_env,
+        })?;
         executor.run(&action)?;
 
         Ok(BuiltLib {
@@ -271,20 +282,20 @@ impl RustBackend {
 
         let extra_env = build_script_env(build_script.as_ref());
 
-        let action = self.rust_action(
-            format!(
+        let action = self.rust_action(RustActionSpec {
+            id: format!(
                 "rust-bin:{}:{}",
                 graph.package(&graph.root)?.manifest.package.name,
                 bin.name
             ),
-            "RustBin",
+            mnemonic: "RustBin",
             args,
             inputs,
-            vec![output.clone()],
-            &node.manifest.root,
+            outputs: vec![output.clone()],
+            workdir: &node.manifest.root,
             request,
-            &extra_env,
-        )?;
+            extra_env: &extra_env,
+        })?;
         executor.run(&action)?;
 
         Ok(output)
@@ -350,16 +361,17 @@ impl RustBackend {
             node.manifest.path.clone(),
             paths::canonicalize(script_path)?,
         ];
-        let action = self.rust_action(
-            format!("build-script-compile:{}", node.manifest.package.name),
-            "RustBuildScriptCompile",
+        let empty_env = BTreeMap::new();
+        let action = self.rust_action(RustActionSpec {
+            id: format!("build-script-compile:{}", node.manifest.package.name),
+            mnemonic: "RustBuildScriptCompile",
             args,
             inputs,
-            vec![output.clone()],
-            &node.manifest.root,
+            outputs: vec![output.clone()],
+            workdir: &node.manifest.root,
             request,
-            &BTreeMap::new(),
-        )?;
+            extra_env: &empty_env,
+        })?;
         executor.run(&action)?;
         Ok(output)
     }
@@ -467,17 +479,17 @@ impl RustBackend {
             .to_owned()
     }
 
-    fn rust_action(
-        &self,
-        id: String,
-        mnemonic: &str,
-        args: Vec<String>,
-        inputs: Vec<PathBuf>,
-        outputs: Vec<PathBuf>,
-        workdir: &Path,
-        request: &BuildRequest,
-        extra_env: &BTreeMap<String, String>,
-    ) -> Result<Action> {
+    fn rust_action(&self, spec: RustActionSpec<'_>) -> Result<Action> {
+        let RustActionSpec {
+            id,
+            mnemonic,
+            args,
+            inputs,
+            outputs,
+            workdir,
+            request,
+            extra_env,
+        } = spec;
         let tmp = request
             .out_dir
             .join("tmp")
@@ -517,7 +529,7 @@ impl RustBackend {
     }
 }
 
-impl LanguageBackend for RustBackend {
+impl LanguageBackend<ProjectGraph> for RustBackend {
     fn name(&self) -> &'static str {
         "rust"
     }
@@ -736,11 +748,11 @@ fn add_dependency_args(dependencies: &[(String, BuiltLib)], args: &mut Vec<Strin
 
     let mut seen_dirs = BTreeSet::new();
     for (_, dependency) in dependencies {
-        if let Some(parent) = dependency.path.parent() {
-            if seen_dirs.insert(parent.to_path_buf()) {
-                args.push("-L".to_owned());
-                args.push(format!("dependency={}", paths::display_path(parent)));
-            }
+        if let Some(parent) = dependency.path.parent()
+            && seen_dirs.insert(parent.to_path_buf())
+        {
+            args.push("-L".to_owned());
+            args.push(format!("dependency={}", paths::display_path(parent)));
         }
     }
 

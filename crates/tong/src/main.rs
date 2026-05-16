@@ -1,17 +1,6 @@
-mod action;
-mod cache;
 mod cli;
-mod error;
-mod exec;
-mod fetch;
-mod graph;
-mod hash;
-mod language;
-mod manifest;
-mod paths;
-mod rust_backend;
 
-use crate::error::Result;
+use tong_core::error::Result;
 
 fn main() {
     if let Err(err) = run() {

@@ -1,10 +1,10 @@
-use crate::error::{IoContext, Result, TongError};
-use crate::hash::{StableHasher, hash_file};
-use crate::manifest::SourceSpec;
-use crate::paths;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tong_core::error::{IoContext, Result, TongError};
+use tong_core::hash::{StableHasher, hash_file};
+use tong_core::paths;
+use tong_manifest::SourceSpec;
 
 #[derive(Debug, Clone)]
 pub struct SourceFetcher {

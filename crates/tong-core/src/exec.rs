@@ -36,11 +36,9 @@ impl Executor {
 
         for output in &action.outputs {
             ensure_parent(output)?;
-            if output.exists() {
-                if output.is_file() {
-                    fs::remove_file(output)
-                        .with_context(format!("failed to remove stale {}", output.display()))?;
-                }
+            if output.exists() && output.is_file() {
+                fs::remove_file(output)
+                    .with_context(format!("failed to remove stale {}", output.display()))?;
             }
         }
         if let Some(stdout) = &action.stdout {

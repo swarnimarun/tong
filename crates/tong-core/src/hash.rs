@@ -32,6 +32,12 @@ impl StableHasher {
     }
 }
 
+impl Default for StableHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn hash_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(format!("failed to read {}", path.display()))?;
     let mut hasher = StableHasher::new();

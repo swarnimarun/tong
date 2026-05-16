@@ -1,9 +1,9 @@
-use crate::error::{Result, TongError};
 use crate::fetch::SourceFetcher;
-use crate::manifest::{Dependency, DependencySource, Manifest, SourceSpec};
-use crate::paths;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use tong_core::error::{Result, TongError};
+use tong_core::paths;
+use tong_manifest::{Dependency, DependencySource, Manifest, SourceSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackageKey(pub PathBuf);

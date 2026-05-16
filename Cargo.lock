@@ -5,3 +5,37 @@ version = 4
 [[package]]
 name = "tong"
 version = "0.1.0"
+dependencies = [
+ "tong-core",
+ "tong-graph",
+ "tong-manifest",
+ "tong-rust",
+]
+
+[[package]]
+name = "tong-core"
+version = "0.1.0"
+
+[[package]]
+name = "tong-graph"
+version = "0.1.0"
+dependencies = [
+ "tong-core",
+ "tong-manifest",
+]
+
+[[package]]
+name = "tong-manifest"
+version = "0.1.0"
+dependencies = [
+ "tong-core",
+]
+
+[[package]]
+name = "tong-rust"
+version = "0.1.0"
+dependencies = [
+ "tong-core",
+ "tong-graph",
+ "tong-manifest",
+]

@@ -1,5 +1,3 @@
-use crate::error::Result;
-use crate::graph::ProjectGraph;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -30,7 +28,7 @@ pub struct BuildOutput {
     pub artifacts: Vec<PathBuf>,
 }
 
-pub trait LanguageBackend {
+pub trait LanguageBackend<G> {
     fn name(&self) -> &'static str;
-    fn build(&mut self, graph: &ProjectGraph, request: &BuildRequest) -> Result<BuildOutput>;
+    fn build(&mut self, graph: &G, request: &BuildRequest) -> crate::error::Result<BuildOutput>;
 }

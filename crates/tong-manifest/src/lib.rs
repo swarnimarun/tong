@@ -1,8 +1,8 @@
-use crate::error::{IoContext, Result, TongError};
-use crate::paths;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tong_core::error::{IoContext, Result, TongError};
+use tong_core::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestKind {
@@ -145,19 +145,16 @@ impl Manifest {
         let raw = fs::read_to_string(&path)
             .with_context(format!("failed to read manifest {}", path.display()))?;
 
-        if matches!(kind, ManifestKind::Tong) {
-            if let Some(extends) = parse_tong_extends(&path, &raw)? {
-                let base = path
-                    .parent()
-                    .ok_or_else(|| {
-                        TongError::invalid_manifest(
-                            path.clone(),
-                            "manifest has no parent directory",
-                        )
-                    })?
-                    .join(extends);
-                return Self::load(&base);
-            }
+        if matches!(kind, ManifestKind::Tong)
+            && let Some(extends) = parse_tong_extends(&path, &raw)?
+        {
+            let base = path
+                .parent()
+                .ok_or_else(|| {
+                    TongError::invalid_manifest(path.clone(), "manifest has no parent directory")
+                })?
+                .join(extends);
+            return Self::load(&base);
         }
 
         parse_manifest(path, kind, &raw)
@@ -356,7 +353,7 @@ fn discover_lib(
     }
 
     let name = optional_string(values, "name")
-        .unwrap_or_else(|| crate::paths::normalize_crate_name(&package.name));
+        .unwrap_or_else(|| paths::normalize_crate_name(&package.name));
     let path = optional_string(values, "path")
         .map(|path| root.join(path))
         .unwrap_or(default);

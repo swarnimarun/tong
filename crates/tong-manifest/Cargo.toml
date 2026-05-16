@@ -1,0 +1,10 @@
+[package]
+name = "tong-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Manifest discovery and parsing for Tong."
+
+[dependencies]
+tong-core.workspace = true

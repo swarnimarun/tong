@@ -1,0 +1,11 @@
+[book]
+title = "The Tong Book"
+authors = ["Swarnim Arun"]
+description = "Usage and project documentation for Tong."
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/swarnimarun/tong"
+edit-url-template = "https://github.com/swarnimarun/tong/edit/main/book/{path}"
+site-url = "/tong/"
