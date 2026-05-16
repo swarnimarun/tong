@@ -43,8 +43,8 @@ struct RustActionSpec<'a> {
 impl RustBackend {
     pub fn new() -> Result<Self> {
         let rustc = resolve_rustc()?;
-        let linker = paths::find_program_uncanonicalized("cc").ok();
         let rustc_version = rustc_version(&rustc)?;
+        let linker = default_linker(&rustc_version);
         Ok(Self {
             rustc,
             linker,
@@ -633,4 +633,17 @@ fn rustc_version(rustc: &Path) -> Result<String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn default_linker(rustc_version: &str) -> Option<PathBuf> {
+    let host = rustc_version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or_default();
+
+    if host.contains("msvc") {
+        None
+    } else {
+        paths::find_program_uncanonicalized("cc").ok()
+    }
 }
