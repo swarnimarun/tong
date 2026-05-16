@@ -2,6 +2,7 @@ use crate::options::{AddCliOptions, BuildCliOptions, RunCliOptions, insert_depen
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tong_core::build_state::{BuildState, collect_all_under};
 use tong_core::error::{IoContext, Result, TongError};
 use tong_core::language::{BuildRequest, LanguageBackend};
 use tong_graph::ProjectGraph;
@@ -18,6 +19,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         "fetch" => fetch(&args[1..]),
         "plan" => plan(&args[1..]),
         "clean" => clean(&args[1..]),
+        "gc" => gc(&args[1..]),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -141,6 +143,86 @@ fn clean(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn gc(args: &[String]) -> Result<()> {
+    let options = BuildCliOptions::parse(args)?;
+    let manifest_path = Manifest::discover(&options.path)?;
+    let manifest = Manifest::load(&manifest_path)?;
+    let tong_root = manifest.root.join("target/tong");
+
+    if !tong_root.exists() {
+        println!("nothing to gc; target/tong does not exist");
+        return Ok(());
+    }
+
+    let state = BuildState::load(&tong_root)?;
+    let live = state.live_paths();
+
+    if live.is_empty() {
+        eprintln!("warning: build state is empty; refusing to delete");
+        eprintln!("hint: run `tong clean` for a full reset");
+        return Ok(());
+    }
+
+    let all = collect_all_under(&tong_root)?;
+    let mut removed = 0usize;
+    let mut removed_bytes = 0u64;
+
+    for path in &all {
+        if !live.contains(path) {
+            if let Ok(meta) = path.metadata() {
+                removed_bytes += meta.len();
+            }
+            if path.is_file() {
+                if let Err(e) = fs::remove_file(path) {
+                    eprintln!("warning: failed to remove {}: {}", path.display(), e);
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    for entry in
+        fs::read_dir(&tong_root).with_context(format!("failed to read {}", tong_root.display()))?
+    {
+        let entry =
+            entry.with_context(format!("failed to read entry in {}", tong_root.display()))?;
+        let path = entry.path();
+        if path.is_dir() && path.file_name() != Some(std::ffi::OsStr::new("store")) {
+            remove_empty_dirs(&path)?;
+        }
+    }
+
+    println!("removed {removed} file(s) ({removed_bytes} bytes)");
+    Ok(())
+}
+
+fn remove_empty_dirs(dir: &Path) -> Result<()> {
+    if !dir.exists() || !dir.is_dir() {
+        return Ok(());
+    }
+    let mut has_content = false;
+    for entry in fs::read_dir(dir).with_context(format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            remove_empty_dirs(&path)?;
+            if path.exists() {
+                has_content = true;
+            }
+        } else {
+            has_content = true;
+        }
+    }
+    if !has_content {
+        fs::remove_dir(dir).with_context(format!(
+            "failed to remove empty directory {}",
+            dir.display()
+        ))?;
+    }
+    Ok(())
+}
+
 fn select_binary(artifacts: &[PathBuf], name: Option<&str>) -> Result<PathBuf> {
     let binaries = artifacts
         .iter()
@@ -194,6 +276,7 @@ USAGE:
   tong fetch [OPTIONS] [PATH]
   tong plan [OPTIONS] [PATH]
   tong clean [PATH]
+  tong gc [OPTIONS] [PATH]
 
 COMMANDS:
   add       Add a git, tar, or zip dependency source to the selected manifest
@@ -202,6 +285,7 @@ COMMANDS:
   fetch     Resolve and materialize dependency sources
   plan      Print the packages and targets Tong discovered
   clean     Remove target/tong for the selected package
+  gc        Remove stale artifacts not tracked by the latest build state
   help      Print this help
   version   Print the version
 

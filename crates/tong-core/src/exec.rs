@@ -1,4 +1,5 @@
 use crate::action::Action;
+use crate::build_state::BuildState;
 use crate::cache::{ActionCache, CacheStatus, ensure_parent};
 use crate::error::{IoContext, Result, TongError};
 use std::fs;
@@ -9,6 +10,7 @@ pub struct Executor {
     pub cache: ActionCache,
     pub workspace_root: std::path::PathBuf,
     pub verbose: bool,
+    pub tong_root: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +27,7 @@ impl Executor {
                 if self.verbose {
                     eprintln!("cached {} {}", action.mnemonic, action.id);
                 }
+                self.record_state(&key, action)?;
                 return Ok(ActionRunStatus::Cached);
             }
             CacheStatus::Miss => {}
@@ -91,6 +94,19 @@ impl Executor {
         }
 
         self.cache.store(&key, action)?;
+        self.record_state(&key, action)?;
         Ok(ActionRunStatus::Executed)
+    }
+
+    fn record_state(&self, key: &str, action: &Action) -> Result<()> {
+        let mut state = BuildState::load(&self.tong_root)?;
+        for output in &action.outputs {
+            state.record_output(output.clone());
+        }
+        if let Some(stdout) = &action.stdout {
+            state.record_stdout(stdout.clone());
+        }
+        state.record_cache_stamp(self.cache.stamp_path_for(key));
+        state.save(&self.tong_root)
     }
 }

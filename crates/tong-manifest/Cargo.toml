@@ -8,3 +8,5 @@ description = "Manifest discovery and parsing for Tong."
 
 [dependencies]
 tong-core.workspace = true
+toml.workspace = true
+serde = { version = "1", features = ["derive"] }

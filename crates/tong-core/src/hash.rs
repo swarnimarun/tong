@@ -1,25 +1,22 @@
 use crate::error::{IoContext, Result};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Debug, Clone)]
 pub struct StableHasher {
-    state: u64,
+    inner: blake3::Hasher,
 }
 
 impl StableHasher {
     pub fn new() -> Self {
-        Self { state: FNV_OFFSET }
+        Self {
+            inner: blake3::Hasher::new(),
+        }
     }
 
     pub fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(FNV_PRIME);
-        }
+        self.inner.update(bytes);
     }
 
     pub fn update_str(&mut self, value: &str) {
@@ -28,7 +25,8 @@ impl StableHasher {
     }
 
     pub fn finish_hex(&self) -> String {
-        format!("{:016x}", self.state)
+        let hasher = self.inner.clone();
+        hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -38,17 +36,28 @@ impl Default for StableHasher {
     }
 }
 
-pub fn hash_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(format!("failed to read {}", path.display()))?;
-    let mut hasher = StableHasher::new();
-    hasher.update(&bytes);
-    Ok(hasher.finish_hex())
+pub fn hash_reader<R: Read>(reader: &mut R) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context("failed to read data for hashing")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = StableHasher::new();
-    hasher.update(bytes);
-    hasher.finish_hex()
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+pub fn hash_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(format!("failed to read {}", path.display()))?;
+    Ok(hash_bytes(&bytes))
 }
 
 #[cfg(test)]
@@ -72,5 +81,21 @@ mod tests {
     fn hash_bytes_is_stable() {
         assert_eq!(hash_bytes(b"tong"), hash_bytes(b"tong"));
         assert_ne!(hash_bytes(b"tong"), hash_bytes(b"tang"));
+    }
+
+    #[test]
+    fn hash_bytes_produces_64_char_hex() {
+        let hex = hash_bytes(b"test");
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn hash_reader_matches_hash_bytes() {
+        let data = b"hello world";
+        let mut cursor = std::io::Cursor::new(data);
+        let reader_hash = hash_reader(&mut cursor).unwrap();
+        let bytes_hash = hash_bytes(data);
+        assert_eq!(reader_hash, bytes_hash);
     }
 }
