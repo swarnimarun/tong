@@ -1,0 +1,11 @@
+[package]
+name = "workspace-root"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = "1.0"

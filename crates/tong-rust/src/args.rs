@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use tong_core::hash;
 use tong_core::language::BuildProfile;
 use tong_core::paths;
 
@@ -50,6 +51,29 @@ pub(super) fn opt_level(profile: BuildProfile) -> &'static str {
         BuildProfile::Debug => "0",
         BuildProfile::Release => "3",
     }
+}
+
+pub(super) fn compute_metadata_hash(
+    package_name: &str,
+    package_version: &str,
+    features: &BTreeSet<String>,
+    host_triple: &str,
+    profile: BuildProfile,
+    crate_kind: &str,
+) -> String {
+    let mut hasher = hash::StableHasher::new();
+    hasher.update_str("tong-rust-metadata-v1");
+    hasher.update_str(package_name);
+    hasher.update_str(package_version);
+    for feature in features {
+        hasher.update_str("feature");
+        hasher.update_str(feature);
+    }
+    hasher.update_str(host_triple);
+    hasher.update_str(profile.as_str());
+    hasher.update_str(crate_kind);
+    let full = hasher.finish_hex();
+    full[..8].to_owned()
 }
 
 pub(super) fn add_dependency_args(dependencies: &[(String, BuiltLib)], args: &mut Vec<String>) {

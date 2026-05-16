@@ -7,4 +7,5 @@ repository.workspace = true
 description = "Manifest discovery and parsing for Tong."
 
 [dependencies]
+toml.workspace = true
 tong-core.workspace = true

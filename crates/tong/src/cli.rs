@@ -2,6 +2,7 @@ use crate::options::{AddCliOptions, BuildCliOptions, RunCliOptions, insert_depen
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tong_core::build_state;
 use tong_core::error::{IoContext, Result, TongError};
 use tong_core::language::{BuildRequest, LanguageBackend};
 use tong_graph::ProjectGraph;
@@ -18,6 +19,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
         "fetch" => fetch(&args[1..]),
         "plan" => plan(&args[1..]),
         "clean" => clean(&args[1..]),
+        "gc" => gc(&args[1..]),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -141,6 +143,28 @@ fn clean(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn gc(args: &[String]) -> Result<()> {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let filtered: Vec<String> = args.iter().filter(|a| *a != "--dry-run").cloned().collect();
+    let options = BuildCliOptions::parse(&filtered)?;
+    let manifest_path = Manifest::discover(&options.path)?;
+    let manifest = Manifest::load(&manifest_path)?;
+    let out_dir = manifest.root.join("target/tong");
+    let (scanned, removed) = build_state::gc(&out_dir, dry_run)?;
+    if dry_run {
+        println!(
+            "would remove {removed} of {scanned} files under {}",
+            out_dir.display()
+        );
+    } else {
+        println!(
+            "removed {removed} of {scanned} files under {}",
+            out_dir.display()
+        );
+    }
+    Ok(())
+}
+
 fn select_binary(artifacts: &[PathBuf], name: Option<&str>) -> Result<PathBuf> {
     let binaries = artifacts
         .iter()
@@ -194,6 +218,7 @@ USAGE:
   tong fetch [OPTIONS] [PATH]
   tong plan [OPTIONS] [PATH]
   tong clean [PATH]
+  tong gc [PATH] [--dry-run]
 
 COMMANDS:
   add       Add a git, tar, or zip dependency source to the selected manifest
@@ -202,6 +227,7 @@ COMMANDS:
   fetch     Resolve and materialize dependency sources
   plan      Print the packages and targets Tong discovered
   clean     Remove target/tong for the selected package
+  gc        Delete untracked files under target/tong
   help      Print this help
   version   Print the version
 
