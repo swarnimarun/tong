@@ -40,7 +40,7 @@ mdbook build book
 
 ## Status
 
-Tong 0.1.0 is an MVP. It supports explicit Rust compile actions, source
+Tong 0.1.1 is the current MVP release. It supports explicit Rust compile actions, source
 materialization from fixed sources, basic build scripts, proc-macro crates, and
 per-action cache keys. It does not yet implement crates.io resolution, native
 dependency fetching, OS-level sandboxing, or remote caching.

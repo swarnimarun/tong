@@ -17,6 +17,11 @@ All notable changes to Tong are documented in this file.
 - Expanded PR CI to validate tests and smoke builds across Linux, macOS, and
   Windows.
 
+### Fixed
+
+- Corrected the default linker selection for Rust MSVC builds on Windows.
+- Fixed Linux CI issues on Ubuntu and a Windows proc-macro regression.
+
 ## 0.1.0 - Initial MVP
 
 Tong 0.1.0 is the first experimental release of a Rust-first hermetic build

@@ -9,6 +9,8 @@
 - Internal cleanup split large implementation files into smaller private
   modules without changing public crate APIs.
 - CI now validates tests and smoke builds across Linux, macOS, and Windows.
+- Fixed the default linker selection for Rust MSVC builds on Windows.
+- Fixed Ubuntu CI issues and a Windows proc-macro regression.
 
 ## 0.1.0
 
