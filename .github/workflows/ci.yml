@@ -46,6 +46,10 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
+      - name: Install Linux linker tools
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y binutils
+
       - name: Smoke build simple project
         run: cargo run -p tong -- build examples/simple-rust-project
 

@@ -238,15 +238,17 @@ mod tests {
 
     #[test]
     fn requires_bin_name_for_multiple_binary_artifacts() {
+        let one = executable_name("one");
+        let two = executable_name("two");
         let artifacts = vec![
-            PathBuf::from("target/tong/debug/bin/one"),
-            PathBuf::from("target/tong/debug/bin/two"),
+            PathBuf::from("target/tong/debug/bin").join(&one),
+            PathBuf::from("target/tong/debug/bin").join(&two),
         ];
 
         assert!(select_binary(&artifacts, None).is_err());
         assert_eq!(
             select_binary(&artifacts, Some("two")).unwrap(),
-            PathBuf::from("target/tong/debug/bin/two")
+            PathBuf::from("target/tong/debug/bin").join(two)
         );
     }
 }
