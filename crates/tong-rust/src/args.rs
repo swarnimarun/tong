@@ -45,6 +45,11 @@ pub(super) fn add_profile_args(profile: BuildProfile, args: &mut Vec<String>) {
     }
 }
 
+pub(super) fn add_metadata_hash(metadata_hash: &str, args: &mut Vec<String>) {
+    args.push("-C".to_owned());
+    args.push(format!("metadata={metadata_hash}"));
+}
+
 pub(super) fn opt_level(profile: BuildProfile) -> &'static str {
     match profile {
         BuildProfile::Debug => "0",

@@ -1,6 +1,6 @@
 use crate::args::{
-    BuiltLib, add_dependency_args, add_feature_args, add_profile_args, opt_level,
-    rust_lib_output_name,
+    BuiltLib, add_dependency_args, add_feature_args, add_metadata_hash, add_profile_args,
+    opt_level, rust_lib_output_name,
 };
 use crate::build_script::{
     BuildScriptOutput, add_build_script_args, build_script_env, parse_build_script_stdout,
@@ -65,6 +65,7 @@ impl RustBackend {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
             verbose: request.verbose,
+            tong_root: request.out_dir.clone(),
         };
 
         let mut artifacts = Vec::new();
@@ -142,8 +143,15 @@ impl RustBackend {
         executor: &Executor,
     ) -> Result<BuiltLib> {
         let crate_name = paths::normalize_crate_name(&lib.name);
-        let package_hash = hash::hash_bytes(node.key.0.to_string_lossy().as_bytes());
-        let short_hash = &package_hash[..8];
+        let metadata_hash = compute_metadata_hash(
+            &node.key.0,
+            &node.manifest.package.version,
+            &node.features,
+            &self.host_triple(),
+            request.profile,
+            if lib.proc_macro { "proc-macro" } else { "lib" },
+        );
+        let short_hash = &metadata_hash[..8];
         let output = request
             .out_dir
             .join(request.profile.as_str())
@@ -168,6 +176,7 @@ impl RustBackend {
         ];
         add_feature_args(&node.features, &mut args);
         add_profile_args(request.profile, &mut args);
+        add_metadata_hash(&metadata_hash, &mut args);
         add_dependency_args(dependencies, &mut args);
         add_build_script_args(build_script, &mut args);
         if lib.proc_macro {
@@ -649,4 +658,24 @@ fn default_linker(rustc_version: &str) -> Option<PathBuf> {
     } else {
         paths::find_program_uncanonicalized("cc").ok()
     }
+}
+
+fn compute_metadata_hash(
+    package_path: &Path,
+    version: &str,
+    features: &std::collections::BTreeSet<String>,
+    host_triple: &str,
+    profile: tong_core::language::BuildProfile,
+    crate_kind: &str,
+) -> String {
+    let mut hasher = hash::StableHasher::new();
+    hasher.update_str(&paths::display_path(package_path));
+    hasher.update_str(version);
+    for feature in features {
+        hasher.update_str(feature);
+    }
+    hasher.update_str(host_triple);
+    hasher.update_str(profile.as_str());
+    hasher.update_str(crate_kind);
+    hasher.finish_hex()
 }

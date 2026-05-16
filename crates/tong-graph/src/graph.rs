@@ -229,7 +229,11 @@ mod tests {
             build_script: None,
             lib: None,
             bins: Vec::new(),
+            tests: Vec::new(),
+            examples: Vec::new(),
             dependencies: Vec::new(),
+            build_dependencies: Vec::new(),
+            workspace: None,
         };
 
         let resolved = resolve_features(&manifest, BTreeSet::new(), true);
