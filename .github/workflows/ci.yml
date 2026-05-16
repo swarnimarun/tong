@@ -3,7 +3,27 @@ name: CI
 on:
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "examples/**"
+      - "docs/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "book/**"
   pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "examples/**"
+      - "docs/**"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "book/**"
   schedule:
     - cron: "0 4 * * 1"
 

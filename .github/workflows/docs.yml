@@ -2,8 +2,20 @@ name: Docs
 
 on:
   pull_request:
+    paths:
+      - ".github/workflows/docs.yml"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "docs/**"
+      - "book/**"
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/docs.yml"
+      - "README.md"
+      - "CHANGELOG.md"
+      - "docs/**"
+      - "book/**"
   workflow_dispatch:
 
 permissions:
