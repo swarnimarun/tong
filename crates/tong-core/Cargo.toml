@@ -7,3 +7,4 @@ repository.workspace = true
 description = "Core action, cache, execution, path, and error primitives for Tong."
 
 [dependencies]
+blake3.workspace = true

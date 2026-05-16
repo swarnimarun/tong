@@ -1,25 +1,22 @@
 use crate::error::{IoContext, Result};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
 
 #[derive(Debug, Clone)]
 pub struct StableHasher {
-    state: u64,
+    hasher: blake3::Hasher,
 }
 
 impl StableHasher {
     pub fn new() -> Self {
-        Self { state: FNV_OFFSET }
+        Self {
+            hasher: blake3::Hasher::new(),
+        }
     }
 
     pub fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(FNV_PRIME);
-        }
+        self.hasher.update(bytes);
     }
 
     pub fn update_str(&mut self, value: &str) {
@@ -28,7 +25,7 @@ impl StableHasher {
     }
 
     pub fn finish_hex(&self) -> String {
-        format!("{:016x}", self.state)
+        self.hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -40,15 +37,24 @@ impl Default for StableHasher {
 
 pub fn hash_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(format!("failed to read {}", path.display()))?;
-    let mut hasher = StableHasher::new();
-    hasher.update(&bytes);
-    Ok(hasher.finish_hex())
+    Ok(hash_bytes(&bytes))
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = StableHasher::new();
-    hasher.update(bytes);
-    hasher.finish_hex()
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+pub fn hash_reader(reader: &mut impl Read) -> std::io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(test)]
@@ -72,5 +78,11 @@ mod tests {
     fn hash_bytes_is_stable() {
         assert_eq!(hash_bytes(b"tong"), hash_bytes(b"tong"));
         assert_ne!(hash_bytes(b"tong"), hash_bytes(b"tang"));
+    }
+
+    #[test]
+    fn hash_matches_fixed_length() {
+        let result = hash_bytes(b"hello");
+        assert_eq!(result.len(), 64);
     }
 }

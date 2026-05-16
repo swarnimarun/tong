@@ -18,7 +18,12 @@ pub struct Manifest {
     pub build_script: Option<PathBuf>,
     pub lib: Option<LibTarget>,
     pub bins: Vec<BinTarget>,
+    pub tests: Vec<TestTarget>,
+    pub examples: Vec<ExampleTarget>,
     pub dependencies: Vec<Dependency>,
+    pub build_dependencies: Vec<Dependency>,
+    pub workspace: Option<Workspace>,
+    pub tong: Option<TongConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,12 +38,29 @@ pub struct LibTarget {
     pub name: String,
     pub path: PathBuf,
     pub proc_macro: bool,
+    pub required_features: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BinTarget {
     pub name: String,
     pub path: PathBuf,
+    pub required_features: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestTarget {
+    pub name: String,
+    pub path: PathBuf,
+    pub required_features: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExampleTarget {
+    pub name: String,
+    pub path: PathBuf,
+    pub required_features: Vec<String>,
+    pub crate_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +71,7 @@ pub struct Dependency {
     pub default_features: bool,
     pub optional: bool,
     pub source: DependencySource,
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,4 +100,17 @@ pub enum SourceSpec {
         strip_prefix: Option<String>,
         subdir: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub members: Vec<String>,
+    pub resolver: Option<String>,
+    pub dependencies: BTreeMap<String, Dependency>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TongConfig {
+    pub sandbox: Option<String>,
+    pub extends: Option<String>,
 }

@@ -1,0 +1,8 @@
+[package]
+name = "diamond-root"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dep-a = { path = "dep_a" }
+dep-b = { path = "dep_b" }

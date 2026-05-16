@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use tong_core::hash::StableHasher;
 use tong_core::language::BuildProfile;
 use tong_core::paths;
 
@@ -75,6 +76,29 @@ pub(super) fn add_dependency_args(dependencies: &[(String, BuiltLib)], args: &mu
             paths::display_path(&dependency.path)
         ));
     }
+}
+
+pub(super) fn metadata_hash(
+    package_name: &str,
+    package_version: &str,
+    features: &BTreeSet<String>,
+    host_triple: &str,
+    profile: BuildProfile,
+    crate_kind: &str,
+) -> String {
+    let mut hasher = StableHasher::new();
+    hasher.update_str("tong-metadata-v1");
+    hasher.update_str(package_name);
+    hasher.update_str(package_version);
+    for feature in features {
+        hasher.update_str("feature");
+        hasher.update_str(feature);
+    }
+    hasher.update_str(host_triple);
+    hasher.update_str(profile.as_str());
+    hasher.update_str(crate_kind);
+    let full = hasher.finish_hex();
+    full[..8].to_owned()
 }
 
 #[cfg(test)]
