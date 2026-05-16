@@ -1,5 +1,9 @@
 # Tong
 
+Status: experimental, vibe-coded, and not yet ready for production use.
+
+AI assisted in writing this code.
+
 Tong is an experimental Rust-first hermetic build system. The current MVP can
 build simple Rust libraries and binaries from `Cargo.toml` or `Tong.toml`
 without depending on Cargo's build execution model.
