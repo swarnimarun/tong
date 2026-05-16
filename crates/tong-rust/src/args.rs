@@ -89,7 +89,8 @@ mod tests {
         );
 
         let proc_macro = rust_lib_output_name("demo", "abcdef12", true);
-        assert!(proc_macro.starts_with("libdemo-abcdef12."));
+        assert!(proc_macro.starts_with(&format!("{}demo-abcdef12.", std::env::consts::DLL_PREFIX)));
+        assert!(proc_macro.ends_with(std::env::consts::DLL_EXTENSION));
         assert_ne!(proc_macro, "libdemo-abcdef12.rlib");
     }
 

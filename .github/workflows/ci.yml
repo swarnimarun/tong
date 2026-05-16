@@ -48,7 +48,7 @@ jobs:
 
       - name: Install Linux linker tools
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y binutils
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
       - name: Smoke build simple project
         run: cargo run -p tong -- build examples/simple-rust-project

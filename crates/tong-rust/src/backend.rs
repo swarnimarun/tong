@@ -43,7 +43,7 @@ struct RustActionSpec<'a> {
 impl RustBackend {
     pub fn new() -> Result<Self> {
         let rustc = resolve_rustc()?;
-        let linker = paths::find_program("cc").ok();
+        let linker = paths::find_program_uncanonicalized("cc").ok();
         let rustc_version = rustc_version(&rustc)?;
         Ok(Self {
             rustc,
