@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 pub struct Executor {
     pub cache: ActionCache,
     pub workspace_root: std::path::PathBuf,
+    pub build_state_root: Option<std::path::PathBuf>,
     pub verbose: bool,
 }
 
@@ -22,6 +23,14 @@ impl Executor {
         let key = action.cache_key(&self.workspace_root)?;
         match self.cache.lookup(&key, action) {
             CacheStatus::Hit => {
+                if let Some(root) = &self.build_state_root {
+                    crate::build_state::record_action(
+                        root,
+                        &action.outputs,
+                        action.stdout.as_ref(),
+                        &self.cache.stamp_path(&key),
+                    )?;
+                }
                 if self.verbose {
                     eprintln!("cached {} {}", action.mnemonic, action.id);
                 }
@@ -91,6 +100,14 @@ impl Executor {
         }
 
         self.cache.store(&key, action)?;
+        if let Some(root) = &self.build_state_root {
+            crate::build_state::record_action(
+                root,
+                &action.outputs,
+                action.stdout.as_ref(),
+                &self.cache.stamp_path(&key),
+            )?;
+        }
         Ok(ActionRunStatus::Executed)
     }
 }

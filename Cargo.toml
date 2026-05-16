@@ -19,3 +19,5 @@ tong-core = { path = "crates/tong-core" }
 tong-manifest = { path = "crates/tong-manifest" }
 tong-graph = { path = "crates/tong-graph" }
 tong-rust = { path = "crates/tong-rust" }
+blake3 = { version = "1", features = ["pure"] }
+toml = "0.8"

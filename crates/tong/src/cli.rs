@@ -14,10 +14,12 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     match command {
         "add" => add(&args[1..]),
         "build" => build(&args[1..]),
+        "test" => test(&args[1..]),
         "run" => run_binary(&args[1..]),
         "fetch" => fetch(&args[1..]),
         "plan" => plan(&args[1..]),
         "clean" => clean(&args[1..]),
+        "gc" => gc(&args[1..]),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -54,17 +56,35 @@ fn build(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn test(args: &[String]) -> Result<()> {
+    let mut args = args.to_vec();
+    if !args.iter().any(|arg| arg == "--no-run") {
+        args.push("--no-run".to_owned());
+    }
+    let mut options = BuildCliOptions::parse(&args)?;
+    options.tests = true;
+    let output = build_project(&options)?;
+    for artifact in output.artifacts {
+        println!("{}", artifact.display());
+    }
+    Ok(())
+}
+
 fn build_project(options: &BuildCliOptions) -> Result<tong_core::language::BuildOutput> {
     let manifest_path = Manifest::discover(&options.path)?;
     let manifest = Manifest::load(&manifest_path)?;
     let out_dir = manifest.root.join("target/tong");
     let graph = ProjectGraph::load(&manifest_path)?;
+    tong_core::build_state::begin(&out_dir)?;
+    record_materialized_sources(&out_dir, &graph)?;
 
     let request = BuildRequest {
         manifest_path,
         out_dir,
         profile: options.profile,
         verbose: options.verbose,
+        build_examples: options.examples,
+        build_tests: options.tests,
     };
 
     let mut backend = RustBackend::new()?;
@@ -72,6 +92,25 @@ fn build_project(options: &BuildCliOptions) -> Result<tong_core::language::Build
         eprintln!("backend {}", backend.name());
     }
     backend.build(&graph, &request)
+}
+
+fn record_materialized_sources(out_dir: &Path, graph: &ProjectGraph) -> Result<()> {
+    let source_store = out_dir.join("store/sources");
+    let roots = graph
+        .packages
+        .keys()
+        .filter_map(|key| materialized_source_root(&source_store, &key.0))
+        .collect::<Vec<_>>();
+    if !roots.is_empty() {
+        tong_core::build_state::record_paths(out_dir, roots.iter())?;
+    }
+    Ok(())
+}
+
+fn materialized_source_root(source_store: &Path, manifest_path: &Path) -> Option<PathBuf> {
+    let relative = manifest_path.strip_prefix(source_store).ok()?;
+    let first = relative.components().next()?;
+    Some(source_store.join(first.as_os_str()))
 }
 
 fn run_binary(args: &[String]) -> Result<()> {
@@ -124,6 +163,13 @@ fn plan(args: &[String]) -> Result<()> {
         for dependency in &node.dependencies {
             println!("  dep {} {}", dependency.alias, dependency.key.0.display());
         }
+        for dependency in &node.build_dependencies {
+            println!(
+                "  build-dep {} {}",
+                dependency.alias,
+                dependency.key.0.display()
+            );
+        }
     }
     Ok(())
 }
@@ -138,6 +184,25 @@ fn clean(args: &[String]) -> Result<()> {
             .with_context(format!("failed to remove {}", out_dir.display()))?;
     }
     println!("removed {}", out_dir.display());
+    Ok(())
+}
+
+fn gc(args: &[String]) -> Result<()> {
+    let options = BuildCliOptions::parse(args)?;
+    let manifest_path = Manifest::discover(&options.path)?;
+    let manifest = Manifest::load(&manifest_path)?;
+    let out_dir = manifest.root.join("target/tong");
+    let state = tong_core::build_state::BuildState::read(out_dir.clone()).map_err(|_| {
+        TongError::unsupported(format!(
+            "no usable build state at {}; run `tong build` first or use `tong clean` for a full reset",
+            out_dir.join("build-state").display()
+        ))
+    })?;
+    let removed = state.gc()?;
+    println!(
+        "removed {removed} stale artifact(s) from {}",
+        out_dir.display()
+    );
     Ok(())
 }
 
@@ -190,18 +255,22 @@ tong {}
 USAGE:
   tong add NAME SOURCE [OPTIONS]
   tong build [OPTIONS] [PATH]
+  tong test --no-run [OPTIONS] [PATH]
   tong run [OPTIONS] [PATH] [-- ARGS...]
   tong fetch [OPTIONS] [PATH]
   tong plan [OPTIONS] [PATH]
   tong clean [PATH]
+  tong gc [PATH]
 
 COMMANDS:
   add       Add a git, tar, or zip dependency source to the selected manifest
   build     Build a Rust package from Tong.toml or Cargo.toml
+  test      Compile test targets without running them
   run       Build and run a binary target
   fetch     Resolve and materialize dependency sources
   plan      Print the packages and targets Tong discovered
   clean     Remove target/tong for the selected package
+  gc        Remove stale files under target/tong using the latest build-state
   help      Print this help
   version   Print the version
 
@@ -214,6 +283,8 @@ OPTIONS:
   --no-default-features Disable dependency default features when used with `tong add`
   --release             Build with release rustc flags
   --debug               Build with debug rustc flags
+  --examples            Build example targets when used with `tong build`
+  --no-run              Compile tests without running them when used with `tong test`
   --bin NAME            Select a binary target when used with `tong run`
   -v, --verbose         Print action execution details
 ",

@@ -6,6 +6,8 @@ pub struct BuildRequest {
     pub out_dir: PathBuf,
     pub profile: BuildProfile,
     pub verbose: bool,
+    pub build_examples: bool,
+    pub build_tests: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

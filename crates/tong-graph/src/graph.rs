@@ -15,6 +15,7 @@ pub struct PackageNode {
     pub manifest: Manifest,
     pub features: BTreeSet<String>,
     pub dependencies: Vec<PackageDependency>,
+    pub build_dependencies: Vec<PackageDependency>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +43,7 @@ impl ProjectGraph {
             source_fetcher: SourceFetcher::new(store_root),
             source_overrides,
         };
-        let root = graph.load_manifest_recursive(root_manifest, BTreeSet::new(), false)?;
+        let root = graph.load_manifest_recursive(root_manifest, BTreeSet::new(), true)?;
         graph.root = root;
         graph.validate_acyclic()?;
         Ok(graph)
@@ -64,8 +65,20 @@ impl ProjectGraph {
         default_features: bool,
     ) -> Result<PackageKey> {
         let key = PackageKey(paths::canonicalize(&manifest.path)?);
-        if self.packages.contains_key(&key) {
-            return Ok(key);
+        if let Some(existing) = self.packages.get_mut(&key) {
+            let feature_resolution =
+                resolve_features(&manifest, requested_features, default_features);
+            if feature_resolution
+                .enabled_features
+                .is_subset(&existing.features)
+            {
+                return Ok(key);
+            }
+            let mut merged_features = existing.features.clone();
+            merged_features.extend(feature_resolution.enabled_features);
+            let manifest = existing.manifest.clone();
+            self.packages.remove(&key);
+            return self.load_manifest_recursive(manifest, merged_features, false);
         }
 
         for (name, spec) in &manifest.sources {
@@ -102,6 +115,33 @@ impl ProjectGraph {
                 key: dep_key,
             });
         }
+        let mut build_dependencies = Vec::new();
+        for dependency in &manifest.build_dependencies {
+            if dependency.optional
+                && !feature_resolution
+                    .optional_dependencies
+                    .contains(&dependency.alias)
+                && !feature_resolution
+                    .optional_dependencies
+                    .contains(&dependency.package)
+            {
+                continue;
+            }
+
+            let manifest_path = self.dependency_manifest_path(&manifest, dependency)?;
+            let dep_manifest = Manifest::load(&manifest_path)?;
+            let dep_features =
+                dependency_features(dependency, &feature_resolution.dependency_features);
+            let dep_key = self.load_manifest_recursive(
+                dep_manifest,
+                dep_features,
+                dependency.default_features,
+            )?;
+            build_dependencies.push(PackageDependency {
+                alias: dependency.alias.clone(),
+                key: dep_key,
+            });
+        }
 
         self.packages.insert(
             key.clone(),
@@ -110,6 +150,7 @@ impl ProjectGraph {
                 manifest,
                 features: feature_resolution.enabled_features,
                 dependencies,
+                build_dependencies,
             },
         );
 
@@ -177,6 +218,9 @@ impl ProjectGraph {
         for dependency in &node.dependencies {
             self.visit(&dependency.key, visiting, visited)?;
         }
+        for dependency in &node.build_dependencies {
+            self.visit(&dependency.key, visiting, visited)?;
+        }
 
         visiting.remove(key);
         visited.insert(key.clone());
@@ -229,7 +273,11 @@ mod tests {
             build_script: None,
             lib: None,
             bins: Vec::new(),
+            tests: Vec::new(),
+            examples: Vec::new(),
             dependencies: Vec::new(),
+            build_dependencies: Vec::new(),
+            workspace: None,
         };
 
         let resolved = resolve_features(&manifest, BTreeSet::new(), true);
@@ -299,6 +347,86 @@ helper = { path = "helper" }
             features,
             BTreeSet::from(["direct".to_owned(), "propagated".to_owned()])
         );
+    }
+
+    #[test]
+    fn reloads_package_when_later_feature_request_activates_optional_dependency() {
+        let root = temp_dir("graph-feature-union");
+        write_package(&root, "app", true);
+        write_package(&root.join("left"), "left", false);
+        write_package(&root.join("right"), "right", false);
+        write_package(&root.join("shared"), "shared", false);
+        write_package(&root.join("optional-helper"), "optional-helper", false);
+
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+left = { path = "left" }
+right = { path = "right" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("left/Cargo.toml"),
+            r#"
+[package]
+name = "left"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("right/Cargo.toml"),
+            r#"
+[package]
+name = "right"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared", features = ["use-helper"] }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("shared/Cargo.toml"),
+            r#"
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+use-helper = ["dep:optional-helper"]
+
+[dependencies]
+optional-helper = { path = "../optional-helper", optional = true }
+"#,
+        )
+        .unwrap();
+
+        let graph = ProjectGraph::load(&root.join("Cargo.toml")).unwrap();
+        let shared = graph
+            .packages
+            .values()
+            .find(|node| node.manifest.package.name == "shared")
+            .unwrap();
+
+        assert!(shared.features.contains("use-helper"));
+        assert_eq!(shared.dependencies.len(), 1);
+        assert_eq!(graph.packages.len(), 5);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_package(root: &Path, name: &str, bin: bool) {

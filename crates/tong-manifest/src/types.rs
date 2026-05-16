@@ -18,7 +18,11 @@ pub struct Manifest {
     pub build_script: Option<PathBuf>,
     pub lib: Option<LibTarget>,
     pub bins: Vec<BinTarget>,
+    pub tests: Vec<TestTarget>,
+    pub examples: Vec<ExampleTarget>,
     pub dependencies: Vec<Dependency>,
+    pub build_dependencies: Vec<Dependency>,
+    pub workspace: Option<Workspace>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +43,21 @@ pub struct LibTarget {
 pub struct BinTarget {
     pub name: String,
     pub path: PathBuf,
+    pub required_features: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestTarget {
+    pub name: String,
+    pub path: PathBuf,
+    pub required_features: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExampleTarget {
+    pub name: String,
+    pub path: PathBuf,
+    pub required_features: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,4 +96,11 @@ pub enum SourceSpec {
         strip_prefix: Option<String>,
         subdir: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub members: Vec<PathBuf>,
+    pub resolver: Option<String>,
+    pub dependencies: BTreeMap<String, Dependency>,
 }
