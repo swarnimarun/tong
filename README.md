@@ -10,6 +10,7 @@ without depending on Cargo's build execution model.
 cargo build -p tong
 cargo run -p tong -- build examples/simple-rust-project
 ./examples/simple-rust-project/target/tong/debug/bin/hello-tong
+cargo run -p tong -- run examples/simple-rust-project
 ```
 
 Inspect the package graph:

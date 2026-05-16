@@ -2,6 +2,21 @@
 
 All notable changes to Tong are documented in this file.
 
+## 0.1.1 - CLI Run And Cleanup
+
+### Added
+
+- `tong run` builds and runs a binary target, with `--bin NAME` for package
+  manifests that define multiple binaries and `--` passthrough for program
+  arguments.
+
+### Changed
+
+- Split large internal modules into smaller private modules while preserving
+  public crate APIs.
+- Expanded PR CI to validate tests and smoke builds across Linux, macOS, and
+  Windows.
+
 ## 0.1.0 - Initial MVP
 
 Tong 0.1.0 is the first experimental release of a Rust-first hermetic build

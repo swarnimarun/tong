@@ -4,13 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 4 * * 1"
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,6 +28,20 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Test
         run: cargo test --workspace --all-targets
@@ -51,3 +67,20 @@ jobs:
 
       - name: Build book
         run: mdbook build book
+
+  full-validation:
+    name: Weekly Full Validation
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch CLI mini sources
+        run: cargo run -p tong -- fetch examples/cli-mini
+
+      - name: Build CLI mini
+        run: cargo run -p tong -- build examples/cli-mini

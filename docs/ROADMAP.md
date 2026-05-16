@@ -1,38 +1,45 @@
 # Tong Roadmap
 
-Tong should grow through explicit layers. Each layer must keep the action boundary stable so Rust, Zig, Nim, Swift, JVM, and other future backends can share the same scheduler and cache.
+Tong should grow through explicit layers. Each layer must keep the action
+boundary stable so Rust, Zig, Nim, Swift, JVM, and future backends can share the
+same scheduler and cache.
 
-## Phase 1: Rust MVP
+## Current Foundation
 
-- Parse `Cargo.toml` and `Tong.toml`.
-- Discover Rust libraries and binaries.
-- Build local path dependency graphs.
-- Materialize git, tar, `.crate`, and zip dependency sources.
-- Invoke `rustc` directly.
-- Cache library and binary compile actions independently.
-- Keep action environments explicit and minimal.
-- Compile and run simple `build.rs` scripts as separate actions.
-- Compile basic proc-macro crates.
+- Five-crate workspace: CLI, core action primitives, manifest parsing, package
+  graph/source materialization, and Rust backend.
+- mdBook documentation and MIT licensing.
+- Unit tests around cache keys, manifest parsing, feature propagation, CLI
+  options, build script output parsing, and rustc argument construction.
+- CI should validate formatting and linting on Linux, then run tests and smoke
+  builds on Linux, macOS, and Windows.
 
-Status: implemented for simple Rust projects, local path dependencies, source URL dependencies, `Tong.toml`, simple `build.rs` code generation, proc-macro crates, and a clap-based CLI example.
+## Phase 1: Cleanup And Testability
 
-## Phase 2: Rust Compatibility
+- Keep public crate APIs stable while splitting large implementation files into
+  private modules.
+- Keep pure units small enough to test directly: manifest values, dependencies,
+  feature resolution, dependency source selection, rustc args, build script
+  parsing, and action cache keys.
+- Avoid adding a dedicated traits crate until an actual cycle appears. For now,
+  `tong-core` remains the shared interface layer.
 
-- Expand `build.rs` support with build-dependencies and stricter declared inputs.
-- Parse more `cargo:` build script output into structured providers.
-- Expand proc macro support and host/target separation.
-- Expand feature resolution to full Cargo-compatible unification.
-- Add test target support.
-- Add better module/input discovery from compiler dep-info.
+## Phase 2: Cargo Compatibility
 
-## Phase 3: Fixed-Output Fetching
+- Improve `Cargo.toml` and `Tong.toml` diagnostics with section/key context.
+- Expand feature resolution toward Cargo-compatible unification.
+- Add test targets, example targets, and target-specific metadata.
+- Expand `build.rs` support with build-dependencies, rerun directives,
+  generated inputs, and additional `cargo:`/`cargo::` output forms.
+- Use compiler dep-info where available to improve declared input discovery.
 
-- Harden `tong fetch`.
-- Add `Tong.lock`.
-- Support URL, archive, git, and crates.io sources.
-- Require hashes for ordinary builds.
-- Permit network only in explicit fetch/update actions.
-- Store fetched sources in a content-addressed store.
+## Phase 3: Fixed-Output Fetching And Lockfiles
+
+- Add `Tong.lock` with resolved source identity, checksums, and source metadata.
+- Make network access explicit to `tong fetch` or future update-style commands.
+- Harden git, archive, and local source handling.
+- Store sources in a content-addressed layout.
+- Add crates.io source resolution after the lockfile format exists.
 
 ## Phase 4: Native Dependencies
 
@@ -40,24 +47,26 @@ Status: implemented for simple Rust projects, local path dependencies, source UR
 - Build native dependencies in isolated actions.
 - Expose include, lib, bin, and pkg-config providers.
 - Prevent ambient system library discovery.
-- Add CMake/configure/make builders as rules, not hardcoded behavior.
+- Add CMake/configure/make builders as rules rather than hardcoded behavior.
 
 ## Phase 5: Runtime Linking
 
 - Linux: pass and patch `RUNPATH`.
 - macOS: patch install names and `LC_RPATH`.
-- Windows: compute DLL runtime closure and use copy or launcher strategies.
+- Windows: compute DLL runtime closure and choose copy or launcher strategies.
 
-## Phase 6: More Language Backends
+## Phase 6: Sandboxing
+
+- Add sandbox launchers behind a shared interface.
+- Linux: namespaces, read-only mounts, seccomp, and network namespaces.
+- macOS: sandbox profiles or a launcher process.
+- Windows: Job Objects, restricted tokens, and ACL-isolated directories.
+- Keep sandboxing optional until each platform path has reliable CI coverage.
+
+## Phase 7: More Language Backends
 
 - Add a `LanguageBackend` implementation per ecosystem.
 - Keep frontend-specific behavior isolated to rule lowering.
 - Reuse the same action model, cache, store, sandbox, and query layers.
-- Start with Zig or Nim before JVM because their compilation models are closer to Rust.
-
-## Phase 7: Hard Sandboxing
-
-- Linux: namespaces, read-only mounts, seccomp, network namespaces.
-- macOS: sandbox profiles or a launcher process.
-- Windows: Job Objects, restricted tokens, ACL-isolated directories.
-- Add undeclared input detection where the platform permits it.
+- Start with Zig or Nim before JVM because their compilation models are closer
+  to Rust.

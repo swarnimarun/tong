@@ -1,6 +1,7 @@
 name: Docs
 
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
@@ -29,15 +30,18 @@ jobs:
         run: mdbook build book
 
       - name: Configure Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
 
       - name: Upload artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: book/book
 
   deploy:
     name: Deploy GitHub Pages
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:

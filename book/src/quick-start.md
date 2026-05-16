@@ -18,6 +18,12 @@ Run the produced binary:
 ./examples/simple-rust-project/target/tong/debug/bin/hello-tong
 ```
 
+Build and run the default binary in one step:
+
+```sh
+cargo run -p tong -- run examples/simple-rust-project
+```
+
 Inspect the package graph:
 
 ```sh

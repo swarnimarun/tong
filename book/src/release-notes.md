@@ -1,5 +1,15 @@
 # Release Notes
 
+## 0.1.1
+
+- Added `tong run` to build and run binary targets in one step.
+- `tong run --bin NAME` selects a binary when a package has multiple binary
+  targets.
+- Arguments after `--` are forwarded to the selected binary.
+- Internal cleanup split large implementation files into smaller private
+  modules without changing public crate APIs.
+- CI now validates tests and smoke builds across Linux, macOS, and Windows.
+
 ## 0.1.0
 
 Tong 0.1.0 is the first experimental MVP release.

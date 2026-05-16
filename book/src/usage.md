@@ -7,6 +7,7 @@ command. If the path is omitted, discovery starts in the current directory.
 
 ```sh
 tong build [OPTIONS] [PATH]
+tong run [OPTIONS] [PATH] [-- ARGS...]
 tong fetch [OPTIONS] [PATH]
 tong plan [OPTIONS] [PATH]
 tong add NAME SOURCE [OPTIONS]
@@ -15,6 +16,10 @@ tong clean [PATH]
 
 `tong build` loads the manifest graph, lowers Rust targets into explicit
 actions, and writes outputs under `target/tong`.
+
+`tong run` builds the selected package and runs its binary target. If the package
+has more than one binary, pass `--bin NAME`. Arguments after `--` are forwarded
+to the binary.
 
 `tong fetch` resolves and materializes dependency sources without compiling.
 
@@ -33,6 +38,12 @@ manifest.
 --release
 --debug
 -v, --verbose
+```
+
+Run a specific binary and pass program arguments:
+
+```sh
+cargo run -p tong -- run examples/cli-mini --bin cli-mini -- echo hello
 ```
 
 ## Adding Source Dependencies

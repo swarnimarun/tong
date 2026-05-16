@@ -4,6 +4,7 @@ Build a project with a `Tong.toml` manifest:
 
 ```sh
 cargo run -p tong -- build examples/tong-manifest-project
+cargo run -p tong -- run examples/tong-manifest-project
 ```
 
 Build a project with a local path dependency:

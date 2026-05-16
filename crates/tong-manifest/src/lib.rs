@@ -4,83 +4,17 @@ use std::path::{Path, PathBuf};
 use tong_core::error::{IoContext, Result, TongError};
 use tong_core::paths;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestKind {
-    Cargo,
-    Tong,
-}
+mod dependency;
+mod types;
 
-#[derive(Debug, Clone)]
-pub struct Manifest {
-    pub path: PathBuf,
-    pub root: PathBuf,
-    pub kind: ManifestKind,
-    pub package: Package,
-    pub features: BTreeMap<String, Vec<String>>,
-    pub sources: BTreeMap<String, SourceSpec>,
-    pub build_script: Option<PathBuf>,
-    pub lib: Option<LibTarget>,
-    pub bins: Vec<BinTarget>,
-    pub dependencies: Vec<Dependency>,
-}
+use dependency::{dependency_table, parse_dependency, parse_source_spec};
 
-#[derive(Debug, Clone)]
-pub struct Package {
-    pub name: String,
-    pub version: String,
-    pub edition: String,
-}
+pub use types::{
+    BinTarget, Dependency, DependencySource, LibTarget, Manifest, ManifestKind, Package, SourceSpec,
+};
 
-#[derive(Debug, Clone)]
-pub struct LibTarget {
-    pub name: String,
-    pub path: PathBuf,
-    pub proc_macro: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct BinTarget {
-    pub name: String,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct Dependency {
-    pub alias: String,
-    pub package: String,
-    pub features: Vec<String>,
-    pub default_features: bool,
-    pub optional: bool,
-    pub source: DependencySource,
-}
-
-#[derive(Debug, Clone)]
-pub enum DependencySource {
-    Path(PathBuf),
-    Registry { version: String },
-    Source(SourceSpec),
-}
-
-#[derive(Debug, Clone)]
-pub enum SourceSpec {
-    Git {
-        url: String,
-        rev: Option<String>,
-        subdir: Option<String>,
-    },
-    Tar {
-        url: String,
-        sha256: Option<String>,
-        strip_prefix: Option<String>,
-        subdir: Option<String>,
-    },
-    Zip {
-        url: String,
-        sha256: Option<String>,
-        strip_prefix: Option<String>,
-        subdir: Option<String>,
-    },
-}
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Section {
@@ -393,113 +327,6 @@ fn discover_bins(
         .collect()
 }
 
-fn parse_dependency(
-    manifest: &Path,
-    root: &Path,
-    alias: String,
-    values: BTreeMap<String, TomlValue>,
-) -> Result<Dependency> {
-    let package = optional_string(&values, "package").unwrap_or_else(|| alias.clone());
-    let features = optional_string_array(&values, "features").unwrap_or_default();
-    let default_features = optional_bool(&values, "default-features").unwrap_or(true);
-    let optional = optional_bool(&values, "optional").unwrap_or(false);
-
-    let source = if let Some(path) = optional_string(&values, "path") {
-        DependencySource::Path(root.join(path))
-    } else if values.contains_key("git") {
-        DependencySource::Source(SourceSpec::Git {
-            url: required_source_url(manifest, root, &values, "git")?,
-            rev: optional_string(&values, "rev")
-                .or_else(|| optional_string(&values, "tag"))
-                .or_else(|| optional_string(&values, "branch")),
-            subdir: optional_string(&values, "subdir"),
-        })
-    } else if values.contains_key("tar") {
-        DependencySource::Source(SourceSpec::Tar {
-            url: required_source_url(manifest, root, &values, "tar")?,
-            sha256: optional_string(&values, "sha256"),
-            strip_prefix: optional_string(&values, "strip-prefix"),
-            subdir: optional_string(&values, "subdir"),
-        })
-    } else if values.contains_key("zip") {
-        DependencySource::Source(SourceSpec::Zip {
-            url: required_source_url(manifest, root, &values, "zip")?,
-            sha256: optional_string(&values, "sha256"),
-            strip_prefix: optional_string(&values, "strip-prefix"),
-            subdir: optional_string(&values, "subdir"),
-        })
-    } else if let Some(version) = optional_string(&values, "version") {
-        DependencySource::Registry { version }
-    } else {
-        DependencySource::Registry {
-            version: "*".to_owned(),
-        }
-    };
-
-    Ok(Dependency {
-        alias,
-        package,
-        features,
-        default_features,
-        optional,
-        source,
-    })
-}
-
-fn dependency_table(value: TomlValue) -> BTreeMap<String, TomlValue> {
-    match value {
-        TomlValue::InlineTable(table) => table,
-        TomlValue::String(version) => {
-            let mut table = BTreeMap::new();
-            table.insert("version".to_owned(), TomlValue::String(version));
-            table
-        }
-        other => {
-            let mut table = BTreeMap::new();
-            table.insert("version".to_owned(), other);
-            table
-        }
-    }
-}
-
-fn parse_source_spec(
-    manifest: &Path,
-    root: &Path,
-    name: String,
-    values: &BTreeMap<String, TomlValue>,
-) -> Result<(String, SourceSpec)> {
-    let spec = if values.contains_key("git") {
-        SourceSpec::Git {
-            url: required_source_url(manifest, root, values, "git")?,
-            rev: optional_string(values, "rev")
-                .or_else(|| optional_string(values, "tag"))
-                .or_else(|| optional_string(values, "branch")),
-            subdir: optional_string(values, "subdir"),
-        }
-    } else if values.contains_key("tar") {
-        SourceSpec::Tar {
-            url: required_source_url(manifest, root, values, "tar")?,
-            sha256: optional_string(values, "sha256"),
-            strip_prefix: optional_string(values, "strip-prefix"),
-            subdir: optional_string(values, "subdir"),
-        }
-    } else if values.contains_key("zip") {
-        SourceSpec::Zip {
-            url: required_source_url(manifest, root, values, "zip")?,
-            sha256: optional_string(values, "sha256"),
-            strip_prefix: optional_string(values, "strip-prefix"),
-            subdir: optional_string(values, "subdir"),
-        }
-    } else {
-        return Err(TongError::invalid_manifest(
-            manifest.to_path_buf(),
-            format!("tong source `{name}` needs git, tar, or zip"),
-        ));
-    };
-
-    Ok((name, spec))
-}
-
 fn parse_section(path: &Path, line: usize, value: &str) -> Result<Section> {
     if value.starts_with("[[") {
         if !value.ends_with("]]") {
@@ -773,33 +600,6 @@ fn optional_string(values: &BTreeMap<String, TomlValue>, key: &str) -> Option<St
     }
 }
 
-fn required_value_string(
-    path: &Path,
-    values: &BTreeMap<String, TomlValue>,
-    key: &str,
-) -> Result<String> {
-    optional_string(values, key)
-        .ok_or_else(|| TongError::invalid_manifest(path.to_path_buf(), format!("missing `{key}`")))
-}
-
-fn required_source_url(
-    path: &Path,
-    root: &Path,
-    values: &BTreeMap<String, TomlValue>,
-    key: &str,
-) -> Result<String> {
-    let value = required_value_string(path, values, key)?;
-    Ok(normalize_source_url(root, &value))
-}
-
-fn normalize_source_url(root: &Path, value: &str) -> String {
-    if value.contains("://") || Path::new(value).is_absolute() {
-        value.to_owned()
-    } else {
-        paths::display_path(&root.join(value))
-    }
-}
-
 fn optional_bool(values: &BTreeMap<String, TomlValue>, key: &str) -> Option<bool> {
     match values.get(key) {
         Some(TomlValue::Bool(value)) => Some(*value),
@@ -838,93 +638,5 @@ fn optional_string_array(values: &BTreeMap<String, TomlValue>, key: &str) -> Opt
             })
             .collect(),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn loads_cargo_manifest_with_default_targets_and_path_dependency() {
-        let root = temp_dir("manifest-cargo");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), "").unwrap();
-        fs::write(root.join("src/main.rs"), "").unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            r#"
-[package]
-name = "demo-app"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-helper = { path = "helper", features = ["fast"], default-features = false }
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest::load(&root.join("Cargo.toml")).unwrap();
-
-        assert_eq!(manifest.package.name, "demo-app");
-        assert_eq!(manifest.lib.as_ref().unwrap().name, "demo_app");
-        assert_eq!(manifest.bins[0].name, "demo-app");
-        assert_eq!(manifest.dependencies[0].alias, "helper");
-        assert_eq!(manifest.dependencies[0].features, ["fast"]);
-        assert!(!manifest.dependencies[0].default_features);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn loads_tong_manifest_source_overrides() {
-        let root = temp_dir("manifest-tong");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "").unwrap();
-        fs::write(
-            root.join("Tong.toml"),
-            r#"
-[package]
-name = "demo"
-
-[dependencies]
-dep = "1.0.0"
-
-[tong.sources.dep]
-tar = "file://fixtures/dep.crate"
-sha256 = "abc123"
-strip-prefix = "dep-1.0.0"
-"#,
-        )
-        .unwrap();
-
-        let manifest = Manifest::load(&root.join("Tong.toml")).unwrap();
-
-        assert_eq!(manifest.kind, ManifestKind::Tong);
-        assert_eq!(manifest.package.version, "0.0.0");
-        assert!(matches!(
-            manifest.dependencies[0].source,
-            DependencySource::Registry { ref version } if version == "1.0.0"
-        ));
-        assert!(matches!(
-            manifest.sources.get("dep").unwrap(),
-            SourceSpec::Tar { url, sha256, strip_prefix, .. }
-                if url.ends_with("fixtures/dep.crate")
-                    && sha256.as_deref() == Some("abc123")
-                    && strip_prefix.as_deref() == Some("dep-1.0.0")
-        ));
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("tong-{name}-{}-{nanos}", std::process::id()))
     }
 }
