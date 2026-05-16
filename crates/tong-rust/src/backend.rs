@@ -1,6 +1,6 @@
 use crate::args::{
-    BuiltLib, add_dependency_args, add_feature_args, add_profile_args, opt_level,
-    rust_lib_output_name,
+    BuiltLib, add_dependency_args, add_feature_args, add_profile_args, compute_metadata_hash,
+    opt_level, rust_lib_output_name,
 };
 use crate::build_script::{
     BuildScriptOutput, add_build_script_args, build_script_env, parse_build_script_stdout,
@@ -57,7 +57,7 @@ impl RustBackend {
     }
 
     fn build_root(&mut self, graph: &ProjectGraph, request: &BuildRequest) -> Result<BuildOutput> {
-        let executor = Executor {
+        let mut executor = Executor {
             cache: ActionCache::new(request.out_dir.join("cache/actions")),
             workspace_root: request
                 .manifest_path
@@ -65,20 +65,24 @@ impl RustBackend {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
             verbose: request.verbose,
+            build_state: tong_core::build_state::BuildState::default(),
         };
 
         let mut artifacts = Vec::new();
         let root = graph.package(&graph.root)?;
 
-        let root_lib = self.build_package_lib(graph, &graph.root, request, &executor)?;
+        let root_lib = self.build_package_lib(graph, &graph.root, request, &mut executor)?;
         if let Some(lib) = &root_lib {
             artifacts.push(lib.path.clone());
         }
 
         for bin in &root.manifest.bins {
-            let path = self.build_bin(graph, root, bin, root_lib.as_ref(), request, &executor)?;
+            let path =
+                self.build_bin(graph, root, bin, root_lib.as_ref(), request, &mut executor)?;
             artifacts.push(path);
         }
+
+        executor.save_state(&request.out_dir)?;
 
         Ok(BuildOutput { artifacts })
     }
@@ -88,7 +92,7 @@ impl RustBackend {
         graph: &ProjectGraph,
         key: &PackageKey,
         request: &BuildRequest,
-        executor: &Executor,
+        executor: &mut Executor,
     ) -> Result<Option<BuiltLib>> {
         if let Some(lib) = self.built_libs.get(key) {
             return Ok(Some(lib.clone()));
@@ -139,21 +143,27 @@ impl RustBackend {
         dependencies: &[(String, BuiltLib)],
         build_script: Option<&BuildScriptOutput>,
         request: &BuildRequest,
-        executor: &Executor,
+        executor: &mut Executor,
     ) -> Result<BuiltLib> {
         let crate_name = paths::normalize_crate_name(&lib.name);
-        let package_hash = hash::hash_bytes(node.key.0.to_string_lossy().as_bytes());
-        let short_hash = &package_hash[..8];
+        let crate_type = if lib.proc_macro { "proc-macro" } else { "lib" };
+        let metadata_hash = compute_metadata_hash(
+            &node.manifest.package.name,
+            &node.manifest.package.version,
+            &node.features,
+            &self.host_triple(),
+            request.profile,
+            crate_type,
+        );
         let output = request
             .out_dir
             .join(request.profile.as_str())
             .join("deps")
             .join(rust_lib_output_name(
                 &crate_name,
-                short_hash,
+                &metadata_hash,
                 lib.proc_macro,
             ));
-        let crate_type = if lib.proc_macro { "proc-macro" } else { "lib" };
 
         let mut args = vec![
             "--crate-name".to_owned(),
@@ -166,6 +176,8 @@ impl RustBackend {
             "-o".to_owned(),
             paths::display_path(&output),
         ];
+        args.push("-C".to_owned());
+        args.push(format!("metadata={metadata_hash}"));
         add_feature_args(&node.features, &mut args);
         add_profile_args(request.profile, &mut args);
         add_dependency_args(dependencies, &mut args);
@@ -215,7 +227,7 @@ impl RustBackend {
         bin: &BinTarget,
         root_lib: Option<&BuiltLib>,
         request: &BuildRequest,
-        executor: &Executor,
+        executor: &mut Executor,
     ) -> Result<PathBuf> {
         let mut dependencies = Vec::new();
         for dependency in &node.dependencies {
@@ -296,7 +308,7 @@ impl RustBackend {
         &mut self,
         node: &PackageNode,
         request: &BuildRequest,
-        executor: &Executor,
+        executor: &mut Executor,
     ) -> Result<Option<BuildScriptOutput>> {
         if let Some(output) = self.build_scripts.get(&node.key) {
             return Ok(output.clone());
@@ -319,7 +331,7 @@ impl RustBackend {
         node: &PackageNode,
         script_path: &Path,
         request: &BuildRequest,
-        executor: &Executor,
+        executor: &mut Executor,
     ) -> Result<PathBuf> {
         let crate_name = format!(
             "build_script_{}",
@@ -372,7 +384,7 @@ impl RustBackend {
         node: &PackageNode,
         script_bin: &Path,
         request: &BuildRequest,
-        executor: &Executor,
+        executor: &mut Executor,
     ) -> Result<BuildScriptOutput> {
         let build_root = request
             .out_dir

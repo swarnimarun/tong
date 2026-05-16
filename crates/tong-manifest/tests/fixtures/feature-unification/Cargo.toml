@@ -1,0 +1,12 @@
+[package]
+name = "feature-unification"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["a", "b"]
+a = ["shared/fast"]
+b = ["shared/verbose"]
+
+[dependencies]
+shared = { path = "shared" }

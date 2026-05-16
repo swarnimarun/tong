@@ -1,14 +1,17 @@
 use crate::action::Action;
+use crate::build_state::BuildState;
 use crate::cache::{ActionCache, CacheStatus, ensure_parent};
 use crate::error::{IoContext, Result, TongError};
 use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct Executor {
     pub cache: ActionCache,
-    pub workspace_root: std::path::PathBuf,
+    pub workspace_root: PathBuf,
     pub verbose: bool,
+    pub build_state: BuildState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +21,7 @@ pub enum ActionRunStatus {
 }
 
 impl Executor {
-    pub fn run(&self, action: &Action) -> Result<ActionRunStatus> {
+    pub fn run(&mut self, action: &Action) -> Result<ActionRunStatus> {
         let key = action.cache_key(&self.workspace_root)?;
         match self.cache.lookup(&key, action) {
             CacheStatus::Hit => {
@@ -91,6 +94,20 @@ impl Executor {
         }
 
         self.cache.store(&key, action)?;
+
+        for output in &action.outputs {
+            self.build_state.outputs.push(output.clone());
+        }
+        if let Some(stdout) = &action.stdout {
+            self.build_state.stdouts.push(stdout.clone());
+        }
+        self.build_state.stamps.push(self.cache.stamp_path(&key));
+
         Ok(ActionRunStatus::Executed)
+    }
+
+    pub fn save_state(&self, out_dir: &std::path::Path) -> Result<()> {
+        let path = out_dir.join("build-state");
+        self.build_state.save(&path)
     }
 }
