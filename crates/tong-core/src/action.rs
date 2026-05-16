@@ -1,3 +1,4 @@
+use crate::env::EnvBundle;
 use crate::error::Result;
 use crate::hash::{StableHasher, hash_file};
 use crate::paths;
@@ -10,6 +11,7 @@ pub struct Action {
     pub mnemonic: String,
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub env_bundle: Option<EnvBundle>,
     pub env: BTreeMap<String, String>,
     pub inputs: Vec<PathBuf>,
     pub outputs: Vec<PathBuf>,
@@ -30,6 +32,13 @@ impl Action {
         for arg in &self.args {
             hasher.update_str("arg");
             hasher.update_str(arg);
+        }
+
+        if let Some(bundle) = &self.env_bundle {
+            hasher.update_str("env-bundle");
+            hasher.update_str(&bundle.id);
+            hasher.update_str(bundle.kind.as_str());
+            hasher.update_str(&bundle.fingerprint());
         }
 
         for (key, value) in &self.env {
@@ -117,12 +126,41 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn cache_key_changes_when_env_bundle_changes() {
+        let root = temp_dir("action-env-bundle");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("input.txt");
+        fs::write(&input, "input").unwrap();
+
+        let mut left = test_action(&root, &input);
+        left.env_bundle = Some(crate::env::EnvBundle::new(
+            "demo",
+            crate::env::EnvBundleKind::HostToolchain,
+        ));
+
+        let mut right = test_action(&root, &input);
+        let mut bundle =
+            crate::env::EnvBundle::new("demo", crate::env::EnvBundleKind::HostToolchain);
+        bundle
+            .vars
+            .insert("PATH".to_owned(), "/toolchain/bin".to_owned());
+        right.env_bundle = Some(bundle);
+
+        assert_ne!(
+            left.cache_key(&root).unwrap(),
+            right.cache_key(&root).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_action(root: &Path, input: &Path) -> Action {
         Action {
             id: "compile".to_owned(),
             mnemonic: "RustLib".to_owned(),
             program: root.join("rustc"),
             args: vec!["--crate-name".to_owned(), "demo".to_owned()],
+            env_bundle: None,
             env: BTreeMap::from([("LANG".to_owned(), "C".to_owned())]),
             inputs: vec![input.to_path_buf()],
             outputs: vec![root.join("out.rlib")],

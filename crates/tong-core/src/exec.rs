@@ -45,12 +45,19 @@ impl Executor {
             ensure_parent(stdout)?;
         }
 
+        let mut env = action
+            .env_bundle
+            .as_ref()
+            .map(|bundle| bundle.vars.clone())
+            .unwrap_or_default();
+        env.extend(action.env.clone());
+
         let mut command = Command::new(&action.program);
         command
             .args(&action.args)
             .current_dir(&action.workdir)
             .env_clear()
-            .envs(&action.env)
+            .envs(&env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

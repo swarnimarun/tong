@@ -12,6 +12,7 @@ Each action has:
 - `mnemonic`
 - executable path
 - arguments
+- environment bundle
 - environment
 - declared inputs
 - declared outputs
@@ -20,6 +21,26 @@ Each action has:
 
 The cache key currently includes all of those fields plus the content hash of every declared input.
 
+## Environment Bundles
+
+An environment bundle is a named, fingerprinted set of environment variables and
+metadata needed to run a toolchain in an otherwise clean action environment.
+Bundles are action inputs, not ambient process state.
+
+The intent is platform-specific without making every backend special-case host
+variables:
+
+- Windows toolchains can declare a Visual Studio/MSVC-style bundle that carries
+  linker discovery variables such as `PATH`, `LIB`, `LIBPATH`, and `INCLUDE`.
+- Linux toolchains should move toward Nix-backed bundles whose fingerprint is
+  the Nix closure identity rather than a hand-written allowlist.
+- Other platforms can add their own bundle providers behind the same action
+  field.
+
+Per-action environment values still exist for values produced by the build
+graph, such as `OUT_DIR` or build-script `cargo:rustc-env` output. If a key is
+present in both places, the per-action value wins.
+
 ## Current Guarantees
 
 The MVP guarantees:
@@ -27,6 +48,8 @@ The MVP guarantees:
 - Rust compile actions use a resolved toolchain `rustc`, not the rustup shim.
 - Rust compile actions run with `env_clear`.
 - The only default environment variables are `LANG`, `LC_ALL`, `TMPDIR`, `TMP`, and `TEMP`.
+- Rust compile actions may attach a declared host toolchain environment bundle
+  when the platform needs one.
 - The rustc verbose version is included in every Rust action cache key.
 - The build profile and host platform are included in every Rust action cache key.
 - Package manifests and package files, excluding build output directories, are declared inputs.
@@ -56,7 +79,8 @@ Those are explicit roadmap items, not accidental omissions.
 
 ## Future Store Model
 
-Fetched and built dependencies should live in a content-addressed store:
+Fetched dependencies, built dependencies, and reusable environment bundles should
+live in a content-addressed store:
 
 ```text
 target/tong/store/
@@ -64,6 +88,8 @@ target/tong/store/
     include/
     lib/
     bin/
+  env/
+    sha256-<hash>-<bundle-name>/
 ```
 
 Store keys should include:
@@ -75,6 +101,12 @@ Store keys should include:
 - toolchain identity
 - declared environment
 - declared dependencies
+
+The build graph should also record the artifacts required for the next
+incremental build. Cleanup should retain live build outputs, source store
+entries, toolchain/env bundles, and cache records reachable from the latest
+successful graph, then remove older unreachable entries. That same retained set
+is the seed for local, shared network, and distributed execution caches.
 
 ## Backend Rule
 

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tong_core::action::Action;
 use tong_core::cache::ActionCache;
+use tong_core::env::EnvBundle;
 use tong_core::error::{IoContext, Result, TongError};
 use tong_core::exec::Executor;
 use tong_core::hash;
@@ -441,6 +442,7 @@ impl RustBackend {
             mnemonic: "RustBuildScriptRun".to_owned(),
             program: script_bin.to_path_buf(),
             args: Vec::new(),
+            env_bundle: None,
             env,
             inputs: build_script_run_inputs(node, script_bin)?,
             outputs: vec![out_dir.clone(), stdout.clone()],
@@ -509,6 +511,7 @@ impl RustBackend {
             mnemonic: mnemonic.to_owned(),
             program: self.rustc.clone(),
             args,
+            env_bundle: EnvBundle::host_rust_toolchain(),
             env,
             inputs,
             outputs,

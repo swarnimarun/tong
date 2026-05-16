@@ -43,11 +43,30 @@ same scheduler and cache.
 
 ## Phase 4: Native Dependencies
 
+- Treat environment bundles as first-class action inputs instead of allowing
+  host variables through ad hoc.
+- Linux: add Nix-backed bundles for toolchains and native system dependencies,
+  with cache keys based on closure identity.
+- Windows: add a dedicated toolchain bundle resolver for MSVC/Windows SDK
+  discovery, including the linker and runtime-library closure.
 - Add native package manifests.
 - Build native dependencies in isolated actions.
 - Expose include, lib, bin, and pkg-config providers.
 - Prevent ambient system library discovery.
 - Add CMake/configure/make builders as rules rather than hardcoded behavior.
+
+## Phase 4.5: Retention And Shared Cache
+
+- Write a build-state manifest containing every artifact needed for the next
+  incremental build: action outputs, generated files, fetched sources, toolchain
+  bundles, and dependency-store entries.
+- Add a mark-and-sweep cleanup mode that keeps the latest live manifest and
+  removes unreachable older entries from `target/tong`.
+- Move action cache records toward content-addressed blobs so the same live set
+  can be reused locally, synchronized to a shared network cache, or fetched by
+  distributed executors.
+- Keep remote and distributed execution behind the same action contract:
+  executable, args, inputs, outputs, env bundle, explicit env, and platform.
 
 ## Phase 5: Runtime Linking
 

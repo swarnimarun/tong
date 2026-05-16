@@ -1,5 +1,6 @@
 pub mod action;
 pub mod cache;
+pub mod env;
 pub mod error;
 pub mod exec;
 pub mod hash;
