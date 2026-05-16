@@ -77,9 +77,9 @@ impl Executor {
         }
 
         if self.verbose {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.trim().is_empty() {
-                eprint!("{stdout}");
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            if !stdout_str.trim().is_empty() {
+                eprint!("{stdout_str}");
             }
         }
 

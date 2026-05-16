@@ -1,0 +1,11 @@
+[package]
+name = "build-dep-demo"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "build_dep_demo"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"

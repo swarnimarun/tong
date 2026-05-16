@@ -1,0 +1,10 @@
+[package]
+name = "fixture-simple"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "fixture_simple"
+
+[dependencies]
+foo = { version = "1.0", features = ["bar"], default-features = false }

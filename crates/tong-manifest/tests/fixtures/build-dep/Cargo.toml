@@ -1,0 +1,13 @@
+[package]
+name = "fixture-build-dep"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "fixture_build_dep"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+serde = "1"

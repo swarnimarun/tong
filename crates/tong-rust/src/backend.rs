@@ -1,5 +1,5 @@
 use crate::args::{
-    BuiltLib, add_dependency_args, add_feature_args, add_profile_args, opt_level,
+    BuiltLib, add_dependency_args, add_feature_args, add_profile_args, metadata_hash, opt_level,
     rust_lib_output_name,
 };
 use crate::build_script::{
@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tong_core::action::Action;
+use tong_core::build_state::BuildState;
 use tong_core::cache::ActionCache;
 use tong_core::env::EnvBundle;
 use tong_core::error::{IoContext, Result, TongError};
@@ -80,6 +81,10 @@ impl RustBackend {
             artifacts.push(path);
         }
 
+        let mut build_state = BuildState::new(&request.out_dir);
+        build_state.track_dir_recursive(&request.out_dir, &request.out_dir);
+        build_state.write()?;
+
         Ok(BuildOutput { artifacts })
     }
 
@@ -142,15 +147,21 @@ impl RustBackend {
         executor: &Executor,
     ) -> Result<BuiltLib> {
         let crate_name = paths::normalize_crate_name(&lib.name);
-        let package_hash = hash::hash_bytes(node.key.0.to_string_lossy().as_bytes());
-        let short_hash = &package_hash[..8];
+        let meta_hash = metadata_hash(
+            &node.manifest.package.name,
+            &node.manifest.package.version,
+            &node.features,
+            &self.host_triple(),
+            request.profile,
+            if lib.proc_macro { "proc-macro" } else { "lib" },
+        );
         let output = request
             .out_dir
             .join(request.profile.as_str())
             .join("deps")
             .join(rust_lib_output_name(
                 &crate_name,
-                short_hash,
+                &meta_hash,
                 lib.proc_macro,
             ));
         let crate_type = if lib.proc_macro { "proc-macro" } else { "lib" };
@@ -166,6 +177,8 @@ impl RustBackend {
             "-o".to_owned(),
             paths::display_path(&output),
         ];
+        args.push("-C".to_owned());
+        args.push(format!("metadata={meta_hash}"));
         add_feature_args(&node.features, &mut args);
         add_profile_args(request.profile, &mut args);
         add_dependency_args(dependencies, &mut args);
@@ -235,6 +248,14 @@ impl RustBackend {
         let build_script = self.run_build_script(node, request, executor)?;
 
         let crate_name = paths::normalize_crate_name(&bin.name);
+        let meta_hash = metadata_hash(
+            &node.manifest.package.name,
+            &node.manifest.package.version,
+            &node.features,
+            &self.host_triple(),
+            request.profile,
+            "bin",
+        );
         let output = request
             .out_dir
             .join(request.profile.as_str())
@@ -252,6 +273,8 @@ impl RustBackend {
             "-o".to_owned(),
             paths::display_path(&output),
         ];
+        args.push("-C".to_owned());
+        args.push(format!("metadata={meta_hash}"));
         add_feature_args(&node.features, &mut args);
         add_profile_args(request.profile, &mut args);
         add_dependency_args(&dependencies, &mut args);
@@ -341,6 +364,8 @@ impl RustBackend {
             "-o".to_owned(),
             paths::display_path(&output),
         ];
+        args.push("-C".to_owned());
+        args.push("incremental=no".to_owned());
         add_feature_args(&node.features, &mut args);
         add_profile_args(request.profile, &mut args);
         if let Some(linker) = &self.linker {
@@ -619,7 +644,7 @@ fn collect_files_inner(root: &Path, files: &mut Vec<PathBuf>, skip_build_dirs: b
 fn is_ignored_package_dir(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("target" | ".git" | ".jj")
+        Some("target" | ".git" | ".jj" | "no")
     )
 }
 
