@@ -71,3 +71,72 @@ fn relative_or_absolute(root: &Path, path: &Path) -> String {
         .map(paths::display_path)
         .unwrap_or_else(|_| paths::display_path(path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cache_key_changes_when_input_contents_change() {
+        let root = temp_dir("action-cache-key");
+        let input = root.join("input.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&input, "one").unwrap();
+
+        let action = test_action(&root, &input);
+        let first = action.cache_key(&root).unwrap();
+
+        fs::write(&input, "two").unwrap();
+        let second = action.cache_key(&root).unwrap();
+
+        assert_ne!(first, second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_key_is_independent_of_input_order() {
+        let root = temp_dir("action-input-order");
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("a.txt");
+        let second = root.join("b.txt");
+        fs::write(&first, "a").unwrap();
+        fs::write(&second, "b").unwrap();
+
+        let mut left = test_action(&root, &first);
+        left.inputs.push(second.clone());
+        let mut right = test_action(&root, &second);
+        right.inputs.push(first);
+
+        assert_eq!(
+            left.cache_key(&root).unwrap(),
+            right.cache_key(&root).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_action(root: &Path, input: &Path) -> Action {
+        Action {
+            id: "compile".to_owned(),
+            mnemonic: "RustLib".to_owned(),
+            program: root.join("rustc"),
+            args: vec!["--crate-name".to_owned(), "demo".to_owned()],
+            env: BTreeMap::from([("LANG".to_owned(), "C".to_owned())]),
+            inputs: vec![input.to_path_buf()],
+            outputs: vec![root.join("out.rlib")],
+            workdir: root.to_path_buf(),
+            key_material: BTreeMap::from([("profile".to_owned(), "debug".to_owned())]),
+            stdout: None,
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tong-{name}-{}-{nanos}", std::process::id()))
+    }
+}

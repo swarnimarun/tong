@@ -780,3 +780,78 @@ fn rustc_version(rustc: &Path) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_lib_output_names_match_crate_kind() {
+        assert_eq!(
+            rust_lib_output_name("demo", "abcdef12", false),
+            "libdemo-abcdef12.rlib"
+        );
+
+        let proc_macro = rust_lib_output_name("demo", "abcdef12", true);
+        assert!(proc_macro.starts_with("libdemo-abcdef12."));
+        assert_ne!(proc_macro, "libdemo-abcdef12.rlib");
+    }
+
+    #[test]
+    fn parses_build_script_stdout_directives() {
+        let output = parse_build_script_stdout(
+            "\
+cargo:rustc-cfg=has_demo
+cargo:rustc-env=DEMO=value
+cargo:rustc-link-search=native=/tmp/lib
+cargo:rustc-link-lib=static=demo
+ignored line
+",
+        );
+
+        assert_eq!(output.cfgs, ["has_demo"]);
+        assert_eq!(output.rustc_env["DEMO"], "value");
+        assert_eq!(output.link_search, ["native=/tmp/lib"]);
+        assert_eq!(output.link_libs, ["static=demo"]);
+    }
+
+    #[test]
+    fn dependency_args_deduplicate_search_dirs_and_normalize_aliases() {
+        let deps = vec![
+            (
+                "foo-bar".to_owned(),
+                BuiltLib {
+                    extern_name: "foo_bar".to_owned(),
+                    path: PathBuf::from("/tmp/deps/libfoo.rlib"),
+                },
+            ),
+            (
+                "baz".to_owned(),
+                BuiltLib {
+                    extern_name: "baz".to_owned(),
+                    path: PathBuf::from("/tmp/deps/libbaz.rlib"),
+                },
+            ),
+        ];
+        let mut args = Vec::new();
+
+        add_dependency_args(&deps, &mut args);
+
+        let search_count = args.iter().filter(|arg| arg.as_str() == "-L").count();
+        assert_eq!(search_count, 1);
+        assert!(args.contains(&"foo_bar=/tmp/deps/libfoo.rlib".to_owned()));
+        assert!(args.contains(&"baz=/tmp/deps/libbaz.rlib".to_owned()));
+    }
+
+    #[test]
+    fn profile_args_are_small_and_predictable() {
+        let mut debug = Vec::new();
+        add_profile_args(BuildProfile::Debug, &mut debug);
+        assert_eq!(debug, ["-C", "debuginfo=2"]);
+
+        let mut release = Vec::new();
+        add_profile_args(BuildProfile::Release, &mut release);
+        assert_eq!(release, ["-C", "opt-level=3", "-C", "debug-assertions=no"]);
+        assert_eq!(opt_level(BuildProfile::Release), "3");
+    }
+}

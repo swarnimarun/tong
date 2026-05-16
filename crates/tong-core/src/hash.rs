@@ -50,3 +50,27 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     hasher.update(bytes);
     hasher.finish_hex()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_hasher_separates_string_boundaries() {
+        let mut one = StableHasher::new();
+        one.update_str("ab");
+        one.update_str("c");
+
+        let mut two = StableHasher::new();
+        two.update_str("a");
+        two.update_str("bc");
+
+        assert_ne!(one.finish_hex(), two.finish_hex());
+    }
+
+    #[test]
+    fn hash_bytes_is_stable() {
+        assert_eq!(hash_bytes(b"tong"), hash_bytes(b"tong"));
+        assert_ne!(hash_bytes(b"tong"), hash_bytes(b"tang"));
+    }
+}

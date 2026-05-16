@@ -262,3 +262,136 @@ fn dependency_manifest_path(path: &Path) -> Result<PathBuf> {
         path.display()
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tong_manifest::{DependencySource, Package};
+
+    #[test]
+    fn resolves_default_features_optional_dependencies_and_dependency_features() {
+        let manifest = Manifest {
+            path: PathBuf::from("Cargo.toml"),
+            root: PathBuf::from("."),
+            kind: tong_manifest::ManifestKind::Cargo,
+            package: Package {
+                name: "demo".to_owned(),
+                version: "0.1.0".to_owned(),
+                edition: "2024".to_owned(),
+            },
+            features: BTreeMap::from([
+                (
+                    "default".to_owned(),
+                    vec!["cli".to_owned(), "helper/fast".to_owned()],
+                ),
+                ("cli".to_owned(), vec!["dep:helper".to_owned()]),
+            ]),
+            sources: BTreeMap::new(),
+            build_script: None,
+            lib: None,
+            bins: Vec::new(),
+            dependencies: Vec::new(),
+        };
+
+        let resolved = resolve_features(&manifest, BTreeSet::new(), true);
+
+        assert!(resolved.enabled_features.contains("default"));
+        assert!(resolved.enabled_features.contains("cli"));
+        assert!(resolved.optional_dependencies.contains("helper"));
+        assert!(resolved.dependency_features["helper"].contains("fast"));
+    }
+
+    #[test]
+    fn loads_path_dependency_graph() {
+        let root = temp_dir("graph-path");
+        write_package(&root, "app", true);
+        let helper = root.join("helper");
+        write_package(&helper, "helper", false);
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+helper = { path = "helper" }
+"#,
+        )
+        .unwrap();
+
+        let graph = ProjectGraph::load(&root.join("Cargo.toml")).unwrap();
+
+        assert_eq!(graph.packages.len(), 2);
+        let root_node = graph.package(&graph.root).unwrap();
+        assert_eq!(root_node.dependencies[0].alias, "helper");
+        assert_eq!(
+            graph
+                .package(&root_node.dependencies[0].key)
+                .unwrap()
+                .manifest
+                .package
+                .name,
+            "helper"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merges_direct_and_propagated_dependency_features() {
+        let dependency = Dependency {
+            alias: "renamed".to_owned(),
+            package: "actual".to_owned(),
+            features: vec!["direct".to_owned()],
+            default_features: true,
+            optional: false,
+            source: DependencySource::Path(PathBuf::from("actual")),
+        };
+        let propagated = BTreeMap::from([(
+            "actual".to_owned(),
+            BTreeSet::from(["propagated".to_owned()]),
+        )]);
+
+        let features = dependency_features(&dependency, &propagated);
+
+        assert_eq!(
+            features,
+            BTreeSet::from(["direct".to_owned(), "propagated".to_owned()])
+        );
+    }
+
+    fn write_package(root: &Path, name: &str, bin: bool) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        if bin {
+            fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        } else {
+            fs::write(root.join("src/lib.rs"), "").unwrap();
+        }
+        if !root.join("Cargo.toml").exists() {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    r#"
+[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+"#
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tong-{name}-{}-{nanos}", std::process::id()))
+    }
+}
