@@ -1,4 +1,10 @@
+# Rust/Cargo build output, including example-project smoke builds.
 /target/
 **/target/
+
+# mdBook output.
 /book/book/
+
+# Local VCS/editor noise.
+/.jj/
 .DS_Store

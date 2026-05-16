@@ -186,6 +186,8 @@ pub(super) struct BuildCliOptions {
     pub(super) path: PathBuf,
     pub(super) profile: BuildProfile,
     pub(super) verbose: bool,
+    pub(super) examples: bool,
+    pub(super) tests: bool,
 }
 
 impl BuildCliOptions {
@@ -193,12 +195,16 @@ impl BuildCliOptions {
         let mut path = PathBuf::from(".");
         let mut profile = BuildProfile::Debug;
         let mut verbose = false;
+        let mut examples = false;
+        let mut tests = false;
 
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--release" => profile = BuildProfile::Release,
                 "--debug" => profile = BuildProfile::Debug,
+                "--examples" => examples = true,
+                "--test" | "--tests" | "--no-run" => tests = true,
                 "-v" | "--verbose" => verbose = true,
                 "--manifest-path" => {
                     let value = iter
@@ -228,6 +234,8 @@ impl BuildCliOptions {
             path,
             profile,
             verbose,
+            examples,
+            tests,
         })
     }
 }

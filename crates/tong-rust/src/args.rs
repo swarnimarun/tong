@@ -9,17 +9,23 @@ pub(super) struct BuiltLib {
     pub(super) path: PathBuf,
 }
 
-pub(super) fn rust_lib_output_name(crate_name: &str, hash: &str, proc_macro: bool) -> String {
+pub(super) fn rust_lib_output_name(
+    crate_name: &str,
+    hash: &str,
+    proc_macro: bool,
+    metadata_hash: &str,
+) -> String {
     if proc_macro {
         format!(
-            "{}{}-{}.{}",
+            "{}{}-{}-{}.{}",
             std::env::consts::DLL_PREFIX,
             crate_name,
             hash,
+            metadata_hash,
             std::env::consts::DLL_EXTENSION
         )
     } else {
-        format!("lib{crate_name}-{hash}.rlib")
+        format!("lib{crate_name}-{hash}-{metadata_hash}.rlib")
     }
 }
 
@@ -43,6 +49,11 @@ pub(super) fn add_profile_args(profile: BuildProfile, args: &mut Vec<String>) {
             args.push("debug-assertions=no".to_owned());
         }
     }
+}
+
+pub(super) fn add_metadata_args(metadata_hash: &str, args: &mut Vec<String>) {
+    args.push("-C".to_owned());
+    args.push(format!("metadata={metadata_hash}"));
 }
 
 pub(super) fn opt_level(profile: BuildProfile) -> &'static str {
@@ -84,14 +95,17 @@ mod tests {
     #[test]
     fn rust_lib_output_names_match_crate_kind() {
         assert_eq!(
-            rust_lib_output_name("demo", "abcdef12", false),
-            "libdemo-abcdef12.rlib"
+            rust_lib_output_name("demo", "abcdef12", false, "meta1234"),
+            "libdemo-abcdef12-meta1234.rlib"
         );
 
-        let proc_macro = rust_lib_output_name("demo", "abcdef12", true);
-        assert!(proc_macro.starts_with(&format!("{}demo-abcdef12.", std::env::consts::DLL_PREFIX)));
+        let proc_macro = rust_lib_output_name("demo", "abcdef12", true, "meta1234");
+        assert!(proc_macro.starts_with(&format!(
+            "{}demo-abcdef12-meta1234.",
+            std::env::consts::DLL_PREFIX
+        )));
         assert!(proc_macro.ends_with(std::env::consts::DLL_EXTENSION));
-        assert_ne!(proc_macro, "libdemo-abcdef12.rlib");
+        assert_ne!(proc_macro, "libdemo-abcdef12-meta1234.rlib");
     }
 
     #[test]

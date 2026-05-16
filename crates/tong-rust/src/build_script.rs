@@ -10,6 +10,12 @@ pub(super) struct BuildScriptOutput {
     pub(super) rustc_env: BTreeMap<String, String>,
     pub(super) link_search: Vec<String>,
     pub(super) link_libs: Vec<String>,
+    pub(super) link_args: Vec<String>,
+    pub(super) cdylib_link_args: Vec<String>,
+    pub(super) rerun_if_changed: Vec<PathBuf>,
+    pub(super) rerun_if_env_changed: Vec<String>,
+    pub(super) warnings: Vec<String>,
+    pub(super) errors: Vec<String>,
     pub(super) generated_inputs: Vec<PathBuf>,
 }
 
@@ -22,6 +28,12 @@ impl BuildScriptOutput {
             rustc_env: BTreeMap::new(),
             link_search: Vec::new(),
             link_libs: Vec::new(),
+            link_args: Vec::new(),
+            cdylib_link_args: Vec::new(),
+            rerun_if_changed: Vec::new(),
+            rerun_if_env_changed: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
             generated_inputs: Vec::new(),
         }
     }
@@ -46,6 +58,18 @@ pub(super) fn parse_build_script_stdout(stdout: &str) -> BuildScriptOutput {
             output.link_search.push(search.to_owned());
         } else if let Some(lib) = rest.strip_prefix("rustc-link-lib=") {
             output.link_libs.push(lib.to_owned());
+        } else if let Some(arg) = rest.strip_prefix("rustc-link-arg=") {
+            output.link_args.push(arg.to_owned());
+        } else if let Some(arg) = rest.strip_prefix("rustc-cdylib-link-arg=") {
+            output.cdylib_link_args.push(arg.to_owned());
+        } else if let Some(path) = rest.strip_prefix("rerun-if-changed=") {
+            output.rerun_if_changed.push(PathBuf::from(path));
+        } else if let Some(key) = rest.strip_prefix("rerun-if-env-changed=") {
+            output.rerun_if_env_changed.push(key.to_owned());
+        } else if let Some(warning) = rest.strip_prefix("warning=") {
+            output.warnings.push(warning.to_owned());
+        } else if let Some(error) = rest.strip_prefix("error=") {
+            output.errors.push(error.to_owned());
         }
     }
     output
@@ -87,6 +111,14 @@ pub(super) fn add_build_script_args(
         args.push("-l".to_owned());
         args.push(lib.clone());
     }
+    for arg in &build_script.link_args {
+        args.push("-C".to_owned());
+        args.push(format!("link-arg={arg}"));
+    }
+    for arg in &build_script.cdylib_link_args {
+        args.push("-C".to_owned());
+        args.push(format!("link-arg={arg}"));
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +134,10 @@ cargo::rustc-cfg=has_double_colon
 cargo:rustc-env=DEMO=value
 cargo:rustc-link-search=native=/tmp/lib
 cargo:rustc-link-lib=static=demo
+cargo:rustc-link-arg=-Wl,--as-needed
+cargo:rerun-if-changed=build-data.txt
+cargo::rerun-if-env-changed=DEMO_ENV
+cargo:warning=careful
 ignored line
 ",
         );
@@ -110,5 +146,9 @@ ignored line
         assert_eq!(output.rustc_env["DEMO"], "value");
         assert_eq!(output.link_search, ["native=/tmp/lib"]);
         assert_eq!(output.link_libs, ["static=demo"]);
+        assert_eq!(output.link_args, ["-Wl,--as-needed"]);
+        assert_eq!(output.rerun_if_changed, [PathBuf::from("build-data.txt")]);
+        assert_eq!(output.rerun_if_env_changed, ["DEMO_ENV"]);
+        assert_eq!(output.warnings, ["careful"]);
     }
 }
