@@ -76,7 +76,9 @@ impl Cas {
     /// Writes a blob, returning its digest. Atomic and idempotent.
     pub fn put_blob(&self, data: &[u8]) -> io::Result<BlobDigest> {
         let digest = BlobDigest::new(Hasher::digest(data));
-        self.write_object("blobs", digest.digest(), |w| w.write_all(data))?;
+        self.write_object("blobs", digest.digest(), data.len() as u64, |w| {
+            w.write_all(data)
+        })?;
         Ok(digest)
     }
 
@@ -85,23 +87,25 @@ impl Cas {
     pub fn put_file(&self, path: &Path) -> io::Result<BlobDigest> {
         // Hash while copying to a temp file, then rename to the digest path.
         let tmp = self.root.join("tmp").join(unique_name());
-        let digest = {
+        let (digest, len) = {
             let mut reader = fs::File::open(path)?;
             let mut writer = fs::File::create(&tmp)?;
             let mut hasher = Hasher::new();
             let mut buf = [0u8; 64 * 1024];
+            let mut total = 0u64;
             loop {
                 let n = reader.read(&mut buf)?;
                 if n == 0 {
                     break;
                 }
+                total += n as u64;
                 hasher.update(&buf[..n]);
                 writer.write_all(&buf[..n])?;
             }
-            hasher.finish()
+            (hasher.finish(), total)
         };
         let digest = BlobDigest::new(digest);
-        self.place_verified("blobs", digest.digest(), &tmp, None)?;
+        self.place_verified("blobs", digest.digest(), &tmp, Some(len))?;
         Ok(digest)
     }
 
@@ -109,6 +113,7 @@ impl Cas {
         &self,
         namespace: &str,
         digest: Digest,
+        len: u64,
         write: impl FnOnce(&mut fs::File) -> io::Result<()>,
     ) -> io::Result<()> {
         let tmp = self.root.join("tmp").join(unique_name());
@@ -116,7 +121,7 @@ impl Cas {
             let mut file = fs::File::create(&tmp)?;
             write(&mut file)?;
         }
-        self.place_verified(namespace, digest, &tmp, None)
+        self.place_verified(namespace, digest, &tmp, Some(len))
     }
 
     /// Verifies the temp file's digest and atomically moves it into place.
@@ -147,9 +152,21 @@ impl Cas {
         }
         let dest = self.object_path(namespace, digest);
         if dest.exists() {
-            // Duplicate writer: content is identical by construction.
-            let _ = fs::remove_file(tmp);
-            return Ok(());
+            let stale = expected_len.is_some_and(|len| {
+                fs::metadata(&dest)
+                    .map(|meta| meta.len() != len)
+                    .unwrap_or(true)
+            });
+            if stale {
+                // A same-digest object with the wrong size is store
+                // corruption (e.g. a blob truncated through an aliased
+                // hard link); replace it with the verified copy.
+                let _ = fs::remove_file(&dest);
+            } else {
+                // Duplicate writer: content is identical by construction.
+                let _ = fs::remove_file(tmp);
+                return Ok(());
+            }
         }
         fs::create_dir_all(dest.parent().unwrap())?;
         // Read-only: stored objects are immutable (section 10.1).
@@ -183,7 +200,8 @@ impl Cas {
         enc.write_u32(tong_core::tree::TREE_SCHEMA_VERSION);
         tree.encode(&mut enc);
         let bytes = enc.into_bytes();
-        self.write_object("trees", digest.digest(), |w| w.write_all(&bytes))?;
+        let len = bytes.len() as u64;
+        self.write_object("trees", digest.digest(), len, |w| w.write_all(&bytes))?;
         Ok(digest)
     }
 
@@ -222,7 +240,8 @@ impl Cas {
         enc.write_u32(tong_core::bundle::ENVIRONMENT_BUNDLE_SCHEMA_VERSION);
         bundle.encode(&mut enc);
         let bytes = enc.into_bytes();
-        self.write_object("bundles", digest, |w| w.write_all(&bytes))?;
+        let len = bytes.len() as u64;
+        self.write_object("bundles", digest, len, |w| w.write_all(&bytes))?;
         Ok(digest)
     }
 
@@ -347,11 +366,12 @@ impl Cas {
                     if path.exists() {
                         fs::remove_file(&path)?;
                     }
-                    if fs::hard_link(&blob, &path).is_err() {
-                        fs::copy(&blob, &path)?;
-                    }
-                    // Stored blobs are read-only; materialized files must be
-                    // writable-removable and keep their executable bit.
+                    // Copy, never hard-link: materialized files must be
+                    // writable-removable and carry the tree's executable bit,
+                    // and a chmod (or any later write) through a hard link
+                    // would mutate the immutable store object. Copies keep
+                    // store blobs read-only and corruption-proof.
+                    fs::copy(&blob, &path)?;
                     let mut perms = fs::metadata(&path)?.permissions();
                     #[cfg(unix)]
                     {
@@ -616,5 +636,91 @@ mod tests {
             assert_eq!(perms.mode() & 0o222, 0);
         }
         let _ = perms;
+    }
+
+    #[test]
+    fn materialized_files_do_not_alias_blobs() {
+        // Regression: materialize used to hard-link blobs and then chmod the
+        // link, which mutated the shared inode — the store blob lost its
+        // read-only mode and any later write through the link truncated it.
+        let (_dir, cas) = temp_cas();
+        let digest = cas.put_blob(b"payload").unwrap();
+        let tree = Tree::new(
+            [(
+                "f".to_owned(),
+                TreeEntry::File {
+                    digest,
+                    executable: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let tree = cas.put_tree(&tree).unwrap();
+
+        let out1 = cas.root().parent().unwrap().join("out1");
+        cas.materialize(tree, &out1).unwrap();
+
+        // Writing to the materialized copy must not corrupt the blob.
+        fs::write(out1.join("f"), b"tampered").unwrap();
+        assert_eq!(cas.read_blob(digest).unwrap(), b"payload");
+
+        // Re-materializing (same tree, different exec expectations)
+        // keeps the blob intact and honors the bit on the copy.
+        let out2 = cas.root().parent().unwrap().join("out2");
+        cas.materialize(tree, &out2).unwrap();
+        assert_eq!(fs::read(out2.join("f")).unwrap(), b"payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(out2.join("f")).unwrap().permissions().mode() & 0o111,
+                0,
+                "executable bit must be set on the copy"
+            );
+            // The store blob keeps its read-only mode.
+            assert_eq!(
+                fs::metadata(cas.blob_path(digest).unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o222,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn put_file_replaces_truncated_blob() {
+        // Regression: a blob truncated in the store used to be silently
+        // reused (idempotent skip), propagating the corruption. A same-
+        // digest object with the wrong length must be replaced.
+        let (_dir, cas) = temp_cas();
+        let src = cas.root().parent().unwrap().join("src.bin");
+        fs::write(&src, b"real content").unwrap();
+        let digest = cas.put_file(&src).unwrap();
+
+        let path = cas.blob_path(digest).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::write(&path, b"").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        let again = cas.put_file(&src).unwrap();
+        assert_eq!(again, digest);
+        assert_eq!(cas.read_blob(digest).unwrap(), b"real content");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o222,
+                0,
+                "replaced blob must be read-only again"
+            );
+        }
     }
 }

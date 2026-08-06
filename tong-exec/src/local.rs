@@ -341,9 +341,9 @@ impl LocalExecutor {
         if dest.exists() {
             fs::remove_file(dest)?;
         }
-        if fs::hard_link(source, dest).is_err() {
-            fs::copy(source, dest)?;
-        }
+        // Copy, never hard-link: chmodding the exec-root copy through a
+        // hard link would mutate the immutable store blob.
+        fs::copy(source, dest)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

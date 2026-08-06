@@ -213,9 +213,13 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 ))
             })?;
             let target = dest.join(name);
-            if fs::hard_link(&blob_path, &target).is_err() {
-                fs::copy(&blob_path, &target)?;
+            // Copy, never hard-link: artifacts are independent files; a
+            // rewrite of the artifact must never be able to corrupt the
+            // immutable store blob (a same-inode copy truncates it).
+            if target.exists() {
+                fs::remove_file(&target)?;
             }
+            fs::copy(&blob_path, &target)?;
         }
         outcome.artifacts.push(dest.join(&artifact.name));
     }
