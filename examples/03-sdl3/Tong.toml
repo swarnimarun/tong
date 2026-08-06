@@ -1,0 +1,37 @@
+# SDL3 demo: a prebuilt C library imported into Rust.
+#
+# Prerequisite: SDL3 installed via Homebrew (`brew install sdl3`). The
+# library is system-captured (PLAN.md section 5): imported into the store,
+# fingerprinted, and marked non-portable — this manifest points at this
+# machine's brew prefix.
+
+[workspace]
+name = "sdl3-demo"
+
+[toolchain.rust]
+kind = "system"
+
+[profile.dev]
+opt_level = 0
+debug = true
+
+# The imported prebuilt SDL3 shared library. `shared` is the host path;
+# `link_name` is the -l name (libSDL3.0.dylib -> SDL3.0).
+[target.sdl3]
+rule = "cc_import"
+shared = "/opt/homebrew/opt/sdl3/lib/libSDL3.0.dylib"
+link_name = "SDL3.0"
+
+# Hand-written FFI bindings over SDL3 (a "simple bindings layer").
+[target.sdl3_sys]
+rule = "rust_library"
+crate_root = "crates/sdl3-sys/src/lib.rs"
+edition = "2021"
+deps = [":sdl3"]
+
+# A small project that opens a window and exits.
+[target.sdl3_demo]
+rule = "rust_binary"
+crate_root = "crates/sdl3-demo/src/main.rs"
+edition = "2021"
+deps = [":sdl3_sys"]

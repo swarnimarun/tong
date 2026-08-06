@@ -181,137 +181,167 @@ impl<'a> RustBackend<'a> {
             self.cc_closure.insert(pkg.name.clone(), closure);
         }
 
-        // 4. Plan actions.
+        // 4. Plan actions. Libraries, proc macros, and build scripts first
+        //    (their planned ids must exist before binaries resolve their
+        //    dependency actions), then binaries.
         let mut actions = Vec::new();
         for pkg in &self.model.packages {
-            let source_tree = self.source_trees[&pkg.name];
-            let cc = self.cc_for(&pkg.name);
+            self.plan_package_library(&mut actions, pkg)?;
+        }
+        for pkg in &self.model.packages {
+            self.plan_package_bins(&mut actions, pkg)?;
+        }
 
-            // Build script: compile, then run.
-            let mut bs_run: Option<ActionId> = None;
-            if let Some(script) = &pkg.build_script {
-                let binary = format!("{}_build_script", crate_name(&pkg.name));
-                let compile_id = self.plan_compile(
-                    &mut actions,
-                    &format!("bs-compile:{}", pkg.name),
-                    &format!("rust:bs-compile:{}", pkg.name),
-                    "RustBuildScriptCompile",
+        Ok(actions)
+    }
+
+    /// Plans a package's build-script, library, and proc-macro actions.
+    fn plan_package_library(
+        &mut self,
+        actions: &mut Vec<PlannedAction>,
+        pkg: &Package,
+    ) -> Result<Option<ActionId>, PlanError> {
+        let source_tree = self.source_trees[&pkg.name];
+        let cc = self.cc_for(&pkg.name);
+
+        // Build script: compile, then run.
+        let mut bs_run: Option<ActionId> = None;
+        if let Some(script) = &pkg.build_script {
+            let binary = format!("{}_build_script", crate_name(&pkg.name));
+            let compile_id = self.plan_compile(
+                actions,
+                &format!("bs-compile:{}", pkg.name),
+                &format!("rust:bs-compile:{}", pkg.name),
+                "RustBuildScriptCompile",
+                pkg,
+                source_tree,
+                cc.clone(),
+                binary.clone(),
+                "bin",
+                None,
+                &pkg.build_deps,
+                None,
+                script.clone(),
+            )?;
+
+            let run_id = ActionId(format!("rust:bs-run:{}", pkg.name));
+            let run_ctx = Ctx {
+                logical_id: run_id.clone(),
+                mnemonic: "RustBuildScriptRun".to_owned(),
+                kind: CtxKind::BuildScriptRun(BuildScriptRunSpec {
+                    compile: compile_id.clone(),
+                    binary: binary.clone(),
+                    pkg_name: pkg.name.clone(),
+                    pkg_version: pkg.version.clone(),
+                    host_triple: self.toolchain.host_triple.clone(),
+                    opt_level: self.profile.opt_level.clone(),
+                    debug: self.profile.debug,
+                }),
+                source_tree,
+                rustc: self.toolchain.rustc_blob,
+                bundle: Some(self.toolchain.bundle_ref()),
+                properties: self.base_properties(),
+                global_env: self.model.global_env.clone(),
+                pkg_env: pkg.env.clone(),
+                cc: Vec::new(),
+                profile_flags: self.profile.rustc_flags(),
+            };
+            self.planned_ids
+                .insert(format!("bs-run:{}", pkg.name), run_id.clone());
+            actions.push(self.boxed(run_ctx));
+
+            bs_run = Some(run_id);
+        }
+
+        // Library / proc-macro actions.
+        if let Some(lib) = &pkg.lib {
+            if lib.proc_macro {
+                self.plan_compile(
+                    actions,
+                    &format!("lib:{}:proc-macro", pkg.name),
+                    &format!("rust:proc-macro:{}", pkg.name),
+                    "RustProcMacro",
                     pkg,
                     source_tree,
                     cc.clone(),
-                    binary.clone(),
-                    "bin",
+                    crate_name(&pkg.name),
+                    "proc-macro",
                     None,
-                    &pkg.build_deps,
-                    None,
-                    script.clone(),
+                    &pkg.deps,
+                    bs_run.clone(),
+                    lib.path.clone(),
                 )?;
-
-                let run_id = ActionId(format!("rust:bs-run:{}", pkg.name));
-                let run_ctx = Ctx {
-                    logical_id: run_id.clone(),
-                    mnemonic: "RustBuildScriptRun".to_owned(),
-                    kind: CtxKind::BuildScriptRun(BuildScriptRunSpec {
-                        compile: compile_id.clone(),
-                        binary: binary.clone(),
-                        pkg_name: pkg.name.clone(),
-                        pkg_version: pkg.version.clone(),
-                        host_triple: self.toolchain.host_triple.clone(),
-                        opt_level: self.profile.opt_level.clone(),
-                        debug: self.profile.debug,
-                    }),
-                    source_tree,
-                    rustc: self.toolchain.rustc_blob,
-                    bundle: Some(self.toolchain.bundle_ref()),
-                    properties: self.base_properties(),
-                    global_env: self.model.global_env.clone(),
-                    pkg_env: pkg.env.clone(),
-                    cc: Vec::new(),
-                    profile_flags: self.profile.rustc_flags(),
+            } else {
+                let types: Vec<CrateType> = if lib.crate_types.is_empty() {
+                    vec![CrateType::Rlib]
+                } else {
+                    lib.crate_types.clone()
                 };
-                self.planned_ids
-                    .insert(format!("bs-run:{}", pkg.name), run_id.clone());
-                actions.push(self.boxed(run_ctx));
-
-                bs_run = Some(run_id);
-            }
-
-            // Library / proc-macro actions.
-            if let Some(lib) = &pkg.lib {
-                if lib.proc_macro {
+                for crate_type in types {
                     self.plan_compile(
-                        &mut actions,
-                        &format!("lib:{}:proc-macro", pkg.name),
-                        &format!("rust:proc-macro:{}", pkg.name),
-                        "RustProcMacro",
+                        actions,
+                        &format!("lib:{}:{}", pkg.name, crate_type.to_rustc()),
+                        &format!("rust:lib:{}:{}", pkg.name, crate_type.to_rustc()),
+                        "RustLibrary",
                         pkg,
                         source_tree,
                         cc.clone(),
                         crate_name(&pkg.name),
-                        "proc-macro",
+                        crate_type.to_rustc(),
                         None,
                         &pkg.deps,
                         bs_run.clone(),
                         lib.path.clone(),
                     )?;
-                } else {
-                    let types: Vec<CrateType> = if lib.crate_types.is_empty() {
-                        vec![CrateType::Rlib]
-                    } else {
-                        lib.crate_types.clone()
-                    };
-                    for crate_type in types {
-                        self.plan_compile(
-                            &mut actions,
-                            &format!("lib:{}:{}", pkg.name, crate_type.to_rustc()),
-                            &format!("rust:lib:{}:{}", pkg.name, crate_type.to_rustc()),
-                            "RustLibrary",
-                            pkg,
-                            source_tree,
-                            cc.clone(),
-                            crate_name(&pkg.name),
-                            crate_type.to_rustc(),
-                            None,
-                            &pkg.deps,
-                            bs_run.clone(),
-                            lib.path.clone(),
-                        )?;
-                    }
                 }
-            }
-
-            // Binary actions; each depends on the package's own library
-            // (when present) plus declared deps.
-            for bin in &pkg.bins {
-                let mut deps = pkg.deps.clone();
-                if pkg.lib.is_some() {
-                    deps.insert(
-                        0,
-                        Dep {
-                            extern_name: crate_name(&pkg.name),
-                            package: pkg.name.clone(),
-                        },
-                    );
-                }
-                self.plan_compile(
-                    &mut actions,
-                    &format!("bin:{}:{}", pkg.name, bin.name),
-                    &format!("rust:bin:{}:{}", pkg.name, bin.name),
-                    "RustBinary",
-                    pkg,
-                    source_tree,
-                    cc.clone(),
-                    crate_name(&bin.name),
-                    "bin",
-                    Some(bin.name.clone()),
-                    &deps,
-                    bs_run.clone(),
-                    bin.path.clone(),
-                )?;
             }
         }
 
-        Ok(actions)
+        Ok(bs_run)
+    }
+
+    /// Plans a package's binary actions; each depends on the package's own
+    /// library (when present) plus declared deps.
+    fn plan_package_bins(
+        &mut self,
+        actions: &mut Vec<PlannedAction>,
+        pkg: &Package,
+    ) -> Result<(), PlanError> {
+        let source_tree = self.source_trees[&pkg.name];
+        let cc = self.cc_for(&pkg.name);
+        let bs_run: Option<ActionId> = self
+            .planned_ids
+            .get(&format!("bs-run:{}", pkg.name))
+            .cloned();
+
+        for bin in &pkg.bins {
+            let mut deps = pkg.deps.clone();
+            if pkg.lib.is_some() {
+                deps.insert(
+                    0,
+                    Dep {
+                        extern_name: crate_name(&pkg.name),
+                        package: pkg.name.clone(),
+                    },
+                );
+            }
+            self.plan_compile(
+                actions,
+                &format!("bin:{}:{}", pkg.name, bin.name),
+                &format!("rust:bin:{}:{}", pkg.name, bin.name),
+                "RustBinary",
+                pkg,
+                source_tree,
+                cc.clone(),
+                crate_name(&bin.name),
+                "bin",
+                Some(bin.name.clone()),
+                &deps,
+                bs_run.clone(),
+                bin.path.clone(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Final runnable artifacts (binaries) with their runtime closures.

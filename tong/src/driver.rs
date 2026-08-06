@@ -191,7 +191,11 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     let requested: Vec<&tong_rust::FinalArtifact> = artifacts
         .iter()
         .filter(|artifact| {
-            options.targets.is_empty() || options.targets.iter().any(|t| t == &artifact.name)
+            options.targets.is_empty()
+                || options
+                    .targets
+                    .iter()
+                    .any(|t| artifact_name_matches(t, &artifact.name))
         })
         .collect();
     for artifact in requested {
@@ -213,7 +217,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 fs::copy(&blob_path, &target)?;
             }
         }
-        outcome.artifacts.push(dest);
+        outcome.artifacts.push(dest.join(&artifact.name));
     }
 
     Ok(outcome)
@@ -248,6 +252,20 @@ pub fn run(root: &Path, target: &str, args: &[String], profile: &str) -> Result<
         .status()
         .map_err(BuildError::Io)?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Matches a target label (`:name`, `//path:name`, or `name`) against an
+/// artifact name.
+fn artifact_name_matches(label: &str, name: &str) -> bool {
+    let label = label
+        .strip_prefix(':') //
+        .or_else(|| {
+            label
+                .strip_prefix("//")
+                .and_then(|rest| rest.rsplit_once(':').map(|(_, name)| name))
+        })
+        .unwrap_or(label);
+    label == name
 }
 
 /// Removes the project-local `.tong` directory.
