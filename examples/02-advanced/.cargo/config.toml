@@ -1,0 +1,8 @@
+# Per-workspace configuration, honored by tong's Cargo import mode:
+# - [build] rustflags are passed to every crate (here: enable advanced_mode)
+# - [env] variables are set for every compile action
+[build]
+rustflags = ["--cfg", "advanced_mode"]
+
+[env]
+APP_GREETING = "hello from .cargo/config.toml"

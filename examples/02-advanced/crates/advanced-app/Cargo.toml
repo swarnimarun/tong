@@ -1,0 +1,8 @@
+[package]
+name = "advanced-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+advanced-core = { path = "../advanced-core" }
+shout = { path = "../shout" }

@@ -205,7 +205,6 @@ impl<'a> RustBackend<'a> {
                     &pkg.build_deps,
                     None,
                     script.clone(),
-                    Vec::new(),
                 )?;
 
                 let run_id = ActionId(format!("rust:bs-run:{}", pkg.name));
@@ -254,7 +253,6 @@ impl<'a> RustBackend<'a> {
                         &pkg.deps,
                         bs_run.clone(),
                         lib.path.clone(),
-                        Vec::new(),
                     )?;
                 } else {
                     let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -277,7 +275,6 @@ impl<'a> RustBackend<'a> {
                             &pkg.deps,
                             bs_run.clone(),
                             lib.path.clone(),
-                            Vec::new(),
                         )?;
                     }
                 }
@@ -310,7 +307,6 @@ impl<'a> RustBackend<'a> {
                     &deps,
                     bs_run.clone(),
                     bin.path.clone(),
-                    Vec::new(),
                 )?;
             }
         }
@@ -369,7 +365,6 @@ impl<'a> RustBackend<'a> {
         deps: &[Dep],
         build_script: Option<ActionId>,
         crate_root: PathBuf,
-        extra_flags: Vec<String>,
     ) -> Result<ActionId, PlanError> {
         let meta = self.metadata(&crate_name, crate_type);
         let output = if let Some(name) = output_name {
@@ -389,6 +384,30 @@ impl<'a> RustBackend<'a> {
             format!("lib{crate_name}-{meta}.{ext}")
         };
         let dep_specs = self.resolve_deps(deps);
+        let extra_flags: Vec<String> = self
+            .model
+            .global_rustflags
+            .iter()
+            .chain(pkg.rustflags.iter())
+            .cloned()
+            .collect();
+        // LTO is not supported for proc-macro crate types; Cargo disables it
+        // automatically.
+        let mut profile_flags = self.profile.rustc_flags();
+        if crate_type == "proc-macro" {
+            let mut index = 0;
+            while index < profile_flags.len() {
+                if profile_flags[index] == "-C"
+                    && profile_flags
+                        .get(index + 1)
+                        .is_some_and(|flag| flag.starts_with("lto="))
+                {
+                    profile_flags.drain(index..index + 2);
+                } else {
+                    index += 1;
+                }
+            }
+        }
         let ctx = Ctx {
             logical_id: ActionId(logical_id.to_owned()),
             mnemonic: mnemonic.to_owned(),
@@ -410,7 +429,7 @@ impl<'a> RustBackend<'a> {
             global_env: self.model.global_env.clone(),
             pkg_env: pkg.env.clone(),
             cc,
-            profile_flags: self.profile.rustc_flags(),
+            profile_flags: profile_flags.clone(),
         };
         let id = ctx.logical_id.clone();
         self.planned_ids.insert(key.to_owned(), id.clone());
@@ -723,6 +742,12 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             args.push(spec.crate_name.clone());
             args.push("--crate-type".to_owned());
             args.push(spec.crate_type.clone());
+            if spec.crate_type == "proc-macro" {
+                // rustc only exposes the proc_macro crate to explicitly
+                // requested externs.
+                args.push("--extern".to_owned());
+                args.push("proc_macro".to_owned());
+            }
             args.push("--edition".to_owned());
             args.push(spec.edition.to_rustc().to_owned());
             args.push("-C".to_owned());

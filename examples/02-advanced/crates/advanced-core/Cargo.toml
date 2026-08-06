@@ -1,0 +1,10 @@
+[package]
+name = "advanced-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "advanced_core"
+crate-type = ["rlib", "cdylib"]
+
+[build-dependencies]

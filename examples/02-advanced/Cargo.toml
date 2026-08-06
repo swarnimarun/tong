@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/advanced-core", "crates/shout", "crates/advanced-app"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+overflow-checks = false

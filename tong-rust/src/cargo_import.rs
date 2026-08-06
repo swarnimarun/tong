@@ -214,12 +214,18 @@ pub fn import_cargo_workspace(workspace_root: &Path) -> Result<RustModel, CargoI
             edition: parse_edition(&package.edition)?,
             lib: None,
             bins: Vec::new(),
-            build_script: package.build.as_ref().map(PathBuf::from),
+            build_script: None,
             deps: Vec::new(),
             build_deps: Vec::new(),
             rustflags: Vec::new(),
             env: BTreeMap::new(),
         };
+        // Cargo auto-detects build.rs at the package root when the `build`
+        // key is absent.
+        pkg.build_script =
+            package.build.as_ref().map(PathBuf::from).or_else(|| {
+                (pkg.dir.join("build.rs").is_file()).then(|| PathBuf::from("build.rs"))
+            });
 
         // Library target: explicit [lib] or auto-detected src/lib.rs.
         let lib_path = match &manifest.lib {
