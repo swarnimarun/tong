@@ -87,7 +87,12 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
     // 2. Ask rustc for its sysroot and verbose version.
     let sysroot = run(&rustc, &["--print", "sysroot"])?;
     let version_verbose = run(&rustc, &["-vV"])?;
-    let host_triple = run(&rustc, &["--print", "host"])?;
+    let host_triple = version_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::trim)
+        .ok_or_else(|| ToolchainError::Missing("rustc -vV reported no host triple".to_owned()))?
+        .to_owned();
 
     let root = PathBuf::from(sysroot.trim());
     let real_rustc = root.join("bin").join("rustc");

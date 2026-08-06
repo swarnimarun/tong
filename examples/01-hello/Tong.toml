@@ -1,0 +1,14 @@
+[workspace]
+name = "hello"
+
+[toolchain.rust]
+kind = "system"
+
+[profile.dev]
+opt_level = 0
+debug = true
+
+[target.hello]
+rule = "rust_binary"
+crate_root = "src/main.rs"
+edition = "2021"

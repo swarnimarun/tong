@@ -201,6 +201,7 @@ impl<'a> RustBackend<'a> {
                     cc.clone(),
                     binary.clone(),
                     "bin",
+                    None,
                     &pkg.build_deps,
                     None,
                     script.clone(),
@@ -249,6 +250,7 @@ impl<'a> RustBackend<'a> {
                         cc.clone(),
                         crate_name(&pkg.name),
                         "proc-macro",
+                        None,
                         &pkg.deps,
                         bs_run.clone(),
                         lib.path.clone(),
@@ -271,6 +273,7 @@ impl<'a> RustBackend<'a> {
                             cc.clone(),
                             crate_name(&pkg.name),
                             crate_type.to_rustc(),
+                            None,
                             &pkg.deps,
                             bs_run.clone(),
                             lib.path.clone(),
@@ -303,6 +306,7 @@ impl<'a> RustBackend<'a> {
                     cc.clone(),
                     crate_name(&bin.name),
                     "bin",
+                    Some(bin.name.clone()),
                     &deps,
                     bs_run.clone(),
                     bin.path.clone(),
@@ -361,13 +365,16 @@ impl<'a> RustBackend<'a> {
         cc: Vec<(String, TreeDigest, String)>,
         crate_name: String,
         crate_type: &str,
+        output_name: Option<String>,
         deps: &[Dep],
         build_script: Option<ActionId>,
         crate_root: PathBuf,
         extra_flags: Vec<String>,
     ) -> Result<ActionId, PlanError> {
         let meta = self.metadata(&crate_name, crate_type);
-        let output = if crate_type == "bin" {
+        let output = if let Some(name) = output_name {
+            name
+        } else if crate_type == "bin" {
             crate_name.clone()
         } else {
             let ext = if crate_type == "proc-macro" {
