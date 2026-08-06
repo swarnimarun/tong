@@ -1,0 +1,6 @@
+[package]
+name = "tong-store"
+description = "Content-addressed store, action cache, build state, and garbage collection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "tong-core"
+description = "Core data model: actions, artifacts, digests, platforms, providers, diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true

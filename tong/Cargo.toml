@@ -1,0 +1,6 @@
+[package]
+name = "tong"
+description = "Tong command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
