@@ -3,3 +3,9 @@
 //! Owns the content-addressed store, action cache, build-state manifests, and
 //! reachability-based garbage collection. Atomic CAS writes and per-digest
 //! concurrency rules are defined in PLAN.md section 10.
+
+pub mod action_cache;
+pub mod cas;
+
+pub use action_cache::{ActionCache, CachedResult};
+pub use cas::{CAPTURE_EXCLUDES, Cas};

@@ -1,0 +1,536 @@
+//! The local content-addressed store.
+//!
+//! Layout (PLAN.md section 10):
+//!
+//! ```text
+//! <root>/
+//!   blobs/<hex[0..2]>/<hex[2..]>   file contents
+//!   trees/<hex[0..2]>/<hex[2..]>   canonical tree encodings
+//!   tmp/                           in-progress writes
+//! ```
+//!
+//! Identity comes exclusively from digests. Writes go to a temporary file,
+//! are digest-verified, then atomically renamed into place (section 10.1);
+//! duplicate writers are tolerated because the final rename is idempotent.
+
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use tong_core::artifact::{BlobDigest, TreeDigest};
+use tong_core::canonical::{self, CanonicalDecode, CanonicalEncode};
+use tong_core::digest::{Digest, Hasher};
+use tong_core::paths::RelativePath;
+use tong_core::tree::{Tree, TreeEntry};
+
+/// Directory names never captured as source content (PLAN.md section 8.3:
+/// exclude known output directories).
+pub const CAPTURE_EXCLUDES: &[&str] = &[".tong", "target", ".git", ".jj"];
+
+/// A local content-addressed store.
+#[derive(Clone, Debug)]
+pub struct Cas {
+    root: PathBuf,
+}
+
+impl Cas {
+    /// Opens (creating if needed) the store at `root`.
+    pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
+        let root = root.into();
+        fs::create_dir_all(root.join("tmp"))?;
+        fs::create_dir_all(root.join("blobs"))?;
+        fs::create_dir_all(root.join("trees"))?;
+        Ok(Self { root })
+    }
+
+    /// Returns the store root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn object_path(&self, namespace: &str, digest: Digest) -> PathBuf {
+        let hex = digest.to_hex();
+        self.root.join(namespace).join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// Returns the filesystem path of a blob, if present.
+    pub fn blob_path(&self, digest: BlobDigest) -> Option<PathBuf> {
+        let path = self.object_path("blobs", digest.digest());
+        path.exists().then_some(path)
+    }
+
+    /// Returns whether a blob is present.
+    pub fn has_blob(&self, digest: BlobDigest) -> bool {
+        self.blob_path(digest).is_some()
+    }
+
+    /// Reads a blob into memory.
+    pub fn read_blob(&self, digest: BlobDigest) -> io::Result<Vec<u8>> {
+        let path = self
+            .blob_path(digest)
+            .ok_or_else(|| not_found(format!("blob {}", digest.digest())))?;
+        fs::read(path)
+    }
+
+    /// Writes a blob, returning its digest. Atomic and idempotent.
+    pub fn put_blob(&self, data: &[u8]) -> io::Result<BlobDigest> {
+        let digest = BlobDigest::new(Hasher::digest(data));
+        self.write_object("blobs", digest.digest(), |w| w.write_all(data))?;
+        Ok(digest)
+    }
+
+    /// Imports a file into the store, streaming the hash. The file mode's
+    /// executable bit is recorded by the caller in the containing tree.
+    pub fn put_file(&self, path: &Path) -> io::Result<BlobDigest> {
+        // Hash while copying to a temp file, then rename to the digest path.
+        let tmp = self.root.join("tmp").join(unique_name());
+        let digest = {
+            let mut reader = fs::File::open(path)?;
+            let mut writer = fs::File::create(&tmp)?;
+            let mut hasher = Hasher::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                writer.write_all(&buf[..n])?;
+            }
+            hasher.finish()
+        };
+        let digest = BlobDigest::new(digest);
+        self.place_verified("blobs", digest.digest(), &tmp, None)?;
+        Ok(digest)
+    }
+
+    fn write_object(
+        &self,
+        namespace: &str,
+        digest: Digest,
+        write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let tmp = self.root.join("tmp").join(unique_name());
+        {
+            let mut file = fs::File::create(&tmp)?;
+            write(&mut file)?;
+        }
+        self.place_verified(namespace, digest, &tmp, None)
+    }
+
+    /// Verifies the temp file's digest and atomically moves it into place.
+    fn place_verified(
+        &self,
+        namespace: &str,
+        digest: Digest,
+        tmp: &Path,
+        expected_len: Option<u64>,
+    ) -> io::Result<()> {
+        let actual = hash_file(tmp)?;
+        if actual != digest {
+            let _ = fs::remove_file(tmp);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("digest mismatch while storing: expected {digest}, wrote {actual}"),
+            ));
+        }
+        if let Some(len) = expected_len {
+            let actual_len = fs::metadata(tmp)?.len();
+            if actual_len != len {
+                let _ = fs::remove_file(tmp);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("length mismatch while storing {digest}"),
+                ));
+            }
+        }
+        let dest = self.object_path(namespace, digest);
+        if dest.exists() {
+            // Duplicate writer: content is identical by construction.
+            let _ = fs::remove_file(tmp);
+            return Ok(());
+        }
+        fs::create_dir_all(dest.parent().unwrap())?;
+        // Read-only: stored objects are immutable (section 10.1).
+        let mut perms = fs::metadata(tmp)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o444);
+        }
+        fs::set_permissions(tmp, perms)?;
+        match fs::rename(tmp, &dest) {
+            Ok(()) => Ok(()),
+            Err(err) if dest.exists() => {
+                // Lost a duplicate-writer race; content is identical.
+                let _ = fs::remove_file(tmp);
+                let _ = err;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Stores a tree (assuming subtrees are already stored) and returns its
+    /// digest.
+    ///
+    /// The stored bytes are exactly the digest pre-image: schema version
+    /// followed by the canonical tree encoding.
+    pub fn put_tree(&self, tree: &Tree) -> io::Result<TreeDigest> {
+        let digest = tree.digest();
+        let mut enc = canonical::Encoder::new();
+        enc.write_u32(tong_core::tree::TREE_SCHEMA_VERSION);
+        tree.encode(&mut enc);
+        let bytes = enc.into_bytes();
+        self.write_object("trees", digest.digest(), |w| w.write_all(&bytes))?;
+        Ok(digest)
+    }
+
+    /// Reads a stored tree by digest.
+    pub fn get_tree(&self, digest: TreeDigest) -> io::Result<Option<Tree>> {
+        let path = self.object_path("trees", digest.digest());
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        let mut dec = canonical::Decoder::new(&bytes);
+        let version = dec
+            .read_u32()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        if version != tong_core::tree::TREE_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported tree schema version {version}"),
+            ));
+        }
+        let tree = Tree::decode(&mut dec)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        dec.expect_end()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        Ok(Some(tree))
+    }
+
+    /// Captures a directory as a canonical tree, importing all file contents.
+    ///
+    /// Directories named in [`CAPTURE_EXCLUDES`] are skipped (PLAN.md
+    /// section 8.3: known output directories never enter source inputs).
+    pub fn capture_dir(&self, path: &Path) -> io::Result<TreeDigest> {
+        self.capture_dir_filtered(path, &CAPTURE_EXCLUDES.iter().copied().collect())
+    }
+
+    /// Captures a directory, skipping entries with excluded names.
+    pub fn capture_dir_filtered(
+        &self,
+        path: &Path,
+        excludes: &std::collections::BTreeSet<&str>,
+    ) -> io::Result<TreeDigest> {
+        let mut entries = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().into_string().map_err(|name| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-UTF-8 file name {name:?} in {}", path.display()),
+                )
+            })?;
+            if excludes.contains(name.as_str()) {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let tree_entry = if file_type.is_dir() {
+                TreeEntry::Directory(self.capture_dir_filtered(&entry.path(), excludes)?)
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(entry.path())?;
+                TreeEntry::Symlink {
+                    target: target.to_string_lossy().into_owned(),
+                }
+            } else if file_type.is_file() {
+                TreeEntry::File {
+                    digest: self.put_file(&entry.path())?,
+                    executable: is_executable(&entry.path())?,
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported file type: {}", entry.path().display()),
+                ));
+            };
+            entries.insert(name, tree_entry);
+        }
+        let tree = Tree::new(entries)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        self.put_tree(&tree)
+    }
+
+    /// Materializes a tree into `dest` (created if missing), hardlinking
+    /// blobs where possible.
+    pub fn materialize(&self, tree: TreeDigest, dest: &Path) -> io::Result<()> {
+        fs::create_dir_all(dest)?;
+        let tree = self
+            .get_tree(tree)?
+            .ok_or_else(|| not_found(format!("tree {}", tree.digest())))?;
+        for (name, entry) in tree.entries() {
+            let path = dest.join(name);
+            match entry {
+                TreeEntry::File { digest, executable } => {
+                    let blob = self
+                        .blob_path(*digest)
+                        .ok_or_else(|| not_found(format!("blob {}", digest.digest())))?;
+                    if path.exists() {
+                        fs::remove_file(&path)?;
+                    }
+                    if fs::hard_link(&blob, &path).is_err() {
+                        fs::copy(&blob, &path)?;
+                    }
+                    // Stored blobs are read-only; materialized files must be
+                    // writable-removable and keep their executable bit.
+                    let mut perms = fs::metadata(&path)?.permissions();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        perms.set_mode(if *executable { 0o755 } else { 0o644 });
+                    }
+                    fs::set_permissions(&path, perms)?;
+                }
+                TreeEntry::Symlink { target } => {
+                    if path.symlink_metadata().is_ok() {
+                        fs::remove_file(&path)?;
+                    }
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(target, &path)?;
+                    #[cfg(not(unix))]
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "symlink materialization is only implemented on unix",
+                    ));
+                }
+                TreeEntry::Directory(sub) => self.materialize(*sub, &path)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Assembles a single tree from mounts: `(mount point, tree)` pairs.
+    ///
+    /// The mount point `.` merges the tree at the root. Mounts under
+    /// directories create intermediate directories as needed; conflicting
+    /// non-directory entries are an error.
+    pub fn assemble(&self, mounts: &[(RelativePath, TreeDigest)]) -> io::Result<TreeDigest> {
+        // Build an in-memory nested structure, then store bottom-up.
+        #[derive(Default)]
+        struct Node {
+            file: Option<TreeEntry>,
+            children: std::collections::BTreeMap<String, Node>,
+        }
+
+        fn insert(
+            node: &mut Node,
+            components: &[String],
+            tree: TreeDigest,
+            cas: &Cas,
+        ) -> io::Result<()> {
+            match components.split_first() {
+                None => {
+                    // Merge this tree's entries into the current node.
+                    let tree = cas
+                        .get_tree(tree)?
+                        .ok_or_else(|| not_found("assembled tree"))?;
+                    for (name, entry) in tree.entries() {
+                        match entry {
+                            TreeEntry::Directory(sub) => {
+                                let child = node.children.entry(name.clone()).or_default();
+                                insert(child, &[], *sub, cas)?;
+                            }
+                            other => {
+                                if node.children.contains_key(name) {
+                                    return Err(conflict(name));
+                                }
+                                node.children.entry(name.clone()).or_default().file =
+                                    Some(other.clone());
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Some((first, rest)) => {
+                    let child = node.children.entry(first.clone()).or_default();
+                    insert(child, rest, tree, cas)
+                }
+            }
+        }
+
+        fn store(node: &Node, cas: &Cas) -> io::Result<TreeDigest> {
+            let mut entries = std::collections::BTreeMap::new();
+            for (name, child) in &node.children {
+                let entry = match &child.file {
+                    Some(file) if child.children.is_empty() => file.clone(),
+                    Some(_) => return Err(conflict(name)),
+                    None => TreeEntry::Directory(store(child, cas)?),
+                };
+                entries.insert(name.clone(), entry);
+            }
+            let tree = Tree::new(entries)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            cas.put_tree(&tree)
+        }
+
+        let mut root = Node::default();
+        for (mount, tree) in mounts {
+            let components: Vec<String> = if mount.as_str() == RelativePath::ROOT {
+                Vec::new()
+            } else {
+                mount.as_str().split('/').map(str::to_owned).collect()
+            };
+            insert(&mut root, &components, *tree, self)?;
+        }
+        store(&root, self)
+    }
+}
+
+fn hash_file(path: &Path) -> io::Result<Digest> {
+    let mut reader = fs::File::open(path)?;
+    let mut hasher = Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finish())
+}
+
+fn is_executable(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::metadata(path)?.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
+    }
+}
+
+fn unique_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn not_found(what: impl Into<String>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{} not in store", what.into()),
+    )
+}
+
+fn conflict(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("conflicting entries for {name:?} while assembling tree"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_cas() -> (tempfile::TempDir, Cas) {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path().join("store")).unwrap();
+        (dir, cas)
+    }
+
+    #[test]
+    fn blob_roundtrip() {
+        let (_dir, cas) = temp_cas();
+        let digest = cas.put_blob(b"hello tong").unwrap();
+        assert!(cas.has_blob(digest));
+        assert_eq!(cas.read_blob(digest).unwrap(), b"hello tong");
+    }
+
+    #[test]
+    fn capture_and_materialize_roundtrip() {
+        let (_dir, cas) = temp_cas();
+        let src = cas.root().parent().unwrap().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"aaa").unwrap();
+        fs::write(src.join("sub/b.txt"), b"bbb").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+
+        let tree = cas.capture_dir(&src).unwrap();
+        let out = cas.root().parent().unwrap().join("out");
+        cas.materialize(tree, &out).unwrap();
+
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"aaa");
+        assert_eq!(fs::read(out.join("sub/b.txt")).unwrap(), b"bbb");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(out.join("link")).unwrap().to_str().unwrap(),
+            "a.txt"
+        );
+    }
+
+    #[test]
+    fn capture_excludes_output_dirs() {
+        let (_dir, cas) = temp_cas();
+        let src = cas.root().parent().unwrap().join("src2");
+        fs::create_dir_all(src.join("target")).unwrap();
+        fs::create_dir_all(src.join(".tong")).unwrap();
+        fs::write(src.join("keep.txt"), b"k").unwrap();
+        fs::write(src.join("target/junk"), b"j").unwrap();
+
+        let tree = cas.capture_dir(&src).unwrap();
+        let tree = cas.get_tree(tree).unwrap().unwrap();
+        assert!(tree.entries().contains_key("keep.txt"));
+        assert!(!tree.entries().contains_key("target"));
+        assert!(!tree.entries().contains_key(".tong"));
+    }
+
+    #[test]
+    fn assemble_merges_mounts() {
+        let (_dir, cas) = temp_cas();
+        let base_dir = cas.root().parent().unwrap().join("base");
+        let dep_dir = cas.root().parent().unwrap().join("dep");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&dep_dir).unwrap();
+        fs::write(base_dir.join("main.rs"), b"fn main() {}").unwrap();
+        fs::write(dep_dir.join("libfoo.rlib"), b"rlib").unwrap();
+
+        let base = cas.capture_dir(&base_dir).unwrap();
+        let dep = cas.capture_dir(&dep_dir).unwrap();
+        let merged = cas
+            .assemble(&[
+                (RelativePath::new(".").unwrap(), base),
+                (RelativePath::new("deps").unwrap(), dep),
+            ])
+            .unwrap();
+
+        let out = cas.root().parent().unwrap().join("merged");
+        cas.materialize(merged, &out).unwrap();
+        assert_eq!(fs::read(out.join("main.rs")).unwrap(), b"fn main() {}");
+        assert_eq!(fs::read(out.join("deps/libfoo.rlib")).unwrap(), b"rlib");
+    }
+
+    #[test]
+    fn stored_objects_are_read_only() {
+        let (_dir, cas) = temp_cas();
+        let digest = cas.put_blob(b"immutable").unwrap();
+        let path = cas.blob_path(digest).unwrap();
+        let perms = fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(perms.mode() & 0o222, 0);
+        }
+        let _ = perms;
+    }
+}
