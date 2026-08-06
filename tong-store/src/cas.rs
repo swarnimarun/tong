@@ -40,6 +40,7 @@ impl Cas {
         fs::create_dir_all(root.join("tmp"))?;
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("trees"))?;
+        fs::create_dir_all(root.join("bundles"))?;
         Ok(Self { root })
     }
 
@@ -208,6 +209,48 @@ impl Cas {
         dec.expect_end()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
         Ok(Some(tree))
+    }
+
+    /// Stores an environment bundle, returning its digest. The stored bytes
+    /// are the digest pre-image: schema version plus canonical encoding.
+    pub fn put_bundle(
+        &self,
+        bundle: &tong_core::bundle::EnvironmentBundle,
+    ) -> io::Result<tong_core::digest::Digest> {
+        let digest = bundle.digest();
+        let mut enc = canonical::Encoder::new();
+        enc.write_u32(tong_core::bundle::ENVIRONMENT_BUNDLE_SCHEMA_VERSION);
+        bundle.encode(&mut enc);
+        let bytes = enc.into_bytes();
+        self.write_object("bundles", digest, |w| w.write_all(&bytes))?;
+        Ok(digest)
+    }
+
+    /// Reads a stored environment bundle by digest.
+    pub fn get_bundle(
+        &self,
+        digest: Digest,
+    ) -> io::Result<Option<tong_core::bundle::EnvironmentBundle>> {
+        let path = self.object_path("bundles", digest);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        let mut dec = canonical::Decoder::new(&bytes);
+        let version = dec
+            .read_u32()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        if version != tong_core::bundle::ENVIRONMENT_BUNDLE_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bundle schema version {version}"),
+            ));
+        }
+        let bundle = decode_bundle(&mut dec)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        dec.expect_end()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        Ok(Some(bundle))
     }
 
     /// Captures a directory as a canonical tree, importing all file contents.
@@ -385,6 +428,22 @@ impl Cas {
         }
         store(&root, self)
     }
+}
+
+fn decode_bundle(
+    dec: &mut canonical::Decoder<'_>,
+) -> Result<tong_core::bundle::EnvironmentBundle, canonical::DecodeError> {
+    use tong_core::action::CanonicalValue;
+    use tong_core::bundle::EnvironmentBundle;
+    use tong_core::platform::PlatformKey;
+    Ok(EnvironmentBundle {
+        name: String::decode(dec)?,
+        provider: String::decode(dec)?,
+        platform: PlatformKey::new(std::collections::BTreeMap::decode(dec)?),
+        variables: std::collections::BTreeMap::decode(dec)?,
+        files: TreeDigest::new(Digest::decode(dec)?),
+        metadata: std::collections::BTreeMap::<String, CanonicalValue>::decode(dec)?,
+    })
 }
 
 fn hash_file(path: &Path) -> io::Result<Digest> {

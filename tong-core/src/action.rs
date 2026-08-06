@@ -155,6 +155,20 @@ impl CanonicalEncode for CanonicalValue {
     }
 }
 
+impl crate::canonical::CanonicalDecode for CanonicalValue {
+    fn decode(
+        dec: &mut crate::canonical::Decoder<'_>,
+    ) -> Result<Self, crate::canonical::DecodeError> {
+        use crate::canonical::DecodeError;
+        match dec.read_discriminant()? {
+            0 => Ok(Self::Bool(bool::decode(dec)?)),
+            1 => Ok(Self::Int(i64::decode(dec)?)),
+            2 => Ok(Self::String(String::decode(dec)?)),
+            tag => Err(DecodeError::InvalidTag(tag)),
+        }
+    }
+}
+
 /// The versioned action schema (PLAN.md section 4.4).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ActionSpec {

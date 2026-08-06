@@ -164,6 +164,11 @@ dependencies = [
 [[package]]
 name = "tong-exec"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tong-core",
+ "tong-store",
+]
 
 [[package]]
 name = "tong-graph"

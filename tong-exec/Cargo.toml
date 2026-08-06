@@ -4,3 +4,10 @@ description = "Action execution: local/process executors, results, structured ev
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+tong-core = { path = "../tong-core" }
+tong-store = { path = "../tong-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
