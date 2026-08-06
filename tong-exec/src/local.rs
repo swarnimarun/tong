@@ -35,9 +35,7 @@ use tong_core::tree::TreeEntry;
 use tong_store::Cas;
 
 /// Placeholder substituted with the action's exec root path.
-pub const EXEC_ROOT_VAR: &str = "{exec_root}";
-/// Placeholder substituted with the environment bundle's local root.
-pub const BUNDLE_ROOT_VAR: &str = "{bundle_root}";
+pub use tong_core::action::{BUNDLE_ROOT_VAR, EXEC_ROOT_VAR};
 
 /// The result of a successful, validated execution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

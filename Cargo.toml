@@ -5,6 +5,7 @@ members = [
     "tong-core",
     "tong-exec",
     "tong-graph",
+    "tong-rust",
     "tong-store",
 ]
 

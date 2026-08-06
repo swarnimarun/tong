@@ -340,6 +340,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tong-rust"
+version = "0.1.0"
+dependencies = [
+ "tong-core",
+ "tong-exec",
+ "tong-graph",
+ "tong-store",
+]
+
+[[package]]
 name = "tong-store"
 version = "0.1.0"
 dependencies = [

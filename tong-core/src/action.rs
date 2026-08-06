@@ -25,6 +25,14 @@ use crate::platform::PlatformKey;
 /// Schema version of the action encoding.
 pub const ACTION_SCHEMA_VERSION: u32 = 1;
 
+/// Placeholder substituted with the action's exec root path at execution
+/// time.
+pub const EXEC_ROOT_VAR: &str = "{exec_root}";
+
+/// Placeholder substituted with the environment bundle's local root at
+/// execution time.
+pub const BUNDLE_ROOT_VAR: &str = "{bundle_root}";
+
 /// Graph identity of an action, used for diagnostics and queries.
 ///
 /// Never encoded into the semantic digest (PLAN.md section 4.1).

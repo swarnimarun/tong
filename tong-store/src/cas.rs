@@ -267,6 +267,26 @@ impl Cas {
         path: &Path,
         excludes: &std::collections::BTreeSet<&str>,
     ) -> io::Result<TreeDigest> {
+        self.walk_dir(path, excludes, true)
+    }
+
+    /// Computes a directory's tree digest without importing file contents
+    /// (fingerprint-only). Used for system-captured toolchains, whose files
+    /// stay in place (PLAN.md section 5).
+    pub fn fingerprint_dir(
+        &self,
+        path: &Path,
+        excludes: &std::collections::BTreeSet<&str>,
+    ) -> io::Result<TreeDigest> {
+        self.walk_dir(path, excludes, false)
+    }
+
+    fn walk_dir(
+        &self,
+        path: &Path,
+        excludes: &std::collections::BTreeSet<&str>,
+        import_blobs: bool,
+    ) -> io::Result<TreeDigest> {
         let mut entries = std::collections::BTreeMap::new();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
@@ -281,15 +301,20 @@ impl Cas {
             }
             let file_type = entry.file_type()?;
             let tree_entry = if file_type.is_dir() {
-                TreeEntry::Directory(self.capture_dir_filtered(&entry.path(), excludes)?)
+                TreeEntry::Directory(self.walk_dir(&entry.path(), excludes, import_blobs)?)
             } else if file_type.is_symlink() {
                 let target = fs::read_link(entry.path())?;
                 TreeEntry::Symlink {
                     target: target.to_string_lossy().into_owned(),
                 }
             } else if file_type.is_file() {
+                let digest = if import_blobs {
+                    self.put_file(&entry.path())?
+                } else {
+                    BlobDigest::new(hash_file(&entry.path())?)
+                };
                 TreeEntry::File {
-                    digest: self.put_file(&entry.path())?,
+                    digest,
                     executable: is_executable(&entry.path())?,
                 }
             } else {

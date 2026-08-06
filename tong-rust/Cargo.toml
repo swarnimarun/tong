@@ -1,0 +1,12 @@
+[package]
+name = "tong-rust"
+description = "Rust backend: target model, toolchain capture, action planning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tong-core = { path = "../tong-core" }
+tong-exec = { path = "../tong-exec" }
+tong-graph = { path = "../tong-graph" }
+tong-store = { path = "../tong-store" }
