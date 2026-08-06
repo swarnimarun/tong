@@ -10,3 +10,8 @@ tong-core = { path = "../tong-core" }
 tong-exec = { path = "../tong-exec" }
 tong-graph = { path = "../tong-graph" }
 tong-store = { path = "../tong-store" }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

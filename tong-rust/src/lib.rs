@@ -7,10 +7,12 @@
 
 pub mod backend;
 pub mod build_directives;
+pub mod cargo_import;
 pub mod model;
 pub mod toolchain;
 
 pub use backend::{FinalArtifact, RustBackend};
+pub use cargo_import::{CargoImportError, import_cargo_workspace};
 pub use model::{
     BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PanicStrategy,
     ProfileSpec, RustModel,

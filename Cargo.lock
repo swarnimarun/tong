@@ -343,6 +343,9 @@ dependencies = [
 name = "tong-rust"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "tempfile",
+ "toml",
  "tong-core",
  "tong-exec",
  "tong-graph",
