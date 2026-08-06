@@ -4,3 +4,11 @@ description = "Tong command-line interface"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+tong-core = { path = "../tong-core" }
+tong-exec = { path = "../tong-exec" }
+tong-graph = { path = "../tong-graph" }
+tong-rust = { path = "../tong-rust" }
+tong-store = { path = "../tong-store" }
+clap = { workspace = true }
