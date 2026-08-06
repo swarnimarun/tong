@@ -28,6 +28,7 @@
 //! other's data.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use crate::digest::{Digest, Hasher};
@@ -153,6 +154,229 @@ impl Encoder {
     pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
+}
+
+/// Decodes a value from its canonical binary form.
+///
+/// Implemented by hand alongside each [`CanonicalEncode`] impl; unknown
+/// trailing bytes and out-of-range tags are always errors.
+pub trait CanonicalDecode: Sized {
+    /// Reads a value from `dec`.
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError>;
+}
+
+/// A cursor over canonically encoded bytes.
+pub struct Decoder<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Decoder<'a> {
+    /// Creates a decoder over `buf`.
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// Returns an error unless every byte has been consumed.
+    pub fn expect_end(&self) -> Result<(), DecodeError> {
+        if self.pos == self.buf.len() {
+            Ok(())
+        } else {
+            Err(DecodeError::TrailingBytes(self.buf.len() - self.pos))
+        }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
+        if self.buf.len() - self.pos < len {
+            return Err(DecodeError::UnexpectedEof {
+                needed: len,
+                remaining: self.buf.len() - self.pos,
+            });
+        }
+        let out = &self.buf[self.pos..self.pos + len];
+        self.pos += len;
+        Ok(out)
+    }
+
+    /// Reads a `u8`.
+    pub fn read_u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    /// Reads a little-endian `u32`.
+    pub fn read_u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    /// Reads a little-endian `u64`.
+    pub fn read_u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// Reads a little-endian two's complement `i64`.
+    pub fn read_i64(&mut self) -> Result<i64, DecodeError> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// Reads a boolean tag; values other than `0x00`/`0x01` are errors.
+    pub fn read_bool(&mut self) -> Result<bool, DecodeError> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            tag => Err(DecodeError::InvalidTag(tag as u32)),
+        }
+    }
+
+    /// Reads raw bytes without consuming a length prefix.
+    pub fn read_raw(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
+        self.take(len)
+    }
+
+    /// Reads a length-prefixed byte string.
+    pub fn read_bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
+        let len = self.read_u64()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    /// Reads a length-prefixed UTF-8 string.
+    pub fn read_str(&mut self) -> Result<String, DecodeError> {
+        let bytes = self.read_bytes()?;
+        String::from_utf8(bytes).map_err(DecodeError::InvalidUtf8)
+    }
+
+    /// Reads a `u32` discriminant for enum decoding.
+    pub fn read_discriminant(&mut self) -> Result<u32, DecodeError> {
+        self.read_u32()
+    }
+}
+
+/// Error returned when canonical decoding fails.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Fewer bytes remain than the value requires.
+    UnexpectedEof {
+        /// Bytes the value needs.
+        needed: usize,
+        /// Bytes left in the input.
+        remaining: usize,
+    },
+    /// A boolean or enum tag was out of range.
+    InvalidTag(u32),
+    /// A string was not valid UTF-8.
+    InvalidUtf8(std::string::FromUtf8Error),
+    /// Bytes remain after the value was fully decoded.
+    TrailingBytes(usize),
+    /// A decoded value failed schema-level validation.
+    InvalidValue(String),
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedEof { needed, remaining } => {
+                write!(
+                    f,
+                    "unexpected end of input: needed {needed} bytes, {remaining} remain"
+                )
+            }
+            Self::InvalidTag(tag) => write!(f, "invalid tag {tag}"),
+            Self::InvalidUtf8(err) => write!(f, "invalid UTF-8: {err}"),
+            Self::TrailingBytes(n) => write!(f, "{n} trailing bytes after value"),
+            Self::InvalidValue(msg) => write!(f, "invalid value: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl CanonicalDecode for u8 {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_u8()
+    }
+}
+
+impl CanonicalDecode for u32 {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_u32()
+    }
+}
+
+impl CanonicalDecode for u64 {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_u64()
+    }
+}
+
+impl CanonicalDecode for i64 {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_i64()
+    }
+}
+
+impl CanonicalDecode for bool {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_bool()
+    }
+}
+
+impl CanonicalDecode for String {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        dec.read_str()
+    }
+}
+
+impl CanonicalDecode for Digest {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let bytes: [u8; crate::digest::DIGEST_LEN] =
+            dec.read_raw(crate::digest::DIGEST_LEN)?.try_into().unwrap();
+        Ok(Digest::from_bytes(bytes))
+    }
+}
+
+impl<T: CanonicalDecode> CanonicalDecode for Option<T> {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        match dec.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(T::decode(dec)?)),
+            tag => Err(DecodeError::InvalidTag(tag as u32)),
+        }
+    }
+}
+
+impl<T: CanonicalDecode> CanonicalDecode for Vec<T> {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let len = dec.read_u64()? as usize;
+        let mut out = Vec::with_capacity(len.min(1024));
+        for _ in 0..len {
+            out.push(T::decode(dec)?);
+        }
+        Ok(out)
+    }
+}
+
+impl<K, V> CanonicalDecode for BTreeMap<K, V>
+where
+    K: CanonicalDecode + Ord,
+    V: CanonicalDecode,
+{
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let len = dec.read_u64()? as usize;
+        let mut out = BTreeMap::new();
+        for _ in 0..len {
+            let key = K::decode(dec)?;
+            let value = V::decode(dec)?;
+            out.insert(key, value);
+        }
+        Ok(out)
+    }
+}
+
+/// Decodes a complete buffer, rejecting trailing bytes.
+pub fn decode_all<T: CanonicalDecode>(buf: &[u8]) -> Result<T, DecodeError> {
+    let mut dec = Decoder::new(buf);
+    let value = T::decode(&mut dec)?;
+    dec.expect_end()?;
+    Ok(value)
 }
 
 /// Returns the canonical encoding of `value`.
@@ -325,5 +549,38 @@ mod tests {
     fn durations_encode_secs_then_nanos() {
         let duration = Duration::new(5, 7);
         assert_eq!(bytes(&duration), vec![5, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_roundtrips() {
+        let mut map = BTreeMap::new();
+        map.insert("key".to_string(), vec![1u64, 2, 3]);
+        let encoded = encode_vec(&map);
+        assert_eq!(decode_all::<BTreeMap<String, Vec<u64>>>(&encoded), Ok(map));
+
+        assert_eq!(
+            decode_all::<Option<String>>(&encode_vec(&None::<String>)),
+            Ok(None)
+        );
+        assert_eq!(
+            decode_all::<Option<String>>(&encode_vec(&Some("hi".to_owned()))),
+            Ok(Some("hi".to_owned()))
+        );
+    }
+
+    #[test]
+    fn decode_rejects_bad_input() {
+        assert!(matches!(
+            decode_all::<u32>(&[1, 2]),
+            Err(DecodeError::UnexpectedEof { .. })
+        ));
+        assert!(matches!(
+            decode_all::<bool>(&[2]),
+            Err(DecodeError::InvalidTag(2))
+        ));
+        assert!(matches!(
+            decode_all::<u8>(&[1, 2]),
+            Err(DecodeError::TrailingBytes(1))
+        ));
     }
 }

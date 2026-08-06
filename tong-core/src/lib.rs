@@ -12,5 +12,11 @@
 //! the cross-platform cache-compatibility contract, so change them only with
 //! a schema-version bump.
 
+pub mod action;
+pub mod artifact;
+pub mod bundle;
 pub mod canonical;
 pub mod digest;
+pub mod paths;
+pub mod platform;
+pub mod tree;
