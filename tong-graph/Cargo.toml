@@ -4,3 +4,13 @@ description = "Labels, configured target graph, pure analysis, and scheduling"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+tong-core = { path = "../tong-core" }
+tong-store = { path = "../tong-store" }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
