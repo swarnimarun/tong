@@ -12,7 +12,8 @@
 //! changes invalidate caches (sections 4.3, 5, 8.4).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use tong_core::action::{
     ACTION_SCHEMA_VERSION, ActionId, ActionSpec, Argument, CachePolicy, CanonicalValue,
@@ -123,6 +124,10 @@ pub struct RustBackend<'a> {
     profile_name: String,
     profile: ProfileSpec,
     source_trees: BTreeMap<String, TreeDigest>,
+    /// Original crate path (relative to the package dir) → rewritten path
+    /// inside the source tree, for crate roots mounted outside the package
+    /// dir.
+    crate_roots: BTreeMap<(String, PathBuf), PathBuf>,
     cc: BTreeMap<String, CcInfo>,
     cc_closure: BTreeMap<String, Vec<String>>,
     planned_ids: BTreeMap<String, ActionId>,
@@ -148,6 +153,7 @@ impl<'a> RustBackend<'a> {
             profile_name: profile_name.to_owned(),
             profile,
             source_trees: BTreeMap::new(),
+            crate_roots: BTreeMap::new(),
             cc: BTreeMap::new(),
             cc_closure: BTreeMap::new(),
             planned_ids: BTreeMap::new(),
@@ -160,7 +166,56 @@ impl<'a> RustBackend<'a> {
         //    package tree, excluding known output directories).
         for pkg in &self.model.packages {
             let excludes = CAPTURE_EXCLUDES.iter().copied().collect();
-            let tree = self.cas.capture_dir_filtered(&pkg.dir, &excludes)?;
+            let mut tree = self.cas.capture_dir_filtered(&pkg.dir, &excludes)?;
+
+            // Tong.toml targets may reference crate roots outside the
+            // package dir (e.g. a shared bindings crate in another
+            // example). Mount each external crate's parent directory into
+            // the source tree at `ext/<n>` and rewrite the root.
+            let mut external: Vec<PathBuf> = Vec::new();
+            if let Some(lib) = &pkg.lib {
+                external.push(lib.path.clone());
+            }
+            for bin in &pkg.bins {
+                external.push(bin.path.clone());
+            }
+            if let Some(script) = &pkg.build_script {
+                external.push(script.clone());
+            }
+            let pkg_dir = fs::canonicalize(&pkg.dir)?;
+            let mut index = 0usize;
+            for path in external {
+                let full = pkg.dir.join(&path);
+                if !full.exists() {
+                    continue;
+                }
+                let canonical = fs::canonicalize(&full)?;
+                if canonical.starts_with(&pkg_dir) {
+                    continue;
+                }
+                let parent = canonical.parent().ok_or_else(|| {
+                    PlanError::Message(format!(
+                        "cannot mount external crate root {}",
+                        full.display()
+                    ))
+                })?;
+                let ext_tree = self.cas.capture_dir_filtered(parent, &excludes)?;
+                let mount = RelativePath::new(&format!("ext/{index}"))
+                    .map_err(|err| PlanError::Message(format!("invalid mount: {err}")))?;
+                tree = self
+                    .cas
+                    .assemble(&[(RelativePath::new(".").unwrap(), tree), (mount, ext_tree)])?;
+                let relative = canonical.strip_prefix(parent).map_err(|_| {
+                    PlanError::Message(format!(
+                        "cannot relativize external crate root {}",
+                        canonical.display()
+                    ))
+                })?;
+                let rewritten = PathBuf::from(format!("ext/{index}")).join(relative);
+                self.crate_roots.insert((pkg.name.clone(), path), rewritten);
+                index += 1;
+            }
+
             self.source_trees.insert(pkg.name.clone(), tree);
         }
 
@@ -207,6 +262,7 @@ impl<'a> RustBackend<'a> {
         // Build script: compile, then run.
         let mut bs_run: Option<ActionId> = None;
         if let Some(script) = &pkg.build_script {
+            let script = self.crate_root_for(&pkg.name, script);
             let binary = format!("{}_build_script", crate_name(&pkg.name));
             let compile_id = self.plan_compile(
                 actions,
@@ -269,7 +325,7 @@ impl<'a> RustBackend<'a> {
                     None,
                     &pkg.deps,
                     bs_run.clone(),
-                    lib.path.clone(),
+                    self.crate_root_for(&pkg.name, &lib.path),
                 )?;
             } else {
                 let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -277,6 +333,7 @@ impl<'a> RustBackend<'a> {
                 } else {
                     lib.crate_types.clone()
                 };
+                let lib_root = self.crate_root_for(&pkg.name, &lib.path);
                 for crate_type in types {
                     self.plan_compile(
                         actions,
@@ -291,7 +348,7 @@ impl<'a> RustBackend<'a> {
                         None,
                         &pkg.deps,
                         bs_run.clone(),
-                        lib.path.clone(),
+                        lib_root.clone(),
                     )?;
                 }
             }
@@ -338,7 +395,7 @@ impl<'a> RustBackend<'a> {
                 Some(bin.name.clone()),
                 &deps,
                 bs_run.clone(),
-                bin.path.clone(),
+                self.crate_root_for(&pkg.name, &bin.path),
             )?;
         }
         Ok(())
@@ -508,6 +565,15 @@ impl<'a> RustBackend<'a> {
         enc.write_str(kind);
         enc.write_str(&self.toolchain.host_triple);
         enc.digest().to_hex()[..16].to_owned()
+    }
+
+    /// The compile-time crate root for a package-relative path, rewritten
+    /// when the file lives outside the package dir (mounted at `ext/<n>`).
+    fn crate_root_for(&self, pkg: &str, original: &Path) -> PathBuf {
+        self.crate_roots
+            .get(&(pkg.to_owned(), original.to_path_buf()))
+            .cloned()
+            .unwrap_or_else(|| original.to_path_buf())
     }
 
     fn resolve_deps(&self, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
