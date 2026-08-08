@@ -1,0 +1,8 @@
+# The bindings crate is built by Tong via `Tong.toml` in examples/03-sdl3
+# (and imported as an external crate root by examples/04-voxel-city). This
+# manifest exists so the crate is also a first-class Cargo crate for
+# tooling (rust-analyzer, cargo check).
+[package]
+name = "sdl3-sys"
+version = "0.1.0"
+edition = "2021"
