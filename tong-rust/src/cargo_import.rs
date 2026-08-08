@@ -63,19 +63,20 @@ struct CargoManifest {
 #[serde(rename_all = "kebab-case")]
 struct CargoPackage {
     name: String,
-    #[serde(default = "default_version")]
-    version: String,
-    #[serde(default = "default_edition")]
-    edition: String,
+    #[serde(default)]
+    version: Option<Field>,
+    #[serde(default)]
+    edition: Option<Field>,
     build: Option<String>,
 }
 
-fn default_version() -> String {
-    "0.0.0".to_owned()
-}
-
-fn default_edition() -> String {
-    "2015".to_owned()
+/// A field that is either set inline (`version = "0.1"`) or inherited from
+/// `[workspace.package]` (`version.workspace = true`).
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum Field {
+    Value(String),
+    Inherit { workspace: bool },
 }
 
 #[derive(Deserialize, Default)]
@@ -85,16 +86,38 @@ struct CargoWorkspace {
     members: Vec<String>,
     #[serde(default)]
     dependencies: BTreeMap<String, DepValue>,
+    /// `[workspace.package]` — defaults inherited by members.
+    #[serde(default)]
+    package: Option<CargoWorkspacePackage>,
 }
 
-/// `name = { path = "...", package = "..." }` or `{ workspace = true }`.
+/// `[workspace.package]` subset: version and edition.
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+struct CargoWorkspacePackage {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    edition: Option<String>,
+}
+
+/// Workspace inheritance context: `[workspace.dependencies]` and
+/// `[workspace.package]` defaults.
+#[derive(Clone, Default)]
+struct Inherited {
+    deps: BTreeMap<String, DepValue>,
+    package: Option<CargoWorkspacePackage>,
+}
+
+/// `name = { version = "...", path = "...", workspace = true, package = "..." }`.
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
 enum DepValue {
     /// `name = "0.1"` — registry dependency.
     Version(String),
-    /// `name = { path = "..." }` or `{ workspace = true }`.
+    /// A table: path/version/workspace deps (and renames).
     Table {
+        version: Option<String>,
         path: Option<String>,
         #[serde(rename = "workspace")]
         workspace: Option<bool>,
@@ -177,10 +200,11 @@ enum EnvValue {
 pub fn import_cargo_workspace(workspace_root: &Path) -> Result<RustModel, CargoImportError> {
     let root_manifest = read_manifest(workspace_root)?;
 
-    // Workspace dependencies for inheritance.
-    let mut inherited: BTreeMap<String, DepValue> = BTreeMap::new();
+    // Workspace inheritance: [workspace.dependencies] and [workspace.package].
+    let mut inherited = Inherited::default();
     if let Some(workspace) = &root_manifest.workspace {
-        inherited.extend(workspace.dependencies.clone());
+        inherited.deps.extend(workspace.dependencies.clone());
+        inherited.package = workspace.package.clone();
     }
 
     let members: Vec<PathBuf> = match &root_manifest.workspace {
@@ -321,7 +345,7 @@ fn import_package(
     dir: &Path,
     packages: &mut BTreeMap<PathBuf, Package>,
     visiting: &mut Vec<PathBuf>,
-    inherited: &BTreeMap<String, DepValue>,
+    inherited: &Inherited,
     workspace_root: &Path,
 ) -> Result<String, CargoImportError> {
     let canonical = fs::canonicalize(dir)
@@ -340,10 +364,14 @@ fn import_package(
     let result = (|| {
         let manifest = read_manifest(&canonical)?;
         // A path dependency may be its own workspace root; its
-        // `[workspace.dependencies]` then apply, not the importer's.
+        // `[workspace.dependencies]`/`[workspace.package]` then apply,
+        // not the importer's.
         let inherited = match &manifest.workspace {
-            Some(workspace) => &workspace.dependencies,
-            None => inherited,
+            Some(workspace) => Inherited {
+                deps: workspace.dependencies.clone(),
+                package: workspace.package.clone(),
+            },
+            None => inherited.clone(),
         };
         let package = manifest.package.as_ref().ok_or_else(|| {
             CargoImportError::Unsupported(format!(
@@ -352,11 +380,28 @@ fn import_package(
             ))
         })?;
 
+        let version = resolve_field(
+            &package.version,
+            inherited.package.as_ref(),
+            &package.name,
+            "version",
+            &canonical,
+            "0.0.0",
+        )?;
+        let edition = resolve_field(
+            &package.edition,
+            inherited.package.as_ref(),
+            &package.name,
+            "edition",
+            &canonical,
+            "2015",
+        )?;
+
         let mut pkg = Package {
             name: package.name.clone(),
             dir: canonical.clone(),
-            version: package.version.clone(),
-            edition: parse_edition(&package.edition)?,
+            version,
+            edition: parse_edition(&edition)?,
             lib: None,
             bins: Vec::new(),
             build_script: None,
@@ -427,13 +472,13 @@ fn import_package(
             &manifest.dependencies,
             &canonical,
             workspace_root,
-            inherited,
+            &inherited.deps,
         )?;
         let resolved_build_deps = resolve_deps(
             &manifest.build_dependencies,
             &canonical,
             workspace_root,
-            inherited,
+            &inherited.deps,
         )?;
         let mut deps = Vec::new();
         let mut build_deps = Vec::new();
@@ -445,7 +490,7 @@ fn import_package(
                 let real_name = match dep.path {
                     Some(path) => {
                         let imported =
-                            import_package(&path, packages, visiting, inherited, workspace_root)?;
+                            import_package(&path, packages, visiting, &inherited, workspace_root)?;
                         if imported != dep.package {
                             return Err(CargoImportError::Unsupported(format!(
                                 "path dependency {} = {{ path = {:?} }} resolves to package \
@@ -477,6 +522,42 @@ fn import_package(
     result
 }
 
+/// Resolves a package field that may be inherited from
+/// `[workspace.package]`, with Cargo-compatible diagnostics.
+fn resolve_field(
+    field: &Option<Field>,
+    workspace_package: Option<&CargoWorkspacePackage>,
+    package_name: &str,
+    what: &str,
+    dir: &Path,
+    default: &str,
+) -> Result<String, CargoImportError> {
+    match field {
+        None => Ok(default.to_owned()),
+        Some(Field::Value(value)) => Ok(value.clone()),
+        Some(Field::Inherit { workspace: true }) => {
+            let inherited = workspace_package
+                .and_then(|package| match what {
+                    "version" => package.version.clone(),
+                    "edition" => package.edition.clone(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    CargoImportError::Unsupported(format!(
+                        "package {package_name:?} in {} inherits {what} from \
+                         [workspace.package], which defines none",
+                        dir.display()
+                    ))
+                })?;
+            Ok(inherited)
+        }
+        Some(Field::Inherit { workspace: false }) => Err(CargoImportError::Unsupported(format!(
+            "package {package_name:?} in {} sets {what}.workspace = false",
+            dir.display()
+        ))),
+    }
+}
+
 /// A resolved dependency: the crate name used at the use site, the package
 /// name it refers to, and — for path dependencies — the package directory.
 struct ResolvedDep {
@@ -503,6 +584,7 @@ fn resolve_deps(
             }
             DepValue::Table {
                 path,
+                version,
                 workspace,
                 package,
             } => {
@@ -530,6 +612,27 @@ fn resolve_deps(
                                 Some(dir),
                             ))
                         }
+                        Some(DepValue::Version(version)) => {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "dependency {name:?} = {version:?} in {} is inherited \
+                                 from [workspace.dependencies] and is a registry \
+                                 dependency; Tong offline mode requires path or \
+                                 workspace dependencies",
+                                member.display()
+                            )));
+                        }
+                        Some(DepValue::Table {
+                            version: Some(version),
+                            ..
+                        }) => {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "dependency {name:?} = {version:?} in {} is inherited \
+                                 from [workspace.dependencies] and is a registry \
+                                 dependency; Tong offline mode requires path or \
+                                 workspace dependencies",
+                                member.display()
+                            )));
+                        }
                         _ => {
                             return Err(CargoImportError::Unsupported(format!(
                                 "dependency {name:?} uses workspace inheritance without a \
@@ -537,6 +640,13 @@ fn resolve_deps(
                             )));
                         }
                     }
+                } else if let Some(version) = version {
+                    return Err(CargoImportError::Unsupported(format!(
+                        "dependency {name:?} = {version:?} in {} is a registry \
+                         dependency; Tong offline mode requires path or workspace \
+                         dependencies",
+                        member.display()
+                    )));
                 } else {
                     return Err(CargoImportError::Unsupported(format!(
                         "dependency {name:?} in {} is neither a path nor workspace \
@@ -854,6 +964,55 @@ a = { path = "../a" }
         ]);
         let err = import_cargo_workspace(dir.path()).unwrap_err();
         assert!(err.to_string().contains("cyclic"), "{err}");
+    }
+
+    #[test]
+    fn imports_workspace_inherited_version_and_edition() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app"]
+
+[workspace.package]
+version = "1.2.3"
+edition = "2021"
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                r#"
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+"#,
+            ),
+            ("app/src/lib.rs", ""),
+        ]);
+        let model = import_cargo_workspace(dir.path()).unwrap();
+        let app = model.packages.iter().find(|p| p.name == "app").unwrap();
+        assert_eq!(app.version, "1.2.3");
+        assert_eq!(app.edition, Edition::E2021);
+    }
+
+    #[test]
+    fn missing_workspace_package_inheritance_is_a_targeted_error() {
+        let dir = write_tree(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n"),
+            (
+                "app/Cargo.toml",
+                r#"
+[package]
+name = "app"
+version.workspace = true
+"#,
+            ),
+            ("app/src/lib.rs", ""),
+        ]);
+        let err = import_cargo_workspace(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("inherits version"), "{err}");
     }
 
     #[test]

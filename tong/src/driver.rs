@@ -103,11 +103,12 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     let cas = Cas::open(&store)?;
     let cache = ActionCache::open(&cas)?;
 
-    // Toolchain first: needed by the backend for action identity.
-    let toolchain = capture_system_rust(&cas)?;
-
-    // Load the model: native Tong.toml or Cargo.toml import.
+    // Model first: manifest errors fail fast, before the expensive system
+    // toolchain capture (rustc import + sysroot fingerprinting).
     let model = load_model(root)?;
+
+    // Toolchain: needed by the backend for action identity.
+    let toolchain = capture_system_rust(&cas)?;
 
     let mut executor = LocalExecutor::new(cas.clone(), &exec)?;
     executor.register_system_tool(toolchain.rustc_blob, toolchain.rustc.clone());
