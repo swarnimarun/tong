@@ -1,0 +1,36 @@
+# Voxel city builder: a tiny isometric game built on the shared SDL3
+# bindings from examples/03-sdl3 (imported here as an external crate root
+# via a `..` path — the backend mounts it into the exec root).
+#
+# Prerequisite: SDL3 installed via Homebrew (`brew install sdl3`); the
+# library is system-captured and non-portable (PLAN.md section 5).
+
+[workspace]
+name = "voxel-city"
+
+[toolchain.rust]
+kind = "system"
+
+[profile.dev]
+opt_level = 0
+debug = true
+
+# The imported prebuilt SDL3 shared library (same capture as 03-sdl3).
+[target.sdl3]
+rule = "cc_import"
+shared = "/opt/homebrew/opt/sdl3/lib/libSDL3.0.dylib"
+link_name = "SDL3.0"
+
+# The bindings crate lives in 03-sdl3; Tong mounts it under `ext/` in the
+# exec root and compiles it from there.
+[target.sdl3_sys]
+rule = "rust_library"
+crate_root = "../03-sdl3/crates/sdl3-sys/src/lib.rs"
+edition = "2021"
+deps = [":sdl3"]
+
+[target.voxel_city]
+rule = "rust_binary"
+crate_root = "crates/voxel-city/src/main.rs"
+edition = "2021"
+deps = [":sdl3_sys"]
