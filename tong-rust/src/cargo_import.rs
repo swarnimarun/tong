@@ -67,7 +67,16 @@ struct CargoPackage {
     version: Option<Field>,
     #[serde(default)]
     edition: Option<Field>,
-    build: Option<String>,
+    build: Option<BuildKey>,
+}
+
+/// `build = "build.rs"` or `build = false` (Cargo's opt-out from build.rs
+/// auto-detection; `true` is rejected by Cargo too).
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum BuildKey {
+    Path(String),
+    Flag(bool),
 }
 
 /// A field that is either set inline (`version = "0.1"`) or inherited from
@@ -411,12 +420,21 @@ fn import_package(
             rustflags: Vec::new(),
             env: BTreeMap::new(),
         };
-        // Cargo auto-detects build.rs at the package root when the `build`
-        // key is absent.
-        pkg.build_script =
-            package.build.as_ref().map(PathBuf::from).or_else(|| {
-                (pkg.dir.join("build.rs").is_file()).then(|| PathBuf::from("build.rs"))
-            });
+        // Build script: explicit path, `build = false` opt-out, or Cargo's
+        // auto-detection of `build.rs` at the package root.
+        pkg.build_script = match &package.build {
+            Some(BuildKey::Path(path)) => Some(PathBuf::from(path)),
+            Some(BuildKey::Flag(false)) => None,
+            Some(BuildKey::Flag(true)) => {
+                return Err(CargoImportError::Unsupported(format!(
+                    "package {} in {} sets build = true; Cargo requires a \
+                     path or false",
+                    package.name,
+                    canonical.display()
+                )));
+            }
+            None => (pkg.dir.join("build.rs").is_file()).then(|| PathBuf::from("build.rs")),
+        };
 
         // Library target: explicit [lib] or auto-detected src/lib.rs.
         let lib_path = match &manifest.lib {
@@ -1045,6 +1063,74 @@ name = "app_core"
         let model = import_cargo_workspace(dir.path()).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.lib.as_ref().unwrap().name.as_deref(), Some("app_core"));
+    }
+
+    #[test]
+    fn auto_detects_build_rs_without_a_build_key() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app"]
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("app/src/lib.rs", ""),
+            ("app/build.rs", "fn main() {}"),
+        ]);
+        let model = import_cargo_workspace(dir.path()).unwrap();
+        let app = model.packages.iter().find(|p| p.name == "app").unwrap();
+        assert_eq!(
+            app.build_script.as_deref(),
+            Some(std::path::Path::new("build.rs"))
+        );
+    }
+
+    #[test]
+    fn build_false_disables_auto_detection() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app"]
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = false\n",
+            ),
+            ("app/src/lib.rs", ""),
+            // A build.rs exists, but the manifest opts out (Cargo semantics).
+            ("app/build.rs", "fn main() {}"),
+        ]);
+        let model = import_cargo_workspace(dir.path()).unwrap();
+        let app = model.packages.iter().find(|p| p.name == "app").unwrap();
+        assert!(app.build_script.is_none());
+    }
+
+    #[test]
+    fn build_true_is_a_targeted_error() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app"]
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = true\n",
+            ),
+            ("app/src/lib.rs", ""),
+        ]);
+        let err = import_cargo_workspace(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("build = true"), "{err}");
     }
 
     #[test]
