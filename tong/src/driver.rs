@@ -260,7 +260,9 @@ pub fn run(root: &Path, target: &str, args: &[String], profile: &str) -> Result<
 }
 
 /// Matches a target label (`:name`, `//path:name`, or `name`) against an
-/// artifact name.
+/// artifact name. An exact match wins; otherwise underscores and dashes
+/// are treated as equal, so `:voxel_city` finds a Cargo package named
+/// `voxel-city` (Cargo sanitizes crate names; Tong.toml names don't).
 fn artifact_name_matches(label: &str, name: &str) -> bool {
     let label = label
         .strip_prefix(':') //
@@ -270,7 +272,10 @@ fn artifact_name_matches(label: &str, name: &str) -> bool {
                 .and_then(|rest| rest.rsplit_once(':').map(|(_, name)| name))
         })
         .unwrap_or(label);
-    label == name
+    if label == name {
+        return true;
+    }
+    label.replace('_', "-") == name.replace('_', "-")
 }
 
 /// Removes the project-local `.tong` directory.
@@ -299,3 +304,18 @@ impl Completed for CompletedMap {
 /// Completed actions keyed by logical id (newtype to satisfy the orphan
 /// rule for the [`Completed`] trait).
 struct CompletedMap(BTreeMap<ActionId, CachedResult>);
+
+#[cfg(test)]
+mod tests {
+    use super::artifact_name_matches;
+
+    #[test]
+    fn artifact_labels_match_exactly_or_with_normalized_separators() {
+        assert!(artifact_name_matches(":voxel_city", "voxel_city"));
+        assert!(artifact_name_matches(":voxel_city", "voxel-city"));
+        assert!(artifact_name_matches(":voxel-city", "voxel_city"));
+        assert!(artifact_name_matches("//crates/app:calc-cli", "calc-cli"));
+        assert!(artifact_name_matches("calc-cli", "calc-cli"));
+        assert!(!artifact_name_matches(":other", "voxel-city"));
+    }
+}

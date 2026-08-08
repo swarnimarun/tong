@@ -1,9 +1,9 @@
-# The voxel-city demo, as a self-contained Cargo workspace: both crates
-# (the SDL3 bindings and the game) live here as workspace members, with
-# no Tong.toml. The exact same manifests compile and run with both
-# `cargo` and `tong build`. The bindings are a copy of the shared crate
-# in examples/03-sdl3 (see examples/06-sdl3-cargo for the variant that
-# imports that crate as an external path dependency instead).
+# The voxel-city demo, built as a plain Cargo workspace whose dependency
+# is an external Cargo project: sdl3-sys lives in examples/06-sdl3-cargo
+# and is pulled in as a path dependency. Both `cargo` and `tong build`
+# import the same manifests and produce the same binaries; tong imports
+# the external package recursively (canonicalized, deduplicated, cycle-
+# checked) and builds its build script like any other package.
 [workspace]
 resolver = "2"
-members = ["crates/sdl3-sys", "crates/voxel-city"]
+members = ["crates/voxel-city"]

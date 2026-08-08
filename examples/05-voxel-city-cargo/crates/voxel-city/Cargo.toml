@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sdl3-sys = { path = "../sdl3-sys" }
+# The shared bindings crate from examples/06-sdl3-cargo, imported as an
+# external Cargo project (path dep outside this workspace).
+sdl3-sys = { path = "../../../06-sdl3-cargo/crates/sdl3-sys" }

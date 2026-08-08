@@ -1,53 +1,34 @@
-# Voxel city builder — Cargo edition (SDL3 + Tong example)
+# SDL3 bindings — plain Cargo package (SDL3 + Tong example)
 
-The same demo as `examples/04-voxel-city`, but as a **plain Cargo
-workspace with no `Tong.toml`** — and its one dependency is an
-**external Cargo project**: `sdl3-sys` lives in `examples/03-sdl3` and is
-pulled in as a path dependency outside this workspace. The exact same
-manifests compile and run with both `cargo` and `tong build`.
+The shared SDL3 FFI bindings as a normal Cargo package (the "SDL3 via
+Cargo" counterpart of `examples/03-sdl3`, which uses a `Tong.toml`
+`cc_import` instead). The native library is linked through the build
+script's `cargo:` directives — Cargo's mechanism for prebuilt
+libraries — which tong parses from the build-script run and applies to
+every crate that depends on the package, mirroring Cargo.
 
-Native SDL3 linking uses Cargo's own mechanism instead of `cc_import`:
-the `sdl3-sys` build script (in 03-sdl3) emits `cargo:rustc-link-search`
-/ `cargo:rustc-link-lib` directives. Cargo consumes them natively; tong
-parses them from the build-script run and **propagates them to every
-crate that depends on the package** — the same Cargo semantics — so the
-binary links identically under both tools.
+Consumed as an external path dependency by `examples/05-voxel-city-cargo`.
 
 ## Prerequisites
 
 - SDL3 via Homebrew: `brew install sdl3` (or set `SDL3_DIR` to the prefix)
 - The default prefix is `/opt/homebrew/opt/sdl3`; the search path is a
   host path — non-portable by design, like tong's system toolchain
-  capture, and the runtime library loads through its absolute install name
-  (no dylib is shipped alongside the binary).
+  capture, and the runtime library loads through its absolute install name.
 
-## Build and run
+## Build
 
 ```sh
 # with cargo
 cargo build
-SDL_VIDEODRIVER=dummy cargo run -p voxel-city -- --frames 120
 
-# with tong
+# with tong (imports the workspace the same way)
 tong build
-SDL_VIDEODRIVER=dummy tong run :voxel-city -- --frames 120
 ```
-
-## Controls
-
-- Left click: place the brush on the hovered column; grass/dirt/stone/
-  brick/wood/leaf stack, water and road carve the column flat
-- Right click: remove the top block of the hovered column
-- Keys `1`-`8`: brush (grass, dirt, stone, brick, wood, leaf, water, road)
-- `ESC` or window close: quit
 
 ## What it shows
 
-- A Cargo workspace whose dependency is an external Cargo project
-  (`path = "../../../03-sdl3/crates/sdl3-sys"`): tong imports it
-  recursively (canonicalized, deduplicated, cycle-checked), builds its
-  build script, and propagates its link directives — no copies, one
-  shared bindings crate across all three SDL3 examples.
-- Full Cargo compatibility: workspace-inherited fields, build scripts,
-  lib/bin renames, and prebuilt native libraries all build identically
-  with `cargo` and `tong`.
+- The build-script directive mechanism shared by both tools:
+  `cargo:rustc-link-search` / `cargo:rustc-link-lib` from `build.rs`.
+- A library-only workspace that both `cargo` and `tong` import
+  identically; run the game that consumes it in `examples/05-voxel-city-cargo`.

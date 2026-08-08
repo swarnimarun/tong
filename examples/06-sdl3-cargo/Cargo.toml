@@ -1,9 +1,7 @@
-# The voxel-city demo, built as a plain Cargo workspace whose dependency
-# is an **external Cargo project**: sdl3-sys lives in examples/03-sdl3
-# and is pulled in as a path dependency. Both `cargo` and `tong build`
-# import the same manifests and produce the same binaries; tong imports
-# the external package recursively (canonicalized, deduplicated, cycle-
-# checked) and builds its build script like any other package.
+# The SDL3 bindings as a plain Cargo package (the "SDL3 via Cargo"
+# example): the native library is linked through the build script's
+# `cargo:` directives, which both cargo and tong consume. Consumed by
+# examples/05-voxel-city-cargo as an external path dependency.
 [workspace]
 resolver = "2"
-members = ["crates/voxel-city"]
+members = ["crates/sdl3-sys"]

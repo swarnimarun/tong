@@ -1,12 +1,10 @@
-# Voxel city builder — self-contained Cargo edition (SDL3 + Tong example)
+# Voxel city builder — Cargo edition (SDL3 + Tong example)
 
 The same demo as `examples/04-voxel-city`, but as a **plain Cargo
-workspace with no `Tong.toml`**: the SDL3 bindings (`sdl3-sys`) and the
-game (`voxel-city`) are both workspace members here. The exact same
-manifests compile and run with both `cargo` and `tong build`.
-(`examples/06-sdl3-cargo` is the variant that imports the shared
-bindings crate from 03-sdl3 as an external path dependency instead of
-carrying a copy.)
+workspace with no `Tong.toml`** — and its one dependency is an
+**external Cargo project**: `sdl3-sys` lives in `examples/06-sdl3-cargo`
+and is pulled in as a path dependency outside this workspace. The exact
+same manifests compile and run with both `cargo` and `tong build`.
 
 Native SDL3 linking uses Cargo's own mechanism instead of `cc_import`:
 the `sdl3-sys` build script emits `cargo:rustc-link-search` /
@@ -32,7 +30,7 @@ SDL_VIDEODRIVER=dummy cargo run -p voxel-city -- --frames 120
 
 # with tong
 tong build
-SDL_VIDEODRIVER=dummy tong run :voxel-city -- --frames 120
+SDL_VIDEODRIVER=dummy tong run :voxel_city -- --frames 120
 ```
 
 ## Controls
@@ -45,6 +43,11 @@ SDL_VIDEODRIVER=dummy tong run :voxel-city -- --frames 120
 
 ## What it shows
 
-- A fully self-contained Cargo workspace: build scripts, native linking
-  via directives, and a multi-crate layout that both `cargo` and `tong`
-  build and run identically from the same `Cargo.toml` files.
+- A Cargo workspace whose dependency is an external Cargo project
+  (`path = "../../../06-sdl3-cargo/crates/sdl3-sys"`): tong imports it
+  recursively (canonicalized, deduplicated, cycle-checked), builds its
+  build script, and propagates its link directives — one shared bindings
+  package across the Cargo examples.
+- Full Cargo compatibility: workspace-inherited fields, build scripts,
+  lib/bin renames, and prebuilt native libraries all build identically
+  with `cargo` and `tong`.
