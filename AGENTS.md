@@ -23,17 +23,20 @@ Tong is a declarative, hermetic, multi-language build system for monorepos that 
 ## Repository structure
 
 - `PLAN.md` — governing design and delivery plan; read the relevant section before non-trivial work
-- `tong/` — CLI binary crate (porcelain + plumbing commands)
-- `tong-core/` — action schema, artifacts, canonical digests, platforms, providers, diagnostics
-- `tong-graph/` — labels, configured target graph, pure analysis, scheduling
-- `tong-exec/` — local/process executors, sandbox launchers, action-result validation, structured events
-- `tong-store/` — content-addressed store, action cache, build state, garbage collection
+- `tong/` — CLI binary crate (build/run/clean driver: manifests → toolchain → plan → schedule → assemble)
+- `tong-core/` — action schema, artifacts, canonical encoding/decoding, digests, platforms, providers
+- `tong-graph/` — `Tong.toml` manifest model, labels, planned actions, topological scheduling
+- `tong-rust/` — Rust backend: target model, system toolchain capture, `Cargo.toml` import, action planning, build scripts, proc macros, `cc_import`
+- `tong-exec/` — local process executor: deterministic exec roots, clean env, output validation
+- `tong-store/` — content-addressed store, tree capture/materialize, bundle storage, action cache
+- `examples/` — runnable workspaces (`01-hello`, `01-calc`, `02-advanced`, `03-sdl3`, `04-voxel-city`)
 
 ## Setup and prerequisites
 
 - Rust toolchain: pinned in `rust-toolchain.toml` (stable, with `clippy` + `rustfmt`); rustup auto-selects it
 - `just` command runner required for the recipes below
 - Bootstrap: `just setup`
+- `examples/03-sdl3` additionally needs SDL3 from Homebrew (`brew install sdl3`); see its README
 
 ## Commands
 
@@ -56,9 +59,11 @@ One test: `cargo test -p <crate> <test-name>`. None of the commands need the net
 The pipeline is: manifests → resolution → configured target graph → backend analysis → immutable action graph → execution → content-addressed outputs (`PLAN.md` §1). Enforce these invariants in code:
 
 - Actions are the only execution unit; backends never invoke compilers or package managers as ambient subprocesses during analysis (`PLAN.md` §3.1).
-- Analysis is pure: no undeclared file reads, no network, no host environment inspection, no time/RNG dependence (`PLAN.md` §3.2).
-- Action digests cover semantic execution fields only — never `logical_id`, target names, or absolute host paths (`PLAN.md` §4).
-- Dependency direction: `tong-core` ← `tong-graph` ← `tong-exec`; `tong-store` is standalone; `tong` (CLI) sits on top. Do not add reverse or circular crate dependencies.
+- Analysis is pure: no undeclared file reads, no network, no host environment inspection, no time/RNG dependence (`PLAN.md` §3.2). Analysis outputs planned actions whose specs are concretized at schedule time — never cache under a key computed before the complete input set is known (§8.3).
+- Action digests cover semantic execution fields only — never `logical_id`, target names, or absolute host paths (`PLAN.md` §4). Exec args use `{exec_root}`/`{bundle_root}` placeholders substituted by the executor.
+- Dependency direction: `tong-core` ← `tong-graph`/`tong-rust` ← `tong-exec`; `tong-store` is standalone; `tong` (CLI) sits on top. Do not add reverse or circular crate dependencies.
+- System-captured toolchains (rustc) and `cc_import` libraries are non-portable (PLAN.md §5): fingerprinted into the action digest via properties (`tong.rust.rustc_verbose_version`, `tong.rust.sysroot_tree`, `tong.execution.portable=false`), used in place, never published to shared caches.
+- Cargo manifests are imported (`tong-rust::cargo_import`), never invoked: no ambient cargo; registry/git deps fail with a targeted diagnostic until Phase 3 locking exists.
 
 ## Code style and conventions
 
@@ -73,6 +78,8 @@ The pipeline is: manifests → resolution → configured target graph → backen
 - Run the targeted test first (`cargo test -p <crate> <name>`), then `just test` before finishing.
 - Behavior changes require test updates in the same change; never weaken or delete a failing test — investigate or ask.
 - Digest/hashing code needs golden cross-platform test vectors (`PLAN.md` §16); sandbox and cache code needs the adversarial and cache-correctness tests described there.
+- The example workspaces in `examples/` are the end-to-end acceptance suite: after changing the backend or driver, rebuild each of them (`tong build` from the example dir) and check they still run.
+- `examples/03-sdl3` needs SDL3 from Homebrew; use `SDL_VIDEODRIVER=dummy` for headless runs.
 
 ## Do / Don't
 
