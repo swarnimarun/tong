@@ -1,0 +1,10 @@
+# The SDL3 bindings as a normal Cargo package. The native library is
+# linked through the build script's `cargo:` directives (Cargo's
+# mechanism for prebuilt libraries) — tong imports those same directives
+# from the build-script run and applies them to every crate that
+# (transitively) depends on this one, mirroring Cargo.
+[package]
+name = "sdl3-sys"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"

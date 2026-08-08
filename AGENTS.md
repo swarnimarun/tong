@@ -29,7 +29,7 @@ Tong is a declarative, hermetic, multi-language build system for monorepos that 
 - `tong-rust/` — Rust backend: target model, system toolchain capture, `Cargo.toml` import, action planning, build scripts, proc macros, `cc_import`
 - `tong-exec/` — local process executor: deterministic exec roots, clean env, output validation
 - `tong-store/` — content-addressed store, tree capture/materialize, bundle storage, action cache
-- `examples/` — runnable workspaces (`01-hello`, `01-calc`, `02-advanced`, `03-sdl3`, `04-voxel-city`, `06-sdl3-cargo`)
+- `examples/` — runnable workspaces (`01-hello`, `01-calc`, `02-advanced`, `03-sdl3`, `04-voxel-city`, `05-voxel-city-cargo`, `06-sdl3-cargo`)
 
 ## Setup and prerequisites
 
