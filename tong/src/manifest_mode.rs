@@ -33,6 +33,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     version: "0.0.0".to_owned(),
                     edition: parse_edition(target.edition.as_deref()),
                     lib: Some(LibTarget {
+                        name: None,
                         crate_types,
                         proc_macro,
                         path,
@@ -70,6 +71,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                 // Cargo-style auto library next to the binary.
                 if root.join("src/lib.rs").is_file() {
                     pkg.lib = Some(LibTarget {
+                        name: None,
                         crate_types: Vec::new(),
                         proc_macro: false,
                         path: PathBuf::from("src/lib.rs"),

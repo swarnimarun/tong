@@ -77,6 +77,9 @@ impl Edition {
 /// The library target of a package.
 #[derive(Clone, Debug)]
 pub struct LibTarget {
+    /// `[lib] name` override; the crate name used for the rlib filename
+    /// and `--crate-name` (falls back to the package name).
+    pub name: Option<String>,
     /// Crate types to compile; empty means `[Rlib]`.
     pub crate_types: Vec<CrateType>,
     /// Compile as a proc macro (host only).

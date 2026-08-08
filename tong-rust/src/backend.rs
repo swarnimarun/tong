@@ -102,6 +102,11 @@ struct CompileSpec {
     output: String,
     deps: Vec<DepSpec>,
     build_script: Option<ActionId>,
+    /// Build-script runs whose link directives apply to this crate: the
+    /// crate's own script plus those of its transitive dependencies
+    /// (Cargo semantics — `cargo:rustc-link-lib`, `rustc-link-search`,
+    /// `rustc-flags`, and `rustc-env` propagate to every dependent).
+    directive_sources: Vec<ActionId>,
     crate_root: PathBuf,
     extra_flags: Vec<String>,
 }
@@ -236,7 +241,21 @@ impl<'a> RustBackend<'a> {
             self.cc_closure.insert(pkg.name.clone(), closure);
         }
 
-        // 4. Plan actions. Libraries, proc macros, and build scripts first
+        // 4. Build-script action ids are deterministic
+        //    (`rust:bs-run:<pkg>`); pre-register them (for packages that
+        //    have a build script) so any package can reference its
+        //    dependencies' build-script directives while planning,
+        //    regardless of package order.
+        for pkg in &self.model.packages {
+            if pkg.build_script.is_some() {
+                self.planned_ids.insert(
+                    format!("bs-run:{}", pkg.name),
+                    ActionId(format!("rust:bs-run:{}", pkg.name)),
+                );
+            }
+        }
+
+        // 5. Plan actions. Libraries, proc macros, and build scripts first
         //    (their planned ids must exist before binaries resolve their
         //    dependency actions), then binaries.
         let mut actions = Vec::new();
@@ -311,6 +330,7 @@ impl<'a> RustBackend<'a> {
 
         // Library / proc-macro actions.
         if let Some(lib) = &pkg.lib {
+            let lib_name = lib_crate_name(pkg);
             if lib.proc_macro {
                 self.plan_compile(
                     actions,
@@ -320,7 +340,7 @@ impl<'a> RustBackend<'a> {
                     pkg,
                     source_tree,
                     cc.clone(),
-                    crate_name(&pkg.name),
+                    lib_name,
                     "proc-macro",
                     None,
                     &pkg.deps,
@@ -343,7 +363,7 @@ impl<'a> RustBackend<'a> {
                         pkg,
                         source_tree,
                         cc.clone(),
-                        crate_name(&pkg.name),
+                        lib_name.clone(),
                         crate_type.to_rustc(),
                         None,
                         &pkg.deps,
@@ -377,7 +397,7 @@ impl<'a> RustBackend<'a> {
                 deps.insert(
                     0,
                     Dep {
-                        extern_name: crate_name(&pkg.name),
+                        extern_name: lib_crate_name(pkg),
                         package: pkg.name.clone(),
                     },
                 );
@@ -506,6 +526,7 @@ impl<'a> RustBackend<'a> {
                 output,
                 deps: dep_specs,
                 build_script,
+                directive_sources: self.link_directive_sources(pkg),
                 crate_root,
                 extra_flags,
             }),
@@ -574,6 +595,36 @@ impl<'a> RustBackend<'a> {
             .get(&(pkg.to_owned(), original.to_path_buf()))
             .cloned()
             .unwrap_or_else(|| original.to_path_buf())
+    }
+
+    /// Build-script run ids whose link directives apply to `pkg`'s crates:
+    /// the package's own script plus the scripts of every transitive
+    /// dependency (Cargo propagates link directives to all dependents).
+    fn link_directive_sources(&self, pkg: &Package) -> Vec<ActionId> {
+        let mut out = Vec::new();
+        if let Some(id) = self.planned_ids.get(&format!("bs-run:{}", pkg.name)) {
+            out.push(id.clone());
+        }
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<String> = pkg
+            .deps
+            .iter()
+            .chain(pkg.build_deps.iter())
+            .map(|dep| dep.package.clone())
+            .collect();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(id) = self.planned_ids.get(&format!("bs-run:{name}")) {
+                out.push(id.clone());
+            }
+            if let Some(dep) = self.model.packages.iter().find(|p| p.name == name) {
+                stack.extend(dep.deps.iter().map(|d| d.package.clone()));
+                stack.extend(dep.build_deps.iter().map(|d| d.package.clone()));
+            }
+        }
+        out
     }
 
     fn resolve_deps(&self, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
@@ -646,11 +697,12 @@ impl<'a> RustBackend<'a> {
             .get(&key)
             .cloned()
             .ok_or_else(|| PlanError::Message(format!("no planned action for {key}")))?;
-        let meta = self.metadata(&crate_name(&pkg.name), kind);
+        let lib_name = lib_crate_name(pkg);
+        let meta = self.metadata(&lib_name, kind);
         Ok(DepSpec::Rust {
             extern_name: dep.extern_name.clone(),
             action,
-            file: format!("lib{}-{meta}.{ext}", crate_name(&pkg.name)),
+            file: format!("lib{lib_name}-{meta}.{ext}"),
         })
     }
 
@@ -840,6 +892,42 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                 args.push(link.clone());
             }
             let build_out = format!("{EXEC_ROOT_VAR}/in/build_out");
+            // Link directives from transitive dependency build scripts
+            // (the own script is already merged above). Deduplicated so a
+            // library linked by several dependencies is passed once.
+            let mut seen_libs: BTreeSet<String> = BTreeSet::new();
+            let mut seen_searches: BTreeSet<String> = BTreeSet::new();
+            let mut seen_flags: BTreeSet<String> = BTreeSet::new();
+            for source in &spec.directive_sources {
+                if spec.build_script.as_ref() == Some(source) {
+                    continue;
+                }
+                let Some(stdout) = completed.stdout(source) else {
+                    continue;
+                };
+                let bytes = cas.read_blob(stdout)?;
+                let dep_directives = parse_directives(&String::from_utf8_lossy(&bytes));
+                for lib in dep_directives.link_libs {
+                    if seen_libs.insert(lib.clone()) {
+                        args.push("-l".to_owned());
+                        args.push(lib);
+                    }
+                }
+                for search in dep_directives.link_search {
+                    if seen_searches.insert(search.clone()) {
+                        args.push("-L".to_owned());
+                        args.push(link_search_arg(&search, &build_out));
+                    }
+                }
+                for flag in dep_directives.raw_flags {
+                    if seen_flags.insert(flag.clone()) {
+                        args.push(flag);
+                    }
+                }
+                for (key, value) in dep_directives.env {
+                    env.insert(key, value);
+                }
+            }
             for flag in &directives.raw_flags {
                 args.push(flag.clone());
             }
@@ -924,6 +1012,20 @@ fn link_search_arg(value: &str, build_out: &str) -> String {
         return value.to_owned();
     }
     format!("{build_out}/{value}")
+}
+
+/// The crate name of a package's library: the `[lib] name` override when
+/// present, else the sanitized package name. Binaries and dependents must
+/// agree on this for `--crate-name` and the rlib filename.
+fn lib_crate_name(pkg: &Package) -> String {
+    match &pkg.lib {
+        Some(lib) => lib
+            .name
+            .as_deref()
+            .map(crate_name)
+            .unwrap_or_else(|| crate_name(&pkg.name)),
+        None => crate_name(&pkg.name),
+    }
 }
 
 fn crate_name(name: &str) -> String {

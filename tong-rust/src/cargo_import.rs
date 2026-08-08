@@ -129,6 +129,7 @@ enum DepValue {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct CargoLib {
+    name: Option<String>,
     #[serde(default)]
     crate_type: Vec<String>,
     #[serde(default)]
@@ -429,12 +430,14 @@ fn import_package(
         let lib_present = pkg.dir.join(&lib_path).is_file();
         if let Some(lib) = &manifest.lib {
             pkg.lib = Some(LibTarget {
+                name: lib.name.clone(),
                 crate_types: parse_crate_types(&lib.crate_type)?,
                 proc_macro: lib.proc_macro,
                 path: lib_path,
             });
         } else if lib_present {
             pkg.lib = Some(LibTarget {
+                name: None,
                 crate_types: Vec::new(),
                 proc_macro: false,
                 path: lib_path,
@@ -1013,6 +1016,35 @@ version.workspace = true
         ]);
         let err = import_cargo_workspace(dir.path()).unwrap_err();
         assert!(err.to_string().contains("inherits version"), "{err}");
+    }
+
+    #[test]
+    fn imports_lib_name_override() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app"]
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "app_core"
+"#,
+            ),
+            ("app/src/lib.rs", ""),
+        ]);
+        let model = import_cargo_workspace(dir.path()).unwrap();
+        let app = model.packages.iter().find(|p| p.name == "app").unwrap();
+        assert_eq!(app.lib.as_ref().unwrap().name.as_deref(), Some("app_core"));
     }
 
     #[test]
