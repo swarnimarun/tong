@@ -1,7 +1,10 @@
 # Voxel city builder (SDL3 + Tong example)
 
-A tiny isometric voxel city builder: a procedural seed city rendered with
-a painter's-algorithm 2:1 isometric projection into a streaming texture.
+A tiny isometric voxel city builder: a deterministic seed town — road
+grid, city blocks with varied brick/stone buildings and flat roofs, parks,
+a lake, rim trees — rendered with a painter's-algorithm 2:1 isometric
+projection into a streaming texture. Surfaces get per-pixel texture
+(brick courses, planks, noise, water shimmer) and beveled tile rims.
 Built on the shared `sdl3-sys` bindings from `examples/03-sdl3`, which
 this manifest imports as an **external crate root** (`..` path — Tong
 mounts the crate's directory into the exec root at plan time).
@@ -23,9 +26,10 @@ tong run :voxel_city -- --frames 2 --screenshot out.ppm      # write frame 1
 
 ## Controls
 
-- Left click: place a block (brush) on the hovered column
+- Left click: place the brush on the hovered column; grass/dirt/stone/
+  brick/wood/leaf stack, water and road carve the column flat
 - Right click: remove the top block of the hovered column
-- Keys `1`-`7`: brush (grass, dirt, stone, wood, leaf, water, brick)
+- Keys `1`-`8`: brush (grass, dirt, stone, brick, wood, leaf, water, road)
 - `ESC` or window close: quit
 
 ## What it shows
@@ -38,4 +42,5 @@ tong run :voxel_city -- --frames 2 --screenshot out.ppm      # write frame 1
   `SDL_GetTicks`-based pacing.
 - A from-scratch iso renderer: painter's order over columns, per-face
   visibility against neighbor column heights, hover picking via the
-  inverse projection, and a deterministic (hash-seeded) seed city.
+  inverse projection, per-pixel surface textures, and a deterministic
+  (hash-seeded) town generator.

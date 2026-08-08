@@ -1,15 +1,16 @@
 //! voxel-city: a tiny isometric voxel city builder.
 //!
 //! Built on the shared `sdl3-sys` bindings from `examples/03-sdl3`, which
-//! `Tong.toml` imports as an external crate root. A procedural seed city
-//! (ground, pond, buildings, trees) is rendered with a painter's-algorithm
-//! 2:1 isometric projection into a streaming RGBA8888 texture; the mouse
-//! places and removes blocks.
+//! `Tong.toml` imports as an external crate root. A deterministic seed
+//! town — road grid, city blocks, parks, a pond, rim trees — is rendered
+//! with a painter's-algorithm 2:1 isometric projection into a streaming
+//! RGBA8888 texture; the mouse places, carves, and removes blocks.
 //!
 //! Controls:
-//! - left click: place a block on the hovered column
+//! - left click: place the brush on the hovered column (grass/dirt/stone/
+//!   brick/wood/leaf stack; water and road carve the column flat)
 //! - right click: remove the top block of the hovered column
-//! - keys 1-7: choose the brush (grass, dirt, stone, wood, leaf, water, brick)
+//! - keys 1-8: choose the brush
 //! - ESC or window close: quit
 //!
 //! Build with `tong build` inside examples/04-voxel-city; run with
@@ -28,10 +29,17 @@ const AIR: u8 = 0;
 const GRASS: u8 = 1;
 const DIRT: u8 = 2;
 const STONE: u8 = 3;
-const WOOD: u8 = 4;
-const LEAF: u8 = 5;
-const WATER: u8 = 6;
-const BRICK: u8 = 7;
+const BRICK: u8 = 4;
+const WOOD: u8 = 5;
+const LEAF: u8 = 6;
+const WATER: u8 = 7;
+const ROAD: u8 = 8;
+const ROOF: u8 = 9;
+
+/// Roads run every 8 columns (at `x % 8 == 4`, same for z), splitting the
+/// map into 7x7 city blocks.
+const ROAD_EVERY: i32 = 8;
+const ROAD_AT: i32 = 4;
 
 const TILE_W: i32 = 24;
 const TILE_H: i32 = 12;
@@ -43,73 +51,109 @@ const ORIGIN_Y: f32 = 150.0;
 #[derive(Clone, Copy)]
 struct Color(u8, u8, u8);
 
-/// A block's colors: (top, south, east, west, north) — south faces the
-/// camera, north faces away.
-fn palette(id: u8) -> (Color, Color, Color, Color, Color) {
+/// Per-pixel surface texture for a block type.
+#[derive(Clone, Copy)]
+enum Tex {
+    Flat,
+    /// Subtle brightness noise, ±delta.
+    Noise(i32),
+    /// Brick courses with staggered vertical joints.
+    Brick,
+    /// Horizontal plank lines.
+    Planks,
+    /// Two-tone leaf dither.
+    Leaf,
+    /// Water shimmer bands.
+    Shimmer,
+}
+
+/// A block's look: top/south/east face colors plus surface texture.
+struct Style {
+    top: Color,
+    south: Color,
+    east: Color,
+    tex: Tex,
+}
+
+fn style(id: u8) -> Style {
     match id {
-        GRASS => (
-            Color(94, 168, 78),
-            Color(74, 138, 62),
-            Color(66, 124, 55),
-            Color(52, 98, 44),
-            Color(42, 80, 36),
-        ),
-        DIRT => (
-            Color(158, 112, 68),
-            Color(128, 90, 56),
-            Color(114, 80, 50),
-            Color(92, 64, 40),
-            Color(74, 52, 32),
-        ),
-        STONE => (
-            Color(150, 150, 150),
-            Color(122, 122, 122),
-            Color(110, 110, 110),
-            Color(90, 90, 90),
-            Color(74, 74, 74),
-        ),
-        WOOD => (
-            Color(154, 114, 72),
-            Color(126, 92, 58),
-            Color(112, 82, 52),
-            Color(90, 66, 42),
-            Color(72, 54, 34),
-        ),
-        LEAF => (
-            Color(66, 148, 62),
-            Color(54, 120, 50),
-            Color(48, 108, 45),
-            Color(38, 88, 36),
-            Color(32, 74, 30),
-        ),
-        WATER => (
-            Color(56, 128, 208),
-            Color(56, 128, 208),
-            Color(56, 128, 208),
-            Color(56, 128, 208),
-            Color(56, 128, 208),
-        ),
-        BRICK => (
-            Color(184, 100, 74),
-            Color(152, 82, 60),
-            Color(136, 72, 53),
-            Color(110, 58, 43),
-            Color(90, 48, 35),
-        ),
-        _ => (
-            Color(255, 0, 255),
-            Color(255, 0, 255),
-            Color(255, 0, 255),
-            Color(255, 0, 255),
-            Color(255, 0, 255),
-        ),
+        GRASS => Style {
+            top: Color(104, 172, 84),
+            south: Color(78, 140, 64),
+            east: Color(68, 122, 56),
+            tex: Tex::Noise(6),
+        },
+        DIRT => Style {
+            top: Color(150, 110, 66),
+            south: Color(120, 88, 54),
+            east: Color(106, 78, 48),
+            tex: Tex::Noise(9),
+        },
+        STONE => Style {
+            top: Color(146, 148, 152),
+            south: Color(120, 122, 126),
+            east: Color(108, 110, 114),
+            tex: Tex::Noise(4),
+        },
+        BRICK => Style {
+            top: Color(168, 98, 72),
+            south: Color(142, 82, 60),
+            east: Color(126, 72, 53),
+            tex: Tex::Brick,
+        },
+        WOOD => Style {
+            top: Color(150, 112, 70),
+            south: Color(124, 92, 58),
+            east: Color(110, 82, 52),
+            tex: Tex::Planks,
+        },
+        LEAF => Style {
+            top: Color(64, 146, 60),
+            south: Color(52, 118, 49),
+            east: Color(46, 104, 44),
+            tex: Tex::Leaf,
+        },
+        WATER => Style {
+            top: Color(58, 132, 212),
+            south: Color(58, 132, 212),
+            east: Color(58, 132, 212),
+            tex: Tex::Shimmer,
+        },
+        ROAD => Style {
+            top: Color(56, 60, 68),
+            south: Color(56, 60, 68),
+            east: Color(56, 60, 68),
+            tex: Tex::Noise(3),
+        },
+        ROOF => Style {
+            top: Color(106, 118, 140),
+            south: Color(90, 101, 122),
+            east: Color(81, 91, 110),
+            tex: Tex::Noise(6),
+        },
+        _ => Style {
+            top: Color(255, 0, 255),
+            south: Color(255, 0, 255),
+            east: Color(255, 0, 255),
+            tex: Tex::Flat,
+        },
     }
+}
+
+/// Adds a signed delta to each channel, clamped.
+fn shade(c: Color, delta: i32) -> Color {
+    let f = |v: u8| (v as i32 + delta).clamp(0, 255) as u8;
+    Color(f(c.0), f(c.1), f(c.2))
 }
 
 struct World {
     blocks: Vec<u8>,
     /// Top count per column: number of blocks (0 = empty column).
     top: Vec<u8>,
+    /// City statistics for the startup banner.
+    buildings: u32,
+    trees: u32,
+    road_tiles: u32,
 }
 
 impl World {
@@ -117,6 +161,9 @@ impl World {
         let mut world = World {
             blocks: vec![AIR; WORLD_W as usize * WORLD_D as usize * WORLD_H],
             top: vec![0; WORLD_W as usize * WORLD_D as usize],
+            buildings: 0,
+            trees: 0,
+            road_tiles: 0,
         };
         world.generate();
         world
@@ -164,10 +211,29 @@ impl World {
         self.top[Self::col(x, z)] as i32
     }
 
-    fn place(&mut self, x: i32, z: i32, brush: u8) {
+    /// Clears the column and sets `id` at slot 0 (leveling brushes).
+    fn flatten(&mut self, x: i32, z: i32, id: u8) {
         let t = self.top_at(x, z);
-        if t < WORLD_H as i32 {
-            self.set(x, z, t, brush);
+        for y in 0..t {
+            self.set(x, z, y, AIR);
+        }
+        self.set(x, z, 0, id);
+    }
+
+    /// Stacks the brush on top of the column; water and road carve flat.
+    fn place(&mut self, x: i32, z: i32, brush: u8) {
+        match brush {
+            WATER => self.flatten(x, z, WATER),
+            ROAD => {
+                self.flatten(x, z, DIRT);
+                self.set(x, z, 1, ROAD);
+            }
+            _ => {
+                let t = self.top_at(x, z);
+                if t < WORLD_H as i32 {
+                    self.set(x, z, t, brush);
+                }
+            }
         }
     }
 
@@ -178,7 +244,8 @@ impl World {
         }
     }
 
-    /// Deterministic seed city: ground, a pond, a few buildings, trees.
+    /// Deterministic seed town: gentle terrain, a road grid, city blocks
+    /// with parks and buildings, and a ring of trees at the map edge.
     fn generate(&mut self) {
         for x in 0..WORLD_W {
             for z in 0..WORLD_D {
@@ -189,82 +256,178 @@ impl World {
                 self.set(x, z, g, GRASS);
             }
         }
-        // Pond: flatten a shallow basin around it (the steep 45° view
-        // otherwise hides the water behind taller ground in front), then
-        // flood the disc itself.
-        let (px, pz) = (11, 13);
+
+        // Road grid: a flat strip every 8 columns, with a grass shoulder
+        // on each side so the strip reads continuously (the taller
+        // terrain between blocks would otherwise hide it).
         for x in 0..WORLD_W {
             for z in 0..WORLD_D {
-                let dx = x - px;
-                let dz = z - pz;
-                let d2 = dx * dx + dz * dz;
-                if d2 <= 25 {
-                    let g = self.top_at(x, z) - 1;
-                    for y in 0..=g {
-                        self.set(x, z, y, AIR);
+                if x % ROAD_EVERY == ROAD_AT || z % ROAD_EVERY == ROAD_AT {
+                    self.flatten(x, z, DIRT);
+                    self.set(x, z, 1, ROAD);
+                    self.road_tiles += 1;
+                    for (sx, sz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                        if sx >= 0 && sz >= 0 && sx < WORLD_W && sz < WORLD_D {
+                            self.flatten(sx, sz, DIRT);
+                            self.set(sx, sz, 1, GRASS);
+                        }
                     }
-                    self.set(x, z, 0, GRASS);
-                }
-                if d2 <= 16 {
-                    self.set(x, z, 0, WATER);
                 }
             }
         }
-        for (bx, bz, bw, bd, bh) in [
-            (5, 5, 4, 4, 4),
-            (30, 12, 5, 4, 5),
-            (18, 30, 4, 5, 3),
-            (33, 33, 3, 3, 5),
-        ] {
-            self.building(bx, bz, bw, bd, bh);
+
+        // City blocks between the roads (7x7 columns each).
+        for bx in 0..4 {
+            for bz in 0..4 {
+                let cx = 8 * bx + 8;
+                let cz = 8 * bz + 8;
+                if bx == 3 && bz == 3 {
+                    // The lake sits in the SE-most park: anything taller in
+                    // front (SE) would occlude it in this steep view.
+                    self.park(cx, cz, true);
+                    continue;
+                }
+                match hash2(bx, bz, 7) % 10 {
+                    0 | 1 => self.park(cx, cz, false),
+                    _ => {
+                        let dist = (bx as i32 - 2).abs() + (bz as i32 - 2).abs();
+                        self.city_block(cx, cz, dist);
+                    }
+                }
+            }
         }
+
+        // Rim trees along the map edge.
         for (tx, tz) in [
-            (3, 8),
-            (8, 3),
-            (15, 22),
-            (22, 12),
-            (26, 25),
-            (31, 20),
-            (8, 35),
-            (36, 6),
-            (24, 36),
-            (37, 30),
+            (2, 2),
+            (2, 36),
+            (36, 2),
+            (1, 10),
+            (1, 26),
+            (10, 1),
+            (26, 1),
+            (38, 10),
+            (38, 26),
+            (10, 38),
+            (26, 38),
+            (37, 33),
         ] {
             self.tree(tx, tz);
         }
     }
 
     fn ground_height(x: i32, z: i32) -> i32 {
-        2 + (hash2(x / 3, z / 3, 1) % 3) as i32 + (hash2(x / 7, z / 7, 2) % 2) as i32
+        1 + (hash2(x / 3, z / 3, 1) % 2) as i32 + (hash2(x / 7, z / 7, 2) % 2) as i32
     }
 
-    fn building(&mut self, bx: i32, bz: i32, bw: i32, bd: i32, bh: i32) {
-        for x in bx..bx + bw {
-            for z in bz..bz + bd {
-                let g = self.top_at(x, z);
-                for y in 0..bh {
-                    let id = if y + 1 == bh { STONE } else { BRICK };
-                    self.set(x, z, g + y, id);
+    /// A park block: level lawn, a few trees, optionally the pond.
+    fn park(&mut self, cx: i32, cz: i32, with_pond: bool) {
+        for x in cx - 3..=cx + 3 {
+            for z in cz - 3..=cz + 3 {
+                self.flatten(x, z, GRASS);
+            }
+        }
+        if with_pond {
+            for x in cx - 3..=cx + 3 {
+                for z in cz - 3..=cz + 3 {
+                    let dx = x - cx;
+                    let dz = z - cz;
+                    let d2 = dx * dx + dz * dz;
+                    if d2 <= 9 {
+                        self.flatten(x, z, WATER);
+                    }
                 }
             }
         }
+        self.tree(cx - 3, cz - 3);
+        self.tree(cx + 3, cz - 3);
+        self.tree(cx - 3, cz + 3);
+        if with_pond {
+            // The SE corner of the pond park sits on the camera's line of
+            // sight to the lake center; plant that tree on the east edge
+            // instead so the water stays visible.
+            self.tree(cx + 3, cz - 1);
+        } else {
+            self.tree(cx + 3, cz + 3);
+        }
+    }
+
+    /// A city block: one or two buildings on a leveled base, taller
+    /// towards the map center.
+    fn city_block(&mut self, cx: i32, cz: i32, dist: i32) {
+        let h = hash2(cx, cz, 11);
+        let count = 1 + (h % 2) as i32;
+        for i in 0..count {
+            let r = hash2(cx + i * 97, cz + i * 131, 13);
+            let w = 3 + (r % 3) as i32;
+            let d = 3 + ((r >> 4) % 3) as i32;
+            let height = 2 + ((r >> 8) % 3) as i32 + (4 - dist).max(0);
+            let material = if (r >> 12) & 1 == 0 { BRICK } else { STONE };
+            let x0 = cx - 3 + ((r >> 16) % (8 - w) as u32) as i32;
+            let z0 = cz - 3 + ((r >> 20) % (8 - d) as u32) as i32;
+            self.building(x0, z0, w, d, height, material);
+        }
+    }
+
+    fn building(&mut self, x0: i32, z0: i32, w: i32, d: i32, h: i32, material: u8) {
+        // Level base so the building sits on flat ground.
+        for x in x0..x0 + w {
+            for z in z0..z0 + d {
+                self.flatten(x, z, GRASS);
+            }
+        }
+        for x in x0..x0 + w {
+            for z in z0..z0 + d {
+                for y in 0..h {
+                    let id = if y + 1 == h { ROOF } else { material };
+                    self.set(x, z, 1 + y, id);
+                }
+            }
+        }
+        // Taller buildings sometimes get a rooftop box (water tower /
+        // mechanical room) for silhouette variety.
+        if h >= 4 && hash2(x0 * 7 + z0 * 13, 17, 5) % 3 == 0 {
+            let cx = x0 + (hash2(x0 * 7 + z0 * 13, 19, 5) % 2) as i32 * (w - 1);
+            let cz = z0 + (hash2(x0 * 7 + z0 * 13, 21, 5) % 2) as i32 * (d - 1);
+            let top = if hash2(x0 * 7 + z0 * 13, 23, 5) & 1 == 0 {
+                STONE
+            } else {
+                WOOD
+            };
+            self.set(cx, cz, 1 + h, top);
+        }
+        self.buildings += 1;
     }
 
     fn tree(&mut self, tx: i32, tz: i32) {
+        // Don't plant in the pond: a canopy on a water column would hide
+        // the water surface and leave a hole.
+        if self.get(tx, tz, 0) == WATER {
+            return;
+        }
         let g = self.top_at(tx, tz);
         self.set(tx, tz, g, WOOD);
         self.set(tx, tz, g + 1, WOOD);
-        self.set(tx, tz, g + 2, WOOD);
+        // Fully solid 3x3 canopy (three leaf slabs, trunk column capped
+        // with leaf): any air gap inside would leave a sky hole, since
+        // interior faces are culled against taller neighbors.
         for x in tx - 1..=tx + 1 {
             for z in tz - 1..=tz + 1 {
-                self.set(x, z, g + 3, LEAF);
-                self.set(x, z, g + 2, if x == tx && z == tz { WOOD } else { LEAF });
+                if self.get(x, z, 0) == WATER {
+                    continue;
+                }
+                self.set(x, z, g + 2, LEAF);
+                self.set(x, z, g + 1, LEAF);
+                if x != tx || z != tz {
+                    self.set(x, z, g, LEAF);
+                }
             }
         }
+        self.trees += 1;
     }
 }
 
-/// Integer hash for the deterministic terrain.
+/// Integer hash for the deterministic terrain and layout.
 fn hash2(x: i32, z: i32, seed: i32) -> u32 {
     let mut h = (x.wrapping_mul(0x9E37_79B1_u32 as i32)
         ^ z.wrapping_mul(0x85EB_CA77_u32 as i32)
@@ -290,10 +453,18 @@ fn blend(dst: u32, src: u32, alpha: u32) -> u32 {
     0xFF00_0000 | (b << 16) | (g << 8) | r
 }
 
-/// Fills a convex quad with a scanline sweep (top and bottom edges are
-/// always horizontal in this projection; the general form handles any
-/// convex quad).
-fn fill_quad(buf: &mut [u32], pts: &[(f32, f32); 4], color: u32, alpha: u32) {
+/// Fills a convex quad with a scanline sweep, applying the block's
+/// per-pixel texture and an optional vertical side gradient.
+#[allow(clippy::too_many_arguments)]
+fn fill_quad(
+    buf: &mut [u32],
+    pts: &[(f32, f32); 4],
+    base: Color,
+    alpha: u32,
+    tex: Tex,
+    seed: u32,
+    grad: Option<(f32, f32)>,
+) {
     let mut min_y = f32::MAX;
     let mut max_y = f32::MIN;
     for p in pts {
@@ -326,11 +497,69 @@ fn fill_quad(buf: &mut [u32], pts: &[(f32, f32); 4], color: u32, alpha: u32) {
             let b = b.min(WIN_W as i32 - 1);
             let row = (y as usize) * WIN_W;
             for x in a..=b {
+                let mut c = base;
+                match tex {
+                    Tex::Flat => {}
+                    Tex::Noise(delta) => {
+                        let n = (hash2(x, y, seed as i32) % (2 * delta as u32 + 1)) as i32 - delta;
+                        c = shade(c, n);
+                    }
+                    Tex::Brick => {
+                        let row_no = y / 5;
+                        let joint = (x + (row_no & 1) * 5) % 10 < 2;
+                        let bed = y % 5 < 1;
+                        if joint || bed {
+                            c = shade(c, -28);
+                        }
+                    }
+                    Tex::Planks => {
+                        if y % 6 < 1 {
+                            c = shade(c, -14);
+                        }
+                    }
+                    Tex::Leaf => {
+                        let n = hash2(x, y, seed as i32);
+                        c = shade(c, if n & 1 == 0 { -9 } else { 5 });
+                    }
+                    Tex::Shimmer => {
+                        if (y / 4) & 1 == 0 {
+                            c = shade(c, 7);
+                        }
+                        c = shade(c, (hash2(x, y, seed as i32) % 5) as i32 - 2);
+                    }
+                }
+                if let Some((top_y, bottom_y)) = grad {
+                    let t = ((fy - top_y) / (bottom_y - top_y).max(1.0)).clamp(0.0, 1.0);
+                    c = shade(c, -(t * 9.0) as i32);
+                }
                 let idx = row + x as usize;
                 buf[idx] = if alpha >= 255 {
-                    color
+                    pack(c)
                 } else {
-                    blend(buf[idx], color, alpha)
+                    blend(buf[idx], pack(c), alpha)
+                };
+            }
+        }
+    }
+}
+
+/// Fills a disc (sun, clouds) with optional alpha.
+fn fill_circle(buf: &mut [u32], cx: f32, cy: f32, r: f32, color: Color, alpha: u32) {
+    let x0 = ((cx - r).floor() as i32).max(0);
+    let x1 = ((cx + r).ceil() as i32).min(WIN_W as i32 - 1);
+    let y0 = ((cy - r).floor() as i32).max(0);
+    let y1 = ((cy + r).ceil() as i32).min(WIN_H as i32 - 1);
+    let r2 = r * r;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            if dx * dx + dy * dy <= r2 {
+                let idx = (y as usize) * WIN_W + x as usize;
+                buf[idx] = if alpha >= 255 {
+                    pack(color)
+                } else {
+                    blend(buf[idx], pack(color), alpha)
                 };
             }
         }
@@ -384,11 +613,17 @@ fn east_face(cx: f32, cy: f32) -> [(f32, f32); 4] {
     ]
 }
 
-/// West face: the W edge of the top diamond extruded down one block.
-///
-/// NOT drawn: in this 2:1 projection (view axis (1,1,1)) the west and
-/// north faces are backfaces whose screen regions lie inside the block's
-/// own top/south/east faces.
+/// The top-face diamond scaled around its center — used for the dark
+/// bevel rim that gives tiles their definition.
+fn scaled_top_face(cx: f32, cy: f32, factor: f32) -> [(f32, f32); 4] {
+    let pts = top_face(cx, cy);
+    let mut out = [(0.0f32, 0.0f32); 4];
+    for (i, (x, y)) in pts.iter().enumerate() {
+        out[i] = (cx + (x - cx) * factor, cy + (y - cy) * factor);
+    }
+    out
+}
+
 fn fill_sky(buf: &mut [u32]) {
     let top = Color(96, 150, 210);
     let bottom = Color(212, 228, 240);
@@ -403,6 +638,19 @@ fn fill_sky(buf: &mut [u32]) {
         for x in 0..WIN_W {
             buf[y * WIN_W + x] = color;
         }
+    }
+    // Sun with a soft glow, and two clouds.
+    fill_circle(buf, 140.0, 86.0, 52.0, Color(255, 242, 200), 60);
+    fill_circle(buf, 140.0, 86.0, 36.0, Color(255, 236, 170), 255);
+    for (cx, cy, r) in [
+        (330.0, 112.0, 24.0),
+        (356.0, 102.0, 18.0),
+        (310.0, 98.0, 16.0),
+        (720.0, 70.0, 20.0),
+        (742.0, 62.0, 15.0),
+        (702.0, 58.0, 13.0),
+    ] {
+        fill_circle(buf, cx, cy, r, Color(244, 248, 252), 255);
     }
 }
 
@@ -434,23 +682,61 @@ fn render(buf: &mut [u32], world: &World, hover: Option<(i32, i32)>) {
                     continue;
                 }
                 let (cx, cy) = project_center(x, z, slot + 1);
-                if id == WATER {
+                let st = style(id);
+                if id == WATER || id == ROAD {
+                    // Flat surfaces: top face only, with a bevel rim.
                     if slot == top - 1 {
-                        fill_quad(buf, &top_face(cx, cy), pack(palette(id).0), 255);
+                        let seed = hash2(x * 7 + z * 13 + slot * 31, 3, 5);
+                        fill_quad(
+                            buf,
+                            &scaled_top_face(cx, cy, 1.08),
+                            shade(st.top, -26),
+                            255,
+                            Tex::Flat,
+                            0,
+                            None,
+                        );
+                        fill_quad(buf, &top_face(cx, cy), st.top, 255, st.tex, seed, None);
                     }
                     continue;
                 }
-                let (top_c, south_c, east_c, _, _) = palette(id);
+                let seed = hash2(x * 7 + z * 13 + slot * 31, 3, 5);
                 if slot == top - 1 {
-                    fill_quad(buf, &top_face(cx, cy), pack(top_c), 255);
+                    // Beveled top face.
+                    fill_quad(
+                        buf,
+                        &scaled_top_face(cx, cy, 1.08),
+                        shade(st.top, -26),
+                        255,
+                        Tex::Flat,
+                        0,
+                        None,
+                    );
+                    fill_quad(buf, &top_face(cx, cy), st.top, 255, st.tex, seed, None);
                 }
                 // The south face is covered by the south neighbor's body
                 // when the neighbor is at least as tall; same for east.
                 if slot >= south {
-                    fill_quad(buf, &south_face(cx, cy), pack(south_c), 255);
+                    fill_quad(
+                        buf,
+                        &south_face(cx, cy),
+                        st.south,
+                        255,
+                        st.tex,
+                        seed,
+                        Some((cy, cy + TILE_H as f32)),
+                    );
                 }
                 if slot >= east {
-                    fill_quad(buf, &east_face(cx, cy), pack(east_c), 255);
+                    fill_quad(
+                        buf,
+                        &east_face(cx, cy),
+                        st.east,
+                        255,
+                        st.tex,
+                        seed,
+                        Some((cy, cy + TILE_H as f32)),
+                    );
                 }
             }
         }
@@ -459,7 +745,24 @@ fn render(buf: &mut [u32], world: &World, hover: Option<(i32, i32)>) {
         let top = world.top_at(hx, hz);
         if top > 0 {
             let (cx, cy) = project_center(hx, hz, top);
-            fill_quad(buf, &top_face(cx, cy), pack(Color(255, 236, 120)), 110);
+            fill_quad(
+                buf,
+                &scaled_top_face(cx, cy, 1.1),
+                Color(255, 236, 120),
+                170,
+                Tex::Flat,
+                0,
+                None,
+            );
+            fill_quad(
+                buf,
+                &top_face(cx, cy),
+                Color(255, 236, 120),
+                110,
+                Tex::Flat,
+                0,
+                None,
+            );
         }
     }
 }
@@ -500,6 +803,43 @@ fn point_in_top_face(cx: f32, cy: f32, px: f32, py: f32) -> bool {
     true
 }
 
+fn brush_for_key(key: u32) -> Option<u8> {
+    // SDL keycodes for '1'-'8' are the ASCII values.
+    const K1: u32 = b'1' as u32;
+    const K2: u32 = b'2' as u32;
+    const K3: u32 = b'3' as u32;
+    const K4: u32 = b'4' as u32;
+    const K5: u32 = b'5' as u32;
+    const K6: u32 = b'6' as u32;
+    const K7: u32 = b'7' as u32;
+    const K8: u32 = b'8' as u32;
+    match key {
+        K1 => Some(GRASS),
+        K2 => Some(DIRT),
+        K3 => Some(STONE),
+        K4 => Some(BRICK),
+        K5 => Some(WOOD),
+        K6 => Some(LEAF),
+        K7 => Some(WATER),
+        K8 => Some(ROAD),
+        _ => None,
+    }
+}
+
+fn brush_name(brush: u8) -> &'static str {
+    match brush {
+        GRASS => "grass",
+        DIRT => "dirt",
+        STONE => "stone",
+        BRICK => "brick",
+        WOOD => "wood",
+        LEAF => "leaf",
+        WATER => "water",
+        ROAD => "road",
+        _ => "?",
+    }
+}
+
 /// Writes the RGBA backbuffer as a PPM P6 image (debugging/headless use).
 fn save_ppm(buf: &[u32], path: &str) {
     let mut bytes = Vec::with_capacity(WIN_W * WIN_H * 3);
@@ -510,40 +850,6 @@ fn save_ppm(buf: &[u32], path: &str) {
     }
     let header = format!("P6\n{WIN_W} {WIN_H}\n255\n");
     std::fs::write(path, [header.as_bytes(), &bytes].concat()).expect("screenshot write");
-}
-
-fn brush_for_key(key: u32) -> Option<u8> {
-    // SDL keycodes for '1'-'7' are the ASCII values.
-    const K1: u32 = b'1' as u32;
-    const K2: u32 = b'2' as u32;
-    const K3: u32 = b'3' as u32;
-    const K4: u32 = b'4' as u32;
-    const K5: u32 = b'5' as u32;
-    const K6: u32 = b'6' as u32;
-    const K7: u32 = b'7' as u32;
-    match key {
-        K1 => Some(GRASS),
-        K2 => Some(DIRT),
-        K3 => Some(STONE),
-        K4 => Some(WOOD),
-        K5 => Some(LEAF),
-        K6 => Some(WATER),
-        K7 => Some(BRICK),
-        _ => None,
-    }
-}
-
-fn brush_name(brush: u8) -> &'static str {
-    match brush {
-        GRASS => "grass",
-        DIRT => "dirt",
-        STONE => "stone",
-        WOOD => "wood",
-        LEAF => "leaf",
-        WATER => "water",
-        BRICK => "brick",
-        _ => "?",
-    }
 }
 
 fn main() {
@@ -568,7 +874,9 @@ fn main() {
         }
     }
 
-    println!("voxel-city: left-click place, right-click remove, keys 1-7 brush, ESC quit");
+    println!(
+        "voxel-city: left-click place, right-click remove, keys 1-8 brush, ESC quit"
+    );
 
     unsafe {
         if !SDL_Init(SDL_INIT_VIDEO) {
@@ -601,6 +909,10 @@ fn main() {
         }
 
         let mut world = World::new();
+        println!(
+            "seed town: {} buildings, {} trees, {} road tiles",
+            world.buildings, world.trees, world.road_tiles
+        );
         let mut brush = GRASS;
         let mut frame: u64 = 0;
         let mut quit = false;
@@ -617,6 +929,10 @@ fn main() {
                         } else if let Some(next) = brush_for_key(key.key) {
                             brush = next;
                             println!("brush: {}", brush_name(brush));
+                            let title =
+                                CString::new(format!("voxel-city — {}", brush_name(brush)))
+                                    .expect("title");
+                            SDL_SetWindowTitle(window, title.as_ptr());
                         }
                     }
                     SDL_EVENT_MOUSE_BUTTON_DOWN => {
