@@ -1,0 +1,9 @@
+[package]
+name = "voxel-city"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The shared bindings crate from examples/03-sdl3, imported as an
+# external Cargo project (path dep outside this workspace).
+sdl3-sys = { path = "../../../03-sdl3/crates/sdl3-sys" }

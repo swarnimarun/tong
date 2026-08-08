@@ -1,4 +1,5 @@
 /target/
+**/target/
 .pi-subagents/
 .env*
 .DS_Store
