@@ -413,7 +413,7 @@ impl<'a> RustBackend<'a> {
             };
             format!("lib{crate_name}-{meta}.{ext}")
         };
-        let dep_specs = self.resolve_deps(deps);
+        let dep_specs = self.resolve_deps(deps)?;
         let extra_flags: Vec<String> = self
             .model
             .global_rustflags
@@ -510,17 +510,29 @@ impl<'a> RustBackend<'a> {
         enc.digest().to_hex()[..16].to_owned()
     }
 
-    fn resolve_deps(&self, deps: &[Dep]) -> Vec<DepSpec> {
-        deps.iter().filter_map(|dep| self.dep_spec(dep)).collect()
+    fn resolve_deps(&self, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
+        deps.iter().map(|dep| self.dep_spec(dep)).collect()
     }
 
     /// Resolves a dependency to its producer action or native import.
-    fn dep_spec(&self, dep: &Dep) -> Option<DepSpec> {
-        if let Some(cc) = self.cc.get(&dep.package) {
-            let _ = cc;
-            return Some(DepSpec::Native);
+    /// An unresolvable dependency is a plan error — silently dropping it
+    /// would link against a missing crate and fail deep inside rustc.
+    fn dep_spec(&self, dep: &Dep) -> Result<DepSpec, PlanError> {
+        if self.cc.contains_key(&dep.package) {
+            return Ok(DepSpec::Native);
         }
-        let pkg = self.model.packages.iter().find(|p| p.name == dep.package)?;
+        let pkg = self
+            .model
+            .packages
+            .iter()
+            .find(|p| p.name == dep.package)
+            .ok_or_else(|| {
+                PlanError::Message(format!(
+                    "dependency {:?} of {:?} names no imported package or cc_import \
+                     (registry dependencies are unsupported until Phase 3 locking)",
+                    dep.extern_name, dep.package
+                ))
+            })?;
         let (kind, ext, key) = if let Some(lib) = &pkg.lib {
             if lib.proc_macro {
                 (
@@ -539,7 +551,13 @@ impl<'a> RustBackend<'a> {
                     .find(|t| **t == CrateType::Rlib)
                     .or_else(|| types.iter().find(|t| **t == CrateType::Staticlib))
                     .or_else(|| types.iter().find(|t| **t == CrateType::Cdylib))
-                    .or_else(|| types.iter().find(|t| **t == CrateType::Dylib))?;
+                    .or_else(|| types.iter().find(|t| **t == CrateType::Dylib))
+                    .ok_or_else(|| {
+                        PlanError::Message(format!(
+                            "cannot link dependency {:?}: no linkable crate type",
+                            pkg.name
+                        ))
+                    })?;
                 let ext = match chosen {
                     CrateType::Rlib => "rlib",
                     CrateType::Staticlib => "a",
@@ -552,11 +570,18 @@ impl<'a> RustBackend<'a> {
                 )
             }
         } else {
-            return None;
+            return Err(PlanError::Message(format!(
+                "dependency {:?} names package {:?}, which has no library target",
+                dep.extern_name, dep.package
+            )));
         };
-        let action = self.planned_ids.get(&key)?.clone();
+        let action = self
+            .planned_ids
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| PlanError::Message(format!("no planned action for {key}")))?;
         let meta = self.metadata(&crate_name(&pkg.name), kind);
-        Some(DepSpec::Rust {
+        Ok(DepSpec::Rust {
             extern_name: dep.extern_name.clone(),
             action,
             file: format!("lib{}-{meta}.{ext}", crate_name(&pkg.name)),

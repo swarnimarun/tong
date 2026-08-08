@@ -87,6 +87,7 @@ struct CargoWorkspace {
     dependencies: BTreeMap<String, DepValue>,
 }
 
+/// `name = { path = "...", package = "..." }` or `{ workspace = true }`.
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
 enum DepValue {
@@ -97,6 +98,8 @@ enum DepValue {
         path: Option<String>,
         #[serde(rename = "workspace")]
         workspace: Option<bool>,
+        /// Optional `package = "real-name"` rename for path deps.
+        package: Option<String>,
     },
 }
 
@@ -196,91 +199,36 @@ pub fn import_cargo_workspace(workspace_root: &Path) -> Result<RustModel, CargoI
     };
 
     let mut model = RustModel::default();
-
+    // Canonical package dir → imported package. Path dependencies outside
+    // the workspace are imported recursively (Cargo semantics), so the
+    // graph is closed over every path dep, not just the members.
+    let mut packages: BTreeMap<PathBuf, Package> = BTreeMap::new();
+    let mut visiting: Vec<PathBuf> = Vec::new();
     for member in &members {
-        let manifest = read_manifest(member)?;
-        let package = manifest.package.as_ref().ok_or_else(|| {
-            CargoImportError::Unsupported(format!(
-                "{} declares a workspace but not a package",
-                member.display()
-            ))
-        })?;
-
-        let dir = member.clone();
-        let mut pkg = Package {
-            name: package.name.clone(),
-            dir,
-            version: package.version.clone(),
-            edition: parse_edition(&package.edition)?,
-            lib: None,
-            bins: Vec::new(),
-            build_script: None,
-            deps: Vec::new(),
-            build_deps: Vec::new(),
-            rustflags: Vec::new(),
-            env: BTreeMap::new(),
-        };
-        // Cargo auto-detects build.rs at the package root when the `build`
-        // key is absent.
-        pkg.build_script =
-            package.build.as_ref().map(PathBuf::from).or_else(|| {
-                (pkg.dir.join("build.rs").is_file()).then(|| PathBuf::from("build.rs"))
-            });
-
-        // Library target: explicit [lib] or auto-detected src/lib.rs.
-        let lib_path = match &manifest.lib {
-            Some(lib) => lib
-                .path
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("src/lib.rs")),
-            None => PathBuf::from("src/lib.rs"),
-        };
-        let lib_present = pkg.dir.join(&lib_path).is_file();
-        if let Some(lib) = &manifest.lib {
-            pkg.lib = Some(LibTarget {
-                crate_types: parse_crate_types(&lib.crate_type)?,
-                proc_macro: lib.proc_macro,
-                path: lib_path,
-            });
-        } else if lib_present {
-            pkg.lib = Some(LibTarget {
-                crate_types: Vec::new(),
-                proc_macro: false,
-                path: lib_path,
-            });
-        }
-
-        // Binaries: explicit [[bin]] or auto-detected src/main.rs.
-        if manifest.bin.is_empty() && pkg.dir.join("src/main.rs").is_file() {
-            pkg.bins.push(BinTarget {
-                name: package.name.clone(),
-                path: PathBuf::from("src/main.rs"),
-            });
-        }
-        for bin in &manifest.bin {
-            let name = bin.name.clone().unwrap_or_else(|| {
-                bin.path
-                    .as_ref()
-                    .and_then(|p| Path::new(p).file_stem())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&package.name)
-                    .to_owned()
-            });
-            let path = bin
-                .path
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("src/bin/{name}.rs")));
-            pkg.bins.push(BinTarget { name, path });
-        }
-
-        // Dependencies (path and workspace-inherited only).
-        pkg.deps = resolve_deps(&manifest.dependencies, member, &inherited)?;
-        pkg.build_deps = resolve_deps(&manifest.build_dependencies, member, &inherited)?;
-
-        model.packages.push(pkg);
+        import_package(
+            member,
+            &mut packages,
+            &mut visiting,
+            &inherited,
+            workspace_root,
+        )?;
     }
+
+    // The model resolves deps by package name (no version-aware resolution
+    // yet): two imported packages with the same name are ambiguous.
+    let mut by_name: BTreeMap<&str, &PathBuf> = BTreeMap::new();
+    for pkg in packages.values() {
+        if let Some(previous) = by_name.insert(pkg.name.as_str(), &pkg.dir) {
+            return Err(CargoImportError::Unsupported(format!(
+                "two packages named {} ({} and {}); Tong cannot distinguish \
+                 same-name packages yet",
+                pkg.name,
+                previous.display(),
+                pkg.dir.display()
+            )));
+        }
+    }
+    model.packages = packages.into_values().collect();
 
     // Profiles from the workspace root manifest (Cargo: [profile.*] tables).
     model.profiles = resolve_profiles(&root_manifest.profile);
@@ -366,11 +314,183 @@ fn expand_members(
     Ok(out)
 }
 
+/// Imports the package at `dir` (a workspace member or a path dependency)
+/// into `packages`, recursing into its path dependencies. Returns the
+/// package's declared name. Cycles are rejected, matching Cargo.
+fn import_package(
+    dir: &Path,
+    packages: &mut BTreeMap<PathBuf, Package>,
+    visiting: &mut Vec<PathBuf>,
+    inherited: &BTreeMap<String, DepValue>,
+    workspace_root: &Path,
+) -> Result<String, CargoImportError> {
+    let canonical = fs::canonicalize(dir)
+        .map_err(|err| CargoImportError::Io(dir.display().to_string(), err))?;
+    if let Some(pkg) = packages.get(&canonical) {
+        return Ok(pkg.name.clone());
+    }
+    if visiting.contains(&canonical) {
+        return Err(CargoImportError::Unsupported(format!(
+            "cyclic path dependency involving {}",
+            dir.display()
+        )));
+    }
+    visiting.push(canonical.clone());
+
+    let result = (|| {
+        let manifest = read_manifest(&canonical)?;
+        // A path dependency may be its own workspace root; its
+        // `[workspace.dependencies]` then apply, not the importer's.
+        let inherited = match &manifest.workspace {
+            Some(workspace) => &workspace.dependencies,
+            None => inherited,
+        };
+        let package = manifest.package.as_ref().ok_or_else(|| {
+            CargoImportError::Unsupported(format!(
+                "{} declares a workspace but not a package",
+                canonical.display()
+            ))
+        })?;
+
+        let mut pkg = Package {
+            name: package.name.clone(),
+            dir: canonical.clone(),
+            version: package.version.clone(),
+            edition: parse_edition(&package.edition)?,
+            lib: None,
+            bins: Vec::new(),
+            build_script: None,
+            deps: Vec::new(),
+            build_deps: Vec::new(),
+            rustflags: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        // Cargo auto-detects build.rs at the package root when the `build`
+        // key is absent.
+        pkg.build_script =
+            package.build.as_ref().map(PathBuf::from).or_else(|| {
+                (pkg.dir.join("build.rs").is_file()).then(|| PathBuf::from("build.rs"))
+            });
+
+        // Library target: explicit [lib] or auto-detected src/lib.rs.
+        let lib_path = match &manifest.lib {
+            Some(lib) => lib
+                .path
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("src/lib.rs")),
+            None => PathBuf::from("src/lib.rs"),
+        };
+        let lib_present = pkg.dir.join(&lib_path).is_file();
+        if let Some(lib) = &manifest.lib {
+            pkg.lib = Some(LibTarget {
+                crate_types: parse_crate_types(&lib.crate_type)?,
+                proc_macro: lib.proc_macro,
+                path: lib_path,
+            });
+        } else if lib_present {
+            pkg.lib = Some(LibTarget {
+                crate_types: Vec::new(),
+                proc_macro: false,
+                path: lib_path,
+            });
+        }
+
+        // Binaries: explicit [[bin]] or auto-detected src/main.rs.
+        if manifest.bin.is_empty() && pkg.dir.join("src/main.rs").is_file() {
+            pkg.bins.push(BinTarget {
+                name: package.name.clone(),
+                path: PathBuf::from("src/main.rs"),
+            });
+        }
+        for bin in &manifest.bin {
+            let name = bin.name.clone().unwrap_or_else(|| {
+                bin.path
+                    .as_ref()
+                    .and_then(|p| Path::new(p).file_stem())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&package.name)
+                    .to_owned()
+            });
+            let path = bin
+                .path
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("src/bin/{name}.rs")));
+            pkg.bins.push(BinTarget { name, path });
+        }
+
+        // Dependencies (path and workspace-inherited only). Direct paths
+        // resolve relative to this manifest; inherited paths resolve
+        // relative to the workspace root.
+        let resolved_deps = resolve_deps(
+            &manifest.dependencies,
+            &canonical,
+            workspace_root,
+            inherited,
+        )?;
+        let resolved_build_deps = resolve_deps(
+            &manifest.build_dependencies,
+            &canonical,
+            workspace_root,
+            inherited,
+        )?;
+        let mut deps = Vec::new();
+        let mut build_deps = Vec::new();
+        for (resolved, target) in [
+            (resolved_deps, &mut deps),
+            (resolved_build_deps, &mut build_deps),
+        ] {
+            for dep in resolved {
+                let real_name = match dep.path {
+                    Some(path) => {
+                        let imported =
+                            import_package(&path, packages, visiting, inherited, workspace_root)?;
+                        if imported != dep.package {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "path dependency {} = {{ path = {:?} }} resolves to package \
+                                 {imported:?}, not {:?}",
+                                dep.extern_name.replace('_', "-"),
+                                path.display(),
+                                dep.package
+                            )));
+                        }
+                        imported
+                    }
+                    None => dep.package,
+                };
+                target.push(Dep {
+                    extern_name: dep.extern_name,
+                    package: real_name,
+                });
+            }
+        }
+        pkg.deps = deps;
+        pkg.build_deps = build_deps;
+
+        let name = pkg.name.clone();
+        packages.insert(canonical, pkg);
+        Ok(name)
+    })();
+
+    visiting.pop();
+    result
+}
+
+/// A resolved dependency: the crate name used at the use site, the package
+/// name it refers to, and — for path dependencies — the package directory.
+struct ResolvedDep {
+    extern_name: String,
+    package: String,
+    path: Option<PathBuf>,
+}
+
 fn resolve_deps(
     deps: &BTreeMap<String, DepValue>,
     member: &Path,
+    workspace_root: &Path,
     inherited: &BTreeMap<String, DepValue>,
-) -> Result<Vec<Dep>, CargoImportError> {
+) -> Result<Vec<ResolvedDep>, CargoImportError> {
     let mut out = Vec::new();
     for (name, value) in deps {
         let resolved = match value {
@@ -381,14 +501,35 @@ fn resolve_deps(
                     member.display()
                 )));
             }
-            DepValue::Table { path, workspace } => {
+            DepValue::Table {
+                path,
+                workspace,
+                package,
+            } => {
                 if let Some(path) = path {
-                    Some((name.clone(), PathBuf::from(path)))
+                    // Path deps resolve relative to the declaring manifest.
+                    let dir = member.join(path);
+                    Some((
+                        name.clone(),
+                        package.clone().unwrap_or_else(|| name.clone()),
+                        Some(dir),
+                    ))
                 } else if *workspace == Some(true) {
                     match inherited.get(name) {
                         Some(DepValue::Table {
-                            path: Some(path), ..
-                        }) => Some((name.clone(), PathBuf::from(path))),
+                            path: Some(path),
+                            package: inherited_package,
+                            ..
+                        }) => {
+                            // Inherited path deps resolve relative to the
+                            // workspace root manifest.
+                            let dir = workspace_root.join(path);
+                            Some((
+                                name.clone(),
+                                inherited_package.clone().unwrap_or_else(|| name.clone()),
+                                Some(dir),
+                            ))
+                        }
                         _ => {
                             return Err(CargoImportError::Unsupported(format!(
                                 "dependency {name:?} uses workspace inheritance without a \
@@ -405,13 +546,11 @@ fn resolve_deps(
                 }
             }
         };
-        if let Some((extern_name, _path)) = resolved {
-            // The package name is the dep key; the target dir is used to
-            // validate, but workspace-local resolution means the package
-            // name is the same as the crate name.
-            out.push(Dep {
+        if let Some((extern_name, package, path)) = resolved {
+            out.push(ResolvedDep {
                 extern_name: extern_name.replace('-', "_"),
-                package: extern_name,
+                package,
+                path,
             });
         }
     }
@@ -637,6 +776,84 @@ APP_GREETING = "hello"
         let model = import_cargo_workspace(dir.path()).unwrap();
         assert_eq!(model.global_rustflags, vec!["--cfg", "advanced_mode"]);
         assert_eq!(model.global_env.get("APP_GREETING").unwrap(), "hello");
+    }
+
+    #[test]
+    fn imports_external_path_dependency() {
+        // A path dep outside the workspace is imported recursively, like
+        // Cargo does (used by examples/04-voxel-city → sdl3-sys).
+        let dir = write_tree(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/app\"]\n"),
+            (
+                "crates/app/Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sdl3-sys = { path = "../../shared/sdl3-sys" }
+"#,
+            ),
+            ("crates/app/src/main.rs", "fn main() {}"),
+            (
+                "shared/sdl3-sys/Cargo.toml",
+                "[package]\nname = \"sdl3-sys\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("shared/sdl3-sys/src/lib.rs", "pub fn init() {}"),
+        ]);
+        let model = import_cargo_workspace(dir.path()).unwrap();
+        assert_eq!(model.packages.len(), 2);
+        let app = model.packages.iter().find(|p| p.name == "app").unwrap();
+        assert_eq!(app.deps.len(), 1);
+        assert_eq!(app.deps[0].extern_name, "sdl3_sys");
+        assert_eq!(app.deps[0].package, "sdl3-sys");
+        let sys = model
+            .packages
+            .iter()
+            .find(|p| p.name == "sdl3-sys")
+            .unwrap();
+        assert_eq!(
+            sys.dir,
+            fs::canonicalize(dir.path().join("shared/sdl3-sys")).unwrap()
+        );
+        assert!(sys.lib.is_some());
+    }
+
+    #[test]
+    fn rejects_cyclic_path_dependencies() {
+        let dir = write_tree(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\"]\n"),
+            (
+                "a/Cargo.toml",
+                r#"
+[package]
+name = "a"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+b = { path = "../b" }
+"#,
+            ),
+            ("a/src/lib.rs", ""),
+            (
+                "b/Cargo.toml",
+                r#"
+[package]
+name = "b"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+a = { path = "../a" }
+"#,
+            ),
+            ("b/src/lib.rs", ""),
+        ]);
+        let err = import_cargo_workspace(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("cyclic"), "{err}");
     }
 
     #[test]
