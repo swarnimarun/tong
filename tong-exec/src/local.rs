@@ -34,6 +34,8 @@ use tong_core::paths::{OutputPath, RelativePath};
 use tong_core::tree::TreeEntry;
 use tong_store::Cas;
 
+use crate::sandbox::{Sandbox, SandboxLevel, SandboxSpec, default_read_only_binds, sandbox_for};
+
 /// Placeholder substituted with the action's exec root path.
 pub use tong_core::action::{BUNDLE_ROOT_VAR, EXEC_ROOT_VAR};
 
@@ -118,6 +120,10 @@ impl From<io::Error> for ExecError {
 pub struct LocalExecutor {
     cas: Cas,
     exec_base: PathBuf,
+    /// Sandbox enforcement level (PLAN.md section 11; opt-in).
+    sandbox_level: SandboxLevel,
+    /// The platform sandbox wrapper.
+    sandbox: Box<dyn Sandbox>,
     /// System-captured executables: blob digest → real local path.
     system_tools: HashMap<Digest, PathBuf>,
     /// System-captured bundle roots: bundle digest → local directory.
@@ -129,11 +135,24 @@ pub struct LocalExecutor {
 impl LocalExecutor {
     /// Creates an executor using `exec_base` for working directories.
     pub fn new(cas: Cas, exec_base: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::with_sandbox(cas, exec_base, SandboxLevel::L1)
+    }
+
+    /// Creates an executor with a sandbox enforcement level.
+    pub fn with_sandbox(
+        cas: Cas,
+        exec_base: impl Into<PathBuf>,
+        sandbox_level: SandboxLevel,
+    ) -> io::Result<Self> {
         let exec_base = exec_base.into();
         fs::create_dir_all(&exec_base)?;
+        let host = std::env::consts::OS;
+        let sandbox = sandbox_for(host);
         Ok(Self {
             cas,
             exec_base,
+            sandbox_level,
+            sandbox,
             system_tools: HashMap::new(),
             bundle_roots: HashMap::new(),
             keep_exec_roots: false,
@@ -253,18 +272,43 @@ impl LocalExecutor {
 
         let stdout_path = tmp.join("stdout");
         let stderr_path = tmp.join("stderr");
-        let mut child = Command::new(&executable)
+        let mut binding = Command::new(&executable);
+        let command = binding
             .args(&args)
             .current_dir(&working_dir)
             .env_clear()
-            .envs(env)
+            .envs(env.clone())
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout_path)?)
-            .stderr(fs::File::create(&stderr_path)?)
-            .spawn()
-            .map_err(|err| {
-                ExecError::ExecutableMissing(format!("{}: {err}", executable.display()))
-            })?;
+            .stderr(fs::File::create(&stderr_path)?);
+        let child = command;
+
+        if self.sandbox_level >= SandboxLevel::L3 {
+            // Filesystem + network isolation. The captured toolchain's
+            // closure (registered bundle roots and system tool parents) is
+            // bound read-only so the sandboxed action can still run rustc.
+            let mut binds = default_read_only_binds();
+            for root in self.bundle_roots.values() {
+                binds.push(root.clone());
+            }
+            for tool in self.system_tools.values() {
+                if let Some(parent) = tool.parent() {
+                    binds.push(parent.to_path_buf());
+                }
+            }
+            let spec = SandboxSpec {
+                level: self.sandbox_level,
+                read_only_binds: binds,
+                writable: vec![output.to_path_buf(), tmp.to_path_buf()],
+                deny_network: spec.network_policy == tong_core::action::NetworkPolicy::Deny,
+                environment: env,
+            };
+            self.sandbox.wrap_command(child, &spec, exec_root)?;
+        }
+
+        let mut child = child.spawn().map_err(|err| {
+            ExecError::ExecutableMissing(format!("{}: {err}", executable.display()))
+        })?;
 
         let status = wait_with_timeout(&mut child, spec.timeout)?;
         let code = match status {

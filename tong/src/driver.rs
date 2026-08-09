@@ -91,6 +91,8 @@ pub struct BuildOptions {
     pub targets: Vec<String>,
     /// Feature selection (Cargo-style flags).
     pub features: FeatureOptions,
+    /// Sandbox enforcement level (`[policy] sandbox`, default `l1`).
+    pub sandbox: Option<tong_exec::SandboxLevel>,
 }
 
 /// Feature selection for a build (`--features`, `--no-default-features`,
@@ -554,7 +556,20 @@ fn prepare(
     // Toolchain: needed by the backend for action identity.
     let toolchain = capture_system_rust(&cas)?;
 
-    let mut executor = LocalExecutor::new(cas.clone(), &exec)?;
+    // Sandbox level: `BuildOptions.sandbox` wins, then `[policy] sandbox`
+    // (default l1 — opt-in).
+    let sandbox_level = options
+        .sandbox
+        .or_else(|| {
+            manifest
+                .as_ref()
+                .and_then(|manifest| manifest.policy.as_ref())
+                .and_then(|policy| policy.sandbox.as_deref())
+                .and_then(tong_exec::SandboxLevel::parse)
+        })
+        .unwrap_or(tong_exec::SandboxLevel::L1);
+
+    let mut executor = LocalExecutor::with_sandbox(cas.clone(), &exec, sandbox_level)?;
     executor.register_system_tool(toolchain.rustc_blob, toolchain.rustc.clone());
     executor.register_bundle_root(toolchain.bundle.digest(), toolchain.root.clone());
 

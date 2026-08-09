@@ -5,5 +5,7 @@
 //! levels are defined in PLAN.md section 11.
 
 pub mod local;
+pub mod sandbox;
 
 pub use local::{BUNDLE_ROOT_VAR, EXEC_ROOT_VAR, ExecError, ExecOutcome, LocalExecutor};
+pub use sandbox::{SandboxLevel, SandboxSpec, sandbox_for};

@@ -133,6 +133,7 @@ fn main() -> ExitCode {
                     no_default_features,
                     all_features,
                 },
+                sandbox: None,
             };
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
@@ -161,6 +162,7 @@ fn main() -> ExitCode {
                     no_default_features,
                     all_features,
                 },
+                sandbox: None,
             };
             match driver::run(&workspace, &target, &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -196,6 +198,7 @@ fn main() -> ExitCode {
                     no_default_features,
                     all_features,
                 },
+                sandbox: None,
             };
             match driver::test(&workspace, label.as_deref(), &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),

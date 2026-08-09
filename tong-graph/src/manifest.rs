@@ -34,6 +34,20 @@ pub struct Manifest {
     /// Registry configuration (`[registry]`): the index URL.
     #[serde(default)]
     pub registry: Option<RegistryConfig>,
+    /// Execution policy (`[policy]`): sandbox level.
+    #[serde(default)]
+    pub policy: Option<PolicyConfig>,
+}
+
+/// Execution policy configuration (`[policy]`).
+///
+/// Sandboxing is opt-in (default `l1` — clean environment) until certified
+/// per platform (PLAN.md section 11).
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Sandbox level: `l1`, `l2`, `l3`, or `l4`.
+    pub sandbox: Option<String>,
 }
 
 /// Registry configuration (`[registry]`).
