@@ -230,23 +230,13 @@ impl StateStore {
 
     /// The newest manifest of a project, if any.
     pub fn latest(&self, project_hash: &Digest) -> Option<BuildManifest> {
-        let dir = self.project_dir(project_hash);
-        let mut entries: Vec<(String, PathBuf)> = fs::read_dir(&dir)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".state"))
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    entry.path(),
-                )
-            })
-            .collect();
-        entries.sort();
-        entries.pop().and_then(|(_, path)| read_manifest(&path).ok())
+        newest_in(&self.project_dir(project_hash))
     }
 
-    /// Every manifest of every project — the GC root set in shared mode.
+    /// The newest manifest of every project — the GC root set in shared
+    /// mode. Older manifests are retained on disk (diagnostics), but only
+    /// the latest successful graph of each project is a GC root, so
+    /// rebuilding clears the superseded cache.
     pub fn all(&self) -> Vec<BuildManifest> {
         let mut out = Vec::new();
         let Ok(projects) = fs::read_dir(&self.root) else {
@@ -256,24 +246,8 @@ impl StateStore {
             if !project.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            let mut entries: Vec<(String, PathBuf)> = fs::read_dir(project.path())
-                .map(|dir| {
-                    dir.filter_map(|entry| entry.ok())
-                        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".state"))
-                        .map(|entry| {
-                            (
-                                entry.file_name().to_string_lossy().into_owned(),
-                                entry.path(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            entries.sort();
-            for (_, path) in entries {
-                if let Ok(manifest) = read_manifest(&path) {
-                    out.push(manifest);
-                }
+            if let Some(manifest) = newest_in(&project.path()) {
+                out.push(manifest);
             }
         }
         out
@@ -287,6 +261,24 @@ impl StateStore {
         }
         Ok(())
     }
+}
+
+fn newest_in(dir: &Path) -> Option<BuildManifest> {
+    let mut entries: Vec<(String, PathBuf)> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".state"))
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+        .pop()
+        .and_then(|(_, path)| read_manifest(&path).ok())
 }
 
 fn read_manifest(path: &Path) -> io::Result<BuildManifest> {
@@ -360,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_newest_manifests() {
+    fn keeps_only_newest_manifests_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateStore::open(dir.path()).unwrap();
         let project = Hasher::digest(b"project");
@@ -368,11 +360,22 @@ mod tests {
             let manifest = sample_manifest(&project, &Hasher::digest(&[created as u8]), created);
             state.write(&manifest).unwrap();
         }
+        // Disk retains only the newest MANIFESTS_KEPT_PER_PROJECT files.
+        let dir = state.project_dir(&project);
+        let files: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".state"))
+            .collect();
+        assert_eq!(files.len(), MANIFESTS_KEPT_PER_PROJECT);
+
+        // The GC root set is only the latest graph of the project:
+        // rebuilding clears the superseded cache.
         let all = state.all();
-        assert_eq!(all.len(), MANIFESTS_KEPT_PER_PROJECT);
-        // Newest survive.
-        assert_eq!(all[0].created_at_unix_secs, 2);
-        assert_eq!(all[2].created_at_unix_secs, 4);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].created_at_unix_secs, 4);
+        assert_eq!(state.latest(&project).unwrap().created_at_unix_secs, 4);
     }
 
     #[test]
@@ -381,8 +384,12 @@ mod tests {
         let state = StateStore::open(dir.path()).unwrap();
         let a = Hasher::digest(b"a");
         let b = Hasher::digest(b"b");
-        state.write(&sample_manifest(&a, &Hasher::digest(b"ga"), 1)).unwrap();
-        state.write(&sample_manifest(&b, &Hasher::digest(b"gb"), 1)).unwrap();
+        state
+            .write(&sample_manifest(&a, &Hasher::digest(b"ga"), 1))
+            .unwrap();
+        state
+            .write(&sample_manifest(&b, &Hasher::digest(b"gb"), 1))
+            .unwrap();
         state.remove_project(&a).unwrap();
         assert!(state.latest(&a).is_none());
         assert!(state.latest(&b).is_some());

@@ -787,28 +787,54 @@ Concurrency control should be per digest:
 
 ### 10.4 Retention and garbage collection
 
-After a successful build, write a build-state manifest containing:
+After a successful build, write a build-state manifest (`tong-store::state`,
+`<store>/state/projects/<project_hash>/`) recording the full object closure
+of the build:
 
-* Requested top-level targets.
-* Configured target graph digest.
-* Action results.
-* Generated artifacts.
-* Source objects.
-* Toolchain closures.
-* Environment bundles.
-* Runtime closures.
-* Test results where cacheable.
+* Requested top-level targets and the configured target graph digest
+  (canonical sorted `(logical_id, action_digest)` pairs).
+* Every action: digest, logical id, mnemonic, input root, executable blob,
+  environment bundle, outputs, stdout/stderr, duration.
+* The union of source input roots and toolchain bundles.
+* Materialized artifact name → outputs tree.
 
-Garbage collection uses mark-and-sweep roots:
+The three newest manifests per project are retained on disk (superseded
+state is deleted at write time — "rebuilding clears the old cache"); only
+the *latest* manifest of each project is a GC root, so a rebuild makes the
+previous graph's objects garbage immediately.
+
+Garbage collection (`tong-store::gc`) is reachability-based mark-and-sweep
+over the whole store, mirroring Cargo's GC direction (#5026/#16804) but
+using CAS reachability instead of SQLite mtime tracking:
 
 ```text
-latest successful graph
-explicit user pins
-active builds
-recently used actions
-installed runtime packages
-remote-upload queue
+roots:      latest successful graph per project
+            (every digest in every manifest from StateStore::all())
+            + transitively: tree → blobs/subtrees, bundle → files tree
+sweep:      unmarked results/ entries and objects older than the
+            retention floor (default 7d) are deleted, results first
+budget:     when the store exceeds max_size (default 10G), unmarked
+            objects are deleted oldest-first until under budget, never
+            younger than 24h (protects concurrent in-flight builds in
+            shared mode)
+tmp:        stale <store>/tmp files older than 24h are always deleted
 ```
+
+The mark phase closes the reachability graph (a marked tree keeps its
+blobs and subtrees; a marked bundle keeps its files tree), so GC never
+sweeps content a marked object references. Retention and budget are
+configured via `[store] retention`/`[store] max_size` in `Tong.toml` or
+the `TONG_STORE_RETENTION`/`TONG_STORE_MAX_SIZE` environment variables;
+`tong gc [--older-than <dur>] [--max-size <size>] [--dry-run]` runs a
+manual sweep (defaults from config; `--older-than 0` deletes all unmarked
+immediately).
+
+Shared stores (env `TONG_STORE_DIR` or `[store] dir`) are first-class: all
+writes stay atomic and idempotent per digest, no locks are needed
+(§10.1, §10.3), and `tong clean` in shared mode removes only the calling
+project's exec roots, outputs, and state manifests, then sweeps the
+objects that no other project's manifest marks — it never touches another
+project's live objects.
 
 The Nix concept of retaining complete reachable closures is useful here, but Tong should maintain separate build-time and runtime reachability.
 
@@ -1115,8 +1141,8 @@ tong-store/
 ### Exit criteria
 
 * A synthetic multi-target graph executes incrementally.
-* Concurrent builds do not lock the whole output tree.
-* Cache hits survive process restarts.
+* Concurrent builds do not lock the whole output tree. *(completed: per-digest atomic writes, shared stores, no whole-build locks — §10.3)*
+* Cache hits survive process restarts. *(completed: digest-keyed results with build-state manifests and reachability GC — §10.4)*
 * `tong explain rebuild` reports the changed semantic input.
 
 ---

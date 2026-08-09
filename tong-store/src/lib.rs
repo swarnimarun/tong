@@ -1,8 +1,10 @@
 //! Storage layer for Tong.
 //!
-//! Owns the content-addressed store, action cache, build-state manifests, and
-//! reachability-based garbage collection. Atomic CAS writes and per-digest
-//! concurrency rules are defined in PLAN.md section 10.
+//! Owns the content-addressed store (`cas`), the digest-keyed action cache
+//! (`action_cache`), build-state manifests (`state`), and reachability-based
+//! garbage collection (`gc`). Atomic CAS writes and per-digest concurrency
+//! rules are defined in PLAN.md section 10; the GC root set, retention, and
+//! shared-store rules are section 10.4.
 
 pub mod action_cache;
 pub mod cas;

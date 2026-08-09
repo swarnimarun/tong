@@ -45,6 +45,18 @@ enum Command {
     },
     /// Remove the project-local `.tong` directory.
     Clean,
+    /// Garbage-collect the store: delete unreferenced cache objects.
+    Gc {
+        /// Delete unmarked objects older than this duration (`0` = all).
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Store size budget (e.g. `10G`, `500M`).
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Report what would be deleted without deleting.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -88,6 +100,24 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Gc {
+            older_than,
+            max_size,
+            dry_run,
+        } => {
+            let opts = driver::GcCli {
+                older_than,
+                max_size,
+                dry_run,
+            };
+            match driver::gc(&workspace, &opts) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 

@@ -193,7 +193,13 @@ pub fn sweep(cas: &Cas, state: &StateStore, opts: &GcOptions) -> io::Result<GcRe
         for entry in entries.flatten() {
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                collect_sharded(&dir.join(entry.file_name()), namespace, &digests, &mut report, &mut candidates)?;
+                collect_sharded(
+                    &dir.join(entry.file_name()),
+                    namespace,
+                    &digests,
+                    &mut report,
+                    &mut candidates,
+                )?;
             } else if file_type.is_file() {
                 // A stray file (e.g. `ActionCache::put`'s `tmp-<pid>`
                 // leftover): unmarked by construction.
@@ -212,7 +218,10 @@ pub fn sweep(cas: &Cas, state: &StateStore, opts: &GcOptions) -> io::Result<GcRe
     }
 
     let mut deleted: BTreeSet<PathBuf> = BTreeSet::new();
-    let delete = |candidate: &Candidate, report: &mut GcReport, deleted: &mut BTreeSet<PathBuf>| -> io::Result<()> {
+    let delete = |candidate: &Candidate,
+                  report: &mut GcReport,
+                  deleted: &mut BTreeSet<PathBuf>|
+     -> io::Result<()> {
         if !opts.dry_run {
             fs::remove_file(&candidate.path)?;
         }
@@ -288,10 +297,7 @@ fn collect_sharded(
         if !file_type.is_file() {
             continue;
         }
-        let shard = dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
+        let shard = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
         let Some(digest) = digest_from_name(shard, entry.file_name().to_str().unwrap_or("")) else {
             // Not a digest-addressed file (leftover temp): unmarked.
             collect_file(&entry.path(), report, candidates)?;
@@ -323,7 +329,11 @@ fn digest_from_name(shard: &str, name: &str) -> Option<Digest> {
     Digest::from_hex(&hex).ok()
 }
 
-fn collect_file(path: &Path, report: &mut GcReport, candidates: &mut Vec<Candidate>) -> io::Result<()> {
+fn collect_file(
+    path: &Path,
+    report: &mut GcReport,
+    candidates: &mut Vec<Candidate>,
+) -> io::Result<()> {
     let metadata = fs::metadata(path)?;
     let mtime = metadata
         .modified()
@@ -357,13 +367,13 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    use crate::action_cache::ActionCache;
+    use crate::state::BuildManifest;
     use tong_core::artifact::{BlobDigest, TreeDigest};
     use tong_core::canonical;
     use tong_core::digest::Hasher;
     use tong_core::platform::PlatformKey;
     use tong_core::tree::{Tree, TreeEntry};
-    use crate::action_cache::ActionCache;
-    use crate::state::BuildManifest;
 
     fn cas_with(action_digests: &[Digest]) -> (tempfile::TempDir, Cas, ActionCache) {
         let dir = tempfile::tempdir().unwrap();

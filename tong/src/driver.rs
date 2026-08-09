@@ -15,7 +15,8 @@ use tong_graph::manifest::Manifest;
 use tong_graph::{Completed, PlanError, topological_order};
 use tong_rust::{RustBackend, capture_system_rust, import_cargo_workspace};
 use tong_store::{
-    ActionCache, CachedResult, Cas, GcOptions, StateStore, graph_digest, project_hash, sweep,
+    ActionCache, CachedResult, Cas, GcOptions, GcReport, StateStore, graph_digest, project_hash,
+    sweep,
 };
 
 use crate::manifest_mode::manifest_to_model;
@@ -39,7 +40,10 @@ pub fn store_dir(root: &Path, manifest: Option<&Manifest>) -> Result<PathBuf, Bu
         && let Some(dir) = &store.dir
     {
         let path = Path::new(dir);
-        if path.is_absolute() || path.components().any(|c| c == std::path::Component::ParentDir)
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
         {
             return Err(BuildError::Store(format!(
                 "[store] dir {dir:?} must be a relative path without `..` components"
@@ -456,13 +460,95 @@ fn artifact_name_matches(label: &str, name: &str) -> bool {
     label.replace('_', "-") == name.replace('_', "-")
 }
 
-/// Removes the project-local `.tong` directory.
-pub fn clean(root: &Path) -> io::Result<()> {
+/// Removes the project-local `.tong` directory, or — in shared-store mode —
+/// the project's exec roots, outputs, state manifests, and unreferenced
+/// store objects.
+pub fn clean(root: &Path) -> Result<(), BuildError> {
     let tong_dir = root.join(".tong");
-    if tong_dir.exists() {
-        fs::remove_dir_all(tong_dir)?;
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let project_local = store == root.join(".tong").join("store");
+
+    if project_local {
+        // The store *is* the project's cache: `tong clean` deletes it all.
+        if tong_dir.exists() {
+            fs::remove_dir_all(&tong_dir)?;
+        }
+        return Ok(());
+    }
+
+    // Shared mode: remove the project-local state, then drop this
+    // project's objects that no other project's manifest marks.
+    for sub in ["exec", "out"] {
+        let dir = tong_dir.join(sub);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+    }
+    let cas = Cas::open(&store)?;
+    let state = StateStore::open(&store)?;
+    if let Ok(project_hash) = project_hash(root) {
+        state.remove_project(&project_hash)?;
+        let report = sweep(
+            &cas,
+            &state,
+            &GcOptions {
+                older_than: Some(std::time::Duration::ZERO),
+                max_size: None,
+                dry_run: false,
+                now: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            },
+        )?;
+        println!("{report}");
     }
     Ok(())
+}
+
+/// Garbage-collects the store: deletes unmarked objects older than the
+/// retention floor (or the `--older-than` override) and, when configured,
+/// sweeps the store under the size budget.
+pub fn gc(root: &Path, opts: &GcCli) -> Result<GcReport, BuildError> {
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let cas = Cas::open(&store)?;
+    let state = StateStore::open(&store)?;
+    let older_than = match &opts.older_than {
+        Some(text) => Some(parse_duration(text).map_err(|err| BuildError::Store(err.to_string()))?),
+        None => Some(retention_policy(manifest.as_ref())?),
+    };
+    let max_size = match &opts.max_size {
+        Some(text) => Some(parse_size(text).map_err(|err| BuildError::Store(err.to_string()))?),
+        None => Some(max_size_policy(manifest.as_ref())?),
+    };
+    let report = sweep(
+        &cas,
+        &state,
+        &GcOptions {
+            older_than,
+            max_size,
+            dry_run: opts.dry_run,
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        },
+    )?;
+    println!("{report}");
+    Ok(report)
+}
+
+/// `tong gc` command-line options.
+#[derive(Clone, Debug, Default)]
+pub struct GcCli {
+    /// Delete unmarked objects older than this duration (`0` = all).
+    pub older_than: Option<String>,
+    /// Store size budget (`10G`, `500M`).
+    pub max_size: Option<String>,
+    /// Report without deleting.
+    pub dry_run: bool,
 }
 
 impl Completed for CompletedMap {

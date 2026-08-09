@@ -22,7 +22,10 @@ impl std::fmt::Display for UnitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidFormat(text) => {
-                write!(f, "{text:?} is not a valid duration or size (expected <number><unit>)")
+                write!(
+                    f,
+                    "{text:?} is not a valid duration or size (expected <number><unit>)"
+                )
             }
             Self::InvalidNumber(text) => write!(f, "{text:?} is not a valid number"),
         }
@@ -96,8 +99,14 @@ mod tests {
 
     #[test]
     fn parses_durations() {
-        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(7 * 86_400));
-        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(24 * 3600));
+        assert_eq!(
+            parse_duration("7d").unwrap(),
+            Duration::from_secs(7 * 86_400)
+        );
+        assert_eq!(
+            parse_duration("24h").unwrap(),
+            Duration::from_secs(24 * 3600)
+        );
         assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(90 * 60));
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("42").unwrap(), Duration::from_secs(42));
