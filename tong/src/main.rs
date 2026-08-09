@@ -100,6 +100,11 @@ enum Command {
         /// Only drop this package's lockfile preference.
         package: Option<String>,
     },
+    /// Manage toolchains.
+    Toolchain {
+        #[command(subcommand)]
+        command: ToolchainCommand,
+    },
     /// Garbage-collect the store: delete unreferenced cache objects.
     Gc {
         /// Delete unmarked objects older than this duration (`0` = all).
@@ -111,6 +116,21 @@ enum Command {
         /// Report what would be deleted without deleting.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolchainCommand {
+    /// Download a toolchain component bundle (rustup dist protocol).
+    Fetch {
+        /// Component name (`rust`).
+        kind: String,
+        /// Toolchain version, e.g. `1.90.0`.
+        #[arg(long)]
+        version: String,
+        /// Target triple (defaults to the host).
+        #[arg(long)]
+        target: Option<String>,
     },
 }
 
@@ -227,6 +247,27 @@ fn main() -> ExitCode {
             Err(err) => {
                 eprintln!("tong: error: {err}");
                 ExitCode::FAILURE
+            }
+        },
+        Command::Toolchain { command } => match command {
+            ToolchainCommand::Fetch {
+                kind,
+                version,
+                target,
+            } => {
+                if kind != "rust" {
+                    eprintln!(
+                        "tong: error: unsupported toolchain component {kind:?} (only \"rust\")"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                match driver::toolchain_fetch(&workspace, &version, target.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("tong: error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
             }
         },
         Command::Gc {

@@ -11,6 +11,7 @@ pub mod cargo_import;
 pub mod features;
 pub mod model;
 pub mod toolchain;
+pub mod toolchain_dist;
 
 pub use backend::{FinalArtifact, RustBackend};
 pub use cargo_import::{CargoImportError, LockedSourceProvider, import_cargo_workspace};
@@ -20,3 +21,4 @@ pub use model::{
     ProfileSpec, RegistryEdge, RustModel, TestTarget,
 };
 pub use toolchain::{SystemRust, ToolchainError, capture_system_rust, host_triple};
+pub use toolchain_dist::{dist_available, fetch_dist_rust, load_dist_rust};

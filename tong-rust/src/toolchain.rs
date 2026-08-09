@@ -52,6 +52,8 @@ pub enum ToolchainError {
     InvalidSysroot(PathBuf),
     /// Store failure.
     Io(std::io::Error),
+    /// Downloaded-toolchain failure (rustup dist protocol).
+    Dist(String),
 }
 
 impl std::fmt::Display for ToolchainError {
@@ -64,6 +66,7 @@ impl std::fmt::Display for ToolchainError {
                 root.display()
             ),
             Self::Io(err) => write!(f, "toolchain capture failed: {err}"),
+            Self::Dist(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -84,7 +87,7 @@ pub fn host_triple() -> Result<String, ToolchainError> {
         .map(PathBuf::from)
         .or_else(|| find_on_path("rustc"))
         .ok_or_else(|| ToolchainError::Missing("no rustc on PATH".to_owned()))?;
-    let version_verbose = run(&rustc, &["-vV"])?;
+    let version_verbose = run_toolchain(&rustc, &["-vV"])?;
     version_verbose
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
@@ -102,8 +105,8 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
         .ok_or_else(|| ToolchainError::Missing("no rustc on PATH".to_owned()))?;
 
     // 2. Ask rustc for its sysroot and verbose version.
-    let sysroot = run(&rustc, &["--print", "sysroot"])?;
-    let version_verbose = run(&rustc, &["-vV"])?;
+    let sysroot = run_toolchain(&rustc, &["--print", "sysroot"])?;
+    let version_verbose = run_toolchain(&rustc, &["-vV"])?;
     let host_triple = version_verbose
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
@@ -166,7 +169,8 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
     })
 }
 
-fn run(program: &Path, args: &[&str]) -> Result<String, ToolchainError> {
+/// Runs a toolchain binary and returns stdout.
+pub fn run_toolchain(program: &Path, args: &[&str]) -> Result<String, ToolchainError> {
     let output = Command::new(program)
         .args(args)
         .output()

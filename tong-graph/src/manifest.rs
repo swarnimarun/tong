@@ -97,15 +97,19 @@ pub struct Toolchain {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustToolchain {
-    /// Toolchain kind. Version 1 supports `system` only (system capture,
-    /// non-portable; PLAN.md section 5).
+    /// Toolchain kind. Version 1 supports `system` (system capture,
+    /// non-portable; PLAN.md section 5) and `dist` (downloaded via
+    /// `tong toolchain fetch rust --version <ver>`, portable).
     pub kind: String,
+    /// Dist toolchain version (e.g. `1.90.0`); required for `dist`.
+    pub version: Option<String>,
 }
 
 impl Default for RustToolchain {
     fn default() -> Self {
         Self {
             kind: "system".to_owned(),
+            version: None,
         }
     }
 }

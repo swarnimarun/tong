@@ -553,8 +553,25 @@ fn prepare(
     // roots until the next build, which is the diagnosis window.
     prune_exec_dir(&exec)?;
 
-    // Toolchain: needed by the backend for action identity.
-    let toolchain = capture_system_rust(&cas)?;
+    // Toolchain: needed by the backend for action identity. A pinned
+    // `[toolchain.rust] version` uses the downloaded dist bundle instead
+    // of the system capture (portable; PLAN.md section 5).
+    let toolchain = match manifest
+        .as_ref()
+        .and_then(|manifest| manifest.toolchain.rust.version.as_deref())
+    {
+        Some(version) => {
+            let host_triple = tong_rust::host_triple()?;
+            match tong_rust::load_dist_rust(&cas, &store, version, &host_triple) {
+                Ok(toolchain) => toolchain,
+                Err(tong_rust::ToolchainError::Dist(msg)) => {
+                    return Err(BuildError::Toolchain(tong_rust::ToolchainError::Dist(msg)));
+                }
+                Err(err) => return Err(BuildError::Toolchain(err)),
+            }
+        }
+        None => capture_system_rust(&cas)?,
+    };
 
     // Sandbox level: `BuildOptions.sandbox` wins, then `[policy] sandbox`
     // (default l1 — opt-in).
@@ -1237,6 +1254,20 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         .save(root)
         .map_err(|err| BuildError::Manifest(err.to_string()))?;
     println!("wrote Tong.lock ({} packages)", locked.packages.len());
+    Ok(())
+}
+
+/// Downloads a pinned dist toolchain into the store.
+pub fn toolchain_fetch(root: &Path, version: &str, target: Option<&str>) -> Result<(), BuildError> {
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let cas = Cas::open(&store)?;
+    let host_triple = tong_rust::host_triple()?;
+    let triple = target.unwrap_or(&host_triple);
+    let toolchain = tong_rust::fetch_dist_rust(&cas, &store, version, triple, &host_triple)
+        .map_err(BuildError::Toolchain)?;
+    let _ = toolchain;
+    println!("fetched rust {version} ({triple})");
     Ok(())
 }
 
