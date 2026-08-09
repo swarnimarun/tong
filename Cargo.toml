@@ -4,6 +4,7 @@ members = [
     "tong",
     "tong-core",
     "tong-exec",
+    "tong-fetch",
     "tong-graph",
     "tong-rust",
     "tong-store",
