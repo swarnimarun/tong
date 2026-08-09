@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "tong*/**"
+      - "examples/**"
+      - "docs/**"
+      - "README.md"
+      - "book/**"
+  pull_request:
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "tong*/**"
+      - "examples/**"
+      - "docs/**"
+      - "README.md"
+      - "book/**"
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC build environment
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Type-check all targets
+        run: cargo check --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  smoke:
+    name: Smoke examples (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build tong
+        run: cargo build -p tong --release
+
+      - name: Build and run 01-hello (native Tong.toml)
+        run: |
+          cd examples/01-hello
+          ../../target/release/tong build
+          ../../target/release/tong run :hello
+          test "$(.tong/out/dev/hello/hello)" = "hello from tong!"
+
+      - name: Build, test, and run 01-calc (Cargo import)
+        run: |
+          cd examples/01-calc
+          ../../target/release/tong build
+          ../../target/release/tong test
+          ../../target/release/tong run :calc_cli
+
+      - name: Build 02-advanced (build script, cdylib)
+        run: |
+          cd examples/02-advanced
+          ../../target/release/tong build
+          ../../target/release/tong run :advanced_app
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install mdBook
+        uses: taiki-e/install-action@mdbook
+
+      - name: Build book
+        run: mdbook build book
+
+  full-validation:
+    name: Weekly Full Validation
+    if: github.event_name == 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            examples: "01-hello 01-calc 02-advanced 07-web-app"
+            needs_sdl: false
+          - os: macos-latest
+            examples: "03-sdl3 04-voxel-city 05-voxel-city-cargo 06-sdl3-cargo"
+            needs_sdl: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install SDL3 (macOS)
+        if: matrix.needs_sdl
+        run: brew install sdl3
+
+      - name: Build tong
+        run: cargo build -p tong --release
+
+      - name: Tong build every example
+        run: |
+          for p in ${{ matrix.examples }}; do
+            echo "== $p =="
+            (cd examples/$p && ../../target/release/tong build --profile dev)
+          done
+
+      - name: Registry workflow (07-web-app)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd examples/07-web-app
+          ../../target/release/tong lock
+          ../../target/release/tong fetch
+          ../../target/release/tong build --offline
+
+      - name: Headless runs (SDL examples)
+        if: matrix.needs_sdl
+        run: |
+          cd examples/03-sdl3
+          SDL_VIDEODRIVER=dummy ../../target/release/tong run :sdl3_demo
+          cd ../05-voxel-city-cargo
+          SDL_VIDEODRIVER=dummy ../../target/release/tong run :voxel_city -- --frames 120
