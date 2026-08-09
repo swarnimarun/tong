@@ -97,6 +97,7 @@ The pipeline is: manifests → resolution → configured target graph → backen
 VCS is **jj (Jujutsu)** colocated with git (both `.jj/` and `.git/` exist; use jj commands).
 
 - The working copy is a commit that auto-snapshots — there is no staging area; `.gitignore` controls what jj snapshots.
+- Commit after each completed change, before starting the next one. Prefer jj (`jj describe -m` — the working copy is already a commit; `jj commit` when a separate commit is needed); fall back to git (`git add` + `git commit`) only when jj is unavailable; if neither works, ask the user for help.
 - Agents MAY create branches and run non-destructive operations (`jj new`, `jj describe`, `jj commit`, `jj branch create`, `jj split`, `jj squash`).
 - Agents MUST NOT push (`jj git push`) — pushing is human-only.
 - Agents MUST ask before destructive operations (`jj abandon`, `jj op restore`, `jj gc`, `git reset --hard`, `git clean -f`, deleting branches).
