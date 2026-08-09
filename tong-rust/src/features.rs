@@ -138,6 +138,15 @@ pub fn resolve_features(
         .map(|package| (package.name.as_str(), package))
         .collect();
 
+    // cc_import targets are native imports, not feature-bearing crates:
+    // edges referencing them are ignored (they never participate in
+    // features).
+    let native_imports: BTreeSet<&str> = model
+        .cc_imports
+        .iter()
+        .map(|import| import.name.as_str())
+        .collect();
+
     let mut state = Resolver {
         packages: &packages,
         features_on: packages
@@ -147,6 +156,7 @@ pub fn resolve_features(
         default_on: BTreeMap::new(),
         active_optional: BTreeMap::new(),
         queue: Vec::new(),
+        native_imports: &native_imports,
     };
 
     // Seed: explicit workspace-member requests.
@@ -164,7 +174,7 @@ pub fn resolve_features(
     // feature lists and default-features apply unconditionally).
     for package in &model.packages {
         for dep in state.edges(package, include_dev_deps) {
-            if !dep.optional {
+            if !dep.optional && !state.native_imports.contains(dep.package.as_str()) {
                 state.activate_edge(package, dep, include_dev_deps)?;
             }
         }
@@ -188,6 +198,7 @@ struct Resolver<'a> {
     default_on: BTreeMap<String, bool>,
     active_optional: BTreeMap<String, BTreeSet<String>>,
     queue: Vec<(String, String)>,
+    native_imports: &'a BTreeSet<&'a str>,
 }
 
 impl<'a> Resolver<'a> {
@@ -256,7 +267,11 @@ impl<'a> Resolver<'a> {
                 return Ok(());
             }
         }
-        // The dependency package must exist for feature application.
+        // The dependency package must exist for feature application;
+        // cc_import edges are not feature-bearing (already filtered).
+        if self.native_imports.contains(dep.package.as_str()) {
+            return Ok(());
+        }
         self.pkg(&dep.package)?;
         if dep.default_features {
             self.mark_default(&dep.package);

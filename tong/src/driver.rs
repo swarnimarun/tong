@@ -737,9 +737,10 @@ fn feature_requests(
     };
     let mut requests = Vec::new();
     if let Some(manifest) = manifest {
-        // Native mode: one package per manifest target.
+        // Native mode: one package per manifest target (cc_import targets
+        // are native imports, not feature-bearing packages).
         for (name, target) in &manifest.target {
-            if !selected(name) {
+            if target.rule == "cc_import" || !selected(name) {
                 continue;
             }
             let mut features = target.features.clone();
