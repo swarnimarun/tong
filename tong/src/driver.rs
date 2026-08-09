@@ -1,7 +1,7 @@
 //! The build driver: manifests → toolchain → plan → schedule → execute →
 //! assemble (PLAN.md section 15, Phase 1 pipeline).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -17,8 +17,8 @@ use tong_rust::{
     RustBackend, SystemRust, ToolchainError, capture_system_rust, import_cargo_workspace,
 };
 use tong_store::{
-    ActionCache, CachedResult, Cas, GcOptions, GcReport, StateStore, graph_digest, project_hash,
-    sweep,
+    ActionCache, BuildManifest, CachedResult, Cas, GcOptions, GcReport, StateStore, graph_digest,
+    project_hash, sweep,
 };
 
 use crate::manifest_mode::manifest_to_model;
@@ -95,6 +95,11 @@ pub struct BuildOptions {
     pub features: FeatureOptions,
     /// Sandbox enforcement level (`[policy] sandbox`, default `l1`).
     pub sandbox: Option<tong_exec::SandboxLevel>,
+    /// Execute only actions owned by non-workspace packages (registry,
+    /// git, and path dependencies); workspace actions are skipped entirely
+    /// and nothing is assembled. Docker dep layers: busts only when the
+    /// lockfile or toolchain changes (docs/docker-caching.md).
+    pub deps_only: bool,
 }
 
 /// Feature selection for a build (`--features`, `--no-default-features`,
@@ -118,6 +123,8 @@ pub struct BuildOutcome {
     pub actions_cached: usize,
     /// Actions executed.
     pub actions_executed: usize,
+    /// Actions skipped (workspace actions under `--deps-only`).
+    pub actions_skipped: usize,
     /// Materialized artifacts.
     pub artifacts: Vec<PathBuf>,
 }
@@ -141,6 +148,8 @@ pub enum BuildError {
     Store(String),
     /// The build needs a lockfile or fetched sources it does not have.
     Offline(String),
+    /// `tong dockerfile` generation failed.
+    Dockerfile(String),
     /// I/O failure.
     Io(io::Error),
 }
@@ -158,6 +167,7 @@ impl fmt::Display for BuildError {
             Self::Exec(err) => write!(f, "{err}"),
             Self::Store(msg) => write!(f, "{msg}"),
             Self::Offline(msg) => write!(f, "{msg}"),
+            Self::Dockerfile(msg) => write!(f, "{msg}"),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -199,6 +209,13 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
     let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
     let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
+    if options.deps_only {
+        // The deps-only manifest records every captured package tree: the
+        // deps stage captured the local packages' manifest-only trees, and
+        // the app stage re-captures identical digests — GC must keep them
+        // (docs/docker-caching.md Feature 1).
+        sources.extend(prepared.source_trees.iter().copied());
+    }
     let mut toolchains: Vec<tong_core::digest::Digest> = Vec::new();
     let mut outcome = BuildOutcome {
         actions_total: order.len(),
@@ -207,6 +224,14 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
 
     for index in 0..order.len() {
         let action = &prepared.planned[order[index]];
+        // `--deps-only`: skip workspace-owned actions entirely — no cache
+        // lookup, no execution, no recording. External actions never
+        // depend on workspace actions, so the topological order stays
+        // valid.
+        if options.deps_only && !action.external {
+            outcome.actions_skipped += 1;
+            continue;
+        }
         let spec = (action.make)(&completed, cas)?;
         let digest = spec.digest();
         let cached = if let Some(result) = cache.get(digest)? {
@@ -284,7 +309,9 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         completed.0.insert(spec.logical_id.clone(), cached);
     }
 
-    // Assemble requested final artifacts.
+    // Assemble requested final artifacts. `--deps-only` assembles nothing:
+    // workspace artifacts are not built, and dep artifacts are consumed by
+    // the app stage's cache hits.
     let out_dir = tong_dir.join("out").join(&options.profile);
     tracing::debug!(
         target: "tong::perf",
@@ -292,46 +319,49 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         actions = order.len(),
         cached = outcome.actions_cached,
         executed = outcome.actions_executed,
+        skipped = outcome.actions_skipped,
         duration_ms = t_build.elapsed().as_millis() as u64,
     );
     let t_assemble = std::time::Instant::now();
-    let requested: Vec<&tong_rust::FinalArtifact> = prepared
-        .artifacts
-        .iter()
-        .filter(|artifact| {
-            options.targets.is_empty()
-                || options
-                    .targets
-                    .iter()
-                    .any(|t| artifact_name_matches(t, &artifact.name))
-        })
-        .collect();
     let mut artifact_pairs: Vec<(String, TreeDigest)> = Vec::new();
-    for artifact in requested {
-        let Some(result) = completed.0.get(&artifact.action) else {
-            continue;
-        };
-        let dest = out_dir.join(&artifact.name);
-        fs::create_dir_all(&dest)?;
-        cas.materialize(result.outputs, &dest)?;
-        for (blob, name) in &artifact.runtime {
-            let blob_path = cas.blob_path(*blob).ok_or_else(|| {
-                BuildError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("runtime blob {} missing", blob.digest()),
-                ))
-            })?;
-            let target = dest.join(name);
-            // Copy, never hard-link: artifacts are independent files; a
-            // rewrite of the artifact must never be able to corrupt the
-            // immutable store blob (a same-inode copy truncates it).
-            if target.exists() {
-                fs::remove_file(&target)?;
+    if !options.deps_only {
+        let requested: Vec<&tong_rust::FinalArtifact> = prepared
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                options.targets.is_empty()
+                    || options
+                        .targets
+                        .iter()
+                        .any(|t| artifact_name_matches(t, &artifact.name))
+            })
+            .collect();
+        for artifact in requested {
+            let Some(result) = completed.0.get(&artifact.action) else {
+                continue;
+            };
+            let dest = out_dir.join(&artifact.name);
+            fs::create_dir_all(&dest)?;
+            cas.materialize(result.outputs, &dest)?;
+            for (blob, name) in &artifact.runtime {
+                let blob_path = cas.blob_path(*blob).ok_or_else(|| {
+                    BuildError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("runtime blob {} missing", blob.digest()),
+                    ))
+                })?;
+                let target = dest.join(name);
+                // Copy, never hard-link: artifacts are independent files; a
+                // rewrite of the artifact must never be able to corrupt the
+                // immutable store blob (a same-inode copy truncates it).
+                if target.exists() {
+                    fs::remove_file(&target)?;
+                }
+                fs::copy(&blob_path, &target)?;
             }
-            fs::copy(&blob_path, &target)?;
+            artifact_pairs.push((artifact.name.clone(), result.outputs));
+            outcome.artifacts.push(dest.join(&artifact.name));
         }
-        artifact_pairs.push((artifact.name.clone(), result.outputs));
-        outcome.artifacts.push(dest.join(&artifact.name));
     }
     tracing::debug!(
         target: "tong::perf",
@@ -349,6 +379,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         &toolchains,
         &artifact_pairs,
         &options.profile,
+        options.deps_only,
     )?;
     tracing::debug!(
         target: "tong::perf",
@@ -512,6 +543,7 @@ pub fn test(
         &toolchains,
         &[],
         &options.profile,
+        false,
     )?;
 
     Ok(if failed || failed_tests > 0 { 1 } else { 0 })
@@ -549,6 +581,9 @@ struct Prepared {
     executor: LocalExecutor,
     planned: Vec<tong_graph::PlannedAction>,
     artifacts: Vec<tong_rust::FinalArtifact>,
+    /// Captured source-tree digests of every package (used by the
+    /// deps-only manifest so GC keeps the local packages' trees).
+    source_trees: Vec<tong_core::digest::Digest>,
     /// Topological order as indices into `planned`.
     order: Vec<usize>,
 }
@@ -564,7 +599,33 @@ fn prepare(
     let t_prep = std::time::Instant::now();
     let tong_dir = root.join(".tong");
     let manifest = load_manifest(root)?;
+    // Auto-lock (cargo generates Cargo.lock on build; tong does the same
+    // for Tong.lock): a missing lock is not an error — resolve it first
+    // and say so.
+    if manifest.is_none() && root.join("Cargo.toml").is_file() && !root.join("Tong.lock").is_file()
+    {
+        println!("tong: no Tong.lock — running `tong lock` first");
+        lock(root, false)?;
+    }
     let store = store_dir(root, manifest.as_ref())?;
+    // Auto-fetch (cargo downloads sources as needed; tong does the same):
+    // when a locked registry archive is missing from the source store,
+    // fetch first and say so.
+    let needs_fetch = tong_fetch::TongLock::load(root).is_ok_and(|lock| {
+        lock.packages.iter().any(|pkg| {
+            pkg.source.starts_with("registry+")
+                && pkg.checksum.as_deref().is_some_and(|checksum| {
+                    !store
+                        .join("sources")
+                        .join(format!("{checksum}.crate"))
+                        .is_file()
+                })
+        })
+    });
+    if needs_fetch {
+        println!("tong: sources not fetched — running `tong fetch` first");
+        fetch(root, false)?;
+    }
     let exec = tong_dir.join("exec");
     let cas = Cas::open(&store)?;
     let cache = ActionCache::open(&cas)?;
@@ -669,6 +730,7 @@ fn prepare(
     )?;
     let planned = backend.plan()?;
     let artifacts = backend.final_artifacts();
+    let source_trees = backend.captured_source_trees();
 
     let order = match topological_order(&planned) {
         Ok(order) => order,
@@ -704,12 +766,19 @@ fn prepare(
         executor,
         planned,
         artifacts,
+        source_trees,
         order,
     })
 }
 
 /// Records the build-state manifest and runs the automatic GC (best-effort:
 /// failures only warn — cache correctness is unaffected).
+///
+/// A `--deps-only` build records only dependency actions; it invalidates
+/// nothing, so its manifest merges the previous manifest's object closure
+/// — the merged manifest stays the GC root and keeps every object the
+/// current workspace references (local results included), instead of
+/// letting a narrow deps-only manifest orphan the local cache.
 #[allow(clippy::too_many_arguments)]
 fn record_state(
     root: &Path,
@@ -720,10 +789,11 @@ fn record_state(
     toolchains: &[tong_core::digest::Digest],
     artifact_pairs: &[(String, TreeDigest)],
     profile: &str,
+    deps_only: bool,
 ) -> Result<(), BuildError> {
     if let Ok(project_hash) = project_hash(root) {
         let state = StateStore::open(&prepared.store)?;
-        let build_manifest = tong_store::BuildManifest {
+        let mut build_manifest = BuildManifest {
             schema_version: tong_store::BUILD_MANIFEST_SCHEMA_VERSION,
             project_hash,
             created_at_unix_secs: std::time::SystemTime::now()
@@ -737,6 +807,36 @@ fn record_state(
             actions: recorded.to_vec(),
             artifacts: artifact_pairs.to_vec(),
         };
+        if deps_only && let Some(previous) = state.latest(&project_hash) {
+            // Union with the previous closure (dedup by digest): the
+            // deps-only build re-verified nothing local, so the previous
+            // graph's objects are still reachable from the current
+            // sources and must not be swept.
+            for digest in previous.sources {
+                if !build_manifest.sources.contains(&digest) {
+                    build_manifest.sources.push(digest);
+                }
+            }
+            for digest in previous.toolchains {
+                if !build_manifest.toolchains.contains(&digest) {
+                    build_manifest.toolchains.push(digest);
+                }
+            }
+            for action in previous.actions {
+                if !build_manifest
+                    .actions
+                    .iter()
+                    .any(|recorded| recorded.action_digest == action.action_digest)
+                {
+                    build_manifest.actions.push(action);
+                }
+            }
+            for (name, tree) in previous.artifacts {
+                if !build_manifest.artifacts.iter().any(|(n, _)| n == &name) {
+                    build_manifest.artifacts.push((name, tree));
+                }
+            }
+        }
         match state.write(&build_manifest) {
             Ok(()) => {
                 let retention = retention_policy(prepared.manifest.as_ref())?;
@@ -868,7 +968,7 @@ fn feature_requests(
 }
 
 /// Loads `Tong.toml` when present (`None` in Cargo-import mode).
-fn load_manifest(root: &Path) -> Result<Option<Manifest>, BuildError> {
+pub(crate) fn load_manifest(root: &Path) -> Result<Option<Manifest>, BuildError> {
     if root.join("Tong.toml").exists() {
         let manifest = Manifest::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
         Ok(Some(manifest))
@@ -894,6 +994,17 @@ pub fn load_model(
     } else {
         Err(BuildError::NoManifest)
     }
+}
+
+/// Loads the model without resolving registry dependencies (collecting
+/// mode — registry edges stay unresolved, path deps import normally).
+/// Used by `tong dockerfile`, which only needs members, path deps, and
+/// binary names.
+pub(crate) fn load_model_unlocked(
+    root: &Path,
+    manifest: Option<&Manifest>,
+) -> Result<tong_rust::RustModel, BuildError> {
+    load_model(root, manifest, &CollectProvider::default())
 }
 
 /// Runs a built binary target with the given arguments.
@@ -1080,9 +1191,17 @@ impl tong_rust::LockedSourceProvider for LockedSource {
         &self,
         edge: &tong_rust::RegistryEdge,
     ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
-        let package = self
-            .locked_package(&edge.package)
-            .map_err(|err| tong_rust::CargoImportError::Unsupported(err.to_string()))?;
+        let package = match self.locked_package(&edge.package) {
+            Ok(package) => package,
+            // Optional dependencies missing from the lock are inactive by
+            // definition (the lock covers the activated feature graph,
+            // cargo-style): skip them instead of erroring. A *mandatory*
+            // dep missing from the lock is a stale lock — error.
+            Err(_) if edge.optional => return Ok(None),
+            Err(err) => {
+                return Err(tong_rust::CargoImportError::Unsupported(err.to_string()));
+            }
+        };
         let req = semver::VersionReq::parse(&edge.req).map_err(|err| {
             tong_rust::CargoImportError::Unsupported(format!(
                 "invalid version requirement {:?} for `{}`: {err}",
@@ -1216,48 +1335,143 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         preferences.packages.retain(|p| p.name != package);
     }
 
-    let mut roots: Vec<tong_fetch::ResolvedDep> = Vec::new();
-    for edge in &edges {
-        let active = !edge.optional
-            || feature_map
-                .active_optional_deps
-                .get(&edge.parent)
-                .is_some_and(|active| active.contains(&edge.extern_name));
-        if !active {
-            continue;
+    // Workspace/path packages enter the resolution graph as roots; their
+    // registry edges resolve against the index, local edges activate the
+    // target package at its exact version (cargo semantics). Optional
+    // edges are filtered by the resolved feature map, exactly like the
+    // roots were.
+    let edge_map: BTreeMap<(String, String, String), &tong_rust::RegistryEdge> = edges
+        .iter()
+        .map(|edge| {
+            (
+                (
+                    edge.parent.clone(),
+                    edge.package.clone(),
+                    edge.extern_name.clone(),
+                ),
+                edge,
+            )
+        })
+        .collect();
+    let mut locals: Vec<tong_fetch::LocalPackage> = Vec::new();
+    let mut registry_edges = 0usize;
+    for pkg in &model.packages {
+        // Local (path) edges come from the model; registry edges come from
+        // the collected edge list — collecting mode deliberately drops
+        // registry deps from the model's dep lists (the provider records
+        // them instead).
+        let active = |extern_name: &str, optional: bool| {
+            !optional
+                || feature_map
+                    .active_optional_deps
+                    .get(&pkg.name)
+                    .is_some_and(|active| active.contains(extern_name))
+        };
+        let mut deps: Vec<tong_fetch::ResolvedDep> = Vec::new();
+        for (dep, dev) in pkg
+            .deps
+            .iter()
+            .map(|dep| (dep, false))
+            .chain(pkg.build_deps.iter().map(|dep| (dep, false)))
+            .chain(pkg.dev_deps.iter().map(|dep| (dep, true)))
+        {
+            let is_registry = edge_map.contains_key(&(
+                pkg.name.clone(),
+                dep.package.clone(),
+                dep.extern_name.clone(),
+            ));
+            if is_registry || !active(&dep.extern_name, dep.optional) {
+                continue;
+            }
+            deps.push(tong_fetch::ResolvedDep {
+                name: dep.package.clone(),
+                req: None,
+                optional: dep.optional,
+                dev,
+                features: dep.features.clone(),
+                default_features: dep.default_features,
+            });
         }
-        let req = semver::VersionReq::parse(&edge.req)
-            .map_err(|err| BuildError::Manifest(err.to_string()))?;
-        roots.push(tong_fetch::ResolvedDep {
-            name: edge.package.clone(),
-            req,
-            features: edge.features.clone(),
-            optional: edge.optional,
-            default_features: edge.default_features,
-            kind: tong_fetch::DepKind::Normal,
-            registry: None,
+        let dev_edges: BTreeSet<(String, String)> = pkg
+            .dev_deps
+            .iter()
+            .map(|dep| (dep.package.clone(), dep.extern_name.clone()))
+            .collect();
+        for edge in edges.iter().filter(|edge| edge.parent == pkg.name) {
+            if !active(&edge.extern_name, edge.optional) {
+                continue;
+            }
+            let req = semver::VersionReq::parse(&edge.req)
+                .map_err(|err| BuildError::Manifest(err.to_string()))?;
+            let dev = dev_edges.contains(&(edge.package.clone(), edge.extern_name.clone()));
+            deps.push(tong_fetch::ResolvedDep {
+                name: edge.package.clone(),
+                req: Some(req),
+                optional: edge.optional,
+                dev,
+                features: edge.features.clone(),
+                default_features: edge.default_features,
+            });
+            registry_edges += 1;
+        }
+        deps.sort_by(|a, b| a.name.cmp(&b.name));
+        locals.push(tong_fetch::LocalPackage {
+            name: pkg.name.clone(),
+            version: semver::Version::parse(&pkg.version)
+                .unwrap_or_else(|_| semver::Version::new(0, 0, 0)),
+            deps,
         });
     }
-    let resolved = tong_fetch::resolve(&index, &roots, &preferences)
+    println!(
+        "resolving {} packages ({} registry edges) against {}",
+        locals.len(),
+        registry_edges,
+        registry.index_url
+    );
+    let t_resolve = std::time::Instant::now();
+    let resolved = tong_fetch::resolve(&index, &locals, &preferences)
         .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    tracing::info!(
+        target: "tong::lock",
+        phase = "lock.resolve",
+        packages = resolved.len(),
+        duration_ms = t_resolve.elapsed().as_millis() as u64,
+    );
 
-    // Assemble the lock: registry packages plus workspace/path packages.
+    // Assemble the lock: every resolved package, registry or local, with
+    // exact per-edge versions (a name may resolve to several versions).
     let mut locked = tong_fetch::TongLock {
         version: tong_fetch::LOCKFILE_VERSION,
         packages: Vec::new(),
     };
     let registry_source = format!("registry+{}", registry.index_url);
+    let model_pkg = |name: &str| model.packages.iter().find(|p| p.name == name);
+    let path_source = |pkg: &tong_rust::Package| {
+        let relative = pkg.dir.strip_prefix(root).unwrap_or(&pkg.dir);
+        format!("path+{}", relative.to_string_lossy())
+    };
     for package in &resolved {
+        let local = model_pkg(&package.name);
+        let source = match local {
+            Some(pkg) => path_source(pkg),
+            None => registry_source.clone(),
+        };
+        let manifest_checksum = if let Some(pkg) = local {
+            fs::read(pkg.dir.join("Cargo.toml"))
+                .ok()
+                .map(|bytes| tong_core::digest::Hasher::digest(&bytes).to_hex())
+        } else {
+            None
+        };
         let mut deps: Vec<String> = package
             .dependencies
             .iter()
-            .map(|dep| {
-                let version = resolved
-                    .iter()
-                    .find(|p| p.name == dep.name)
-                    .map(|p| p.version.to_string())
-                    .unwrap_or_else(|| dep.req.to_string());
-                format!("{} {version} {registry_source}", dep.name)
+            .map(|(name, version)| {
+                let dep_source = match model_pkg(name) {
+                    Some(pkg) => path_source(pkg),
+                    None => registry_source.clone(),
+                };
+                format!("{name} {version} {dep_source}")
             })
             .collect();
         deps.sort();
@@ -1265,58 +1479,10 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         locked.packages.push(tong_fetch::LockedPackage {
             name: package.name.clone(),
             version: package.version.clone(),
-            source: registry_source.clone(),
-            checksum: Some(package.checksum.clone()),
-            manifest_checksum: None,
-            yanked: package.yanked,
-            publish_time: None,
-            dependencies: deps,
-        });
-    }
-    let path_packages: Vec<&tong_rust::Package> = model
-        .packages
-        .iter()
-        .filter(|pkg| !resolved.iter().any(|p| p.name == pkg.name))
-        .collect();
-    for pkg in &path_packages {
-        let relative = pkg.dir.strip_prefix(root).unwrap_or(&pkg.dir).to_path_buf();
-        let manifest_checksum = fs::read(pkg.dir.join("Cargo.toml"))
-            .ok()
-            .map(|bytes| tong_core::digest::Hasher::digest(&bytes).to_hex());
-        let mut deps: Vec<String> = pkg
-            .deps
-            .iter()
-            .chain(pkg.build_deps.iter())
-            .chain(pkg.dev_deps.iter())
-            .filter_map(|dep| {
-                let version =
-                    if let Some(other) = path_packages.iter().find(|p| p.name == dep.package) {
-                        other.version.clone()
-                    } else {
-                        resolved
-                            .iter()
-                            .find(|p| p.name == dep.package)?
-                            .version
-                            .to_string()
-                    };
-                let source = if path_packages.iter().any(|p| p.name == dep.package) {
-                    format!("path+{}", relative.display())
-                } else {
-                    registry_source.clone()
-                };
-                Some(format!("{} {version} {source}", dep.package))
-            })
-            .collect();
-        deps.sort();
-        deps.dedup();
-        locked.packages.push(tong_fetch::LockedPackage {
-            name: pkg.name.clone(),
-            version: semver::Version::parse(&pkg.version)
-                .unwrap_or_else(|_| semver::Version::new(0, 0, 0)),
-            source: format!("path+{}", relative.display()),
-            checksum: None,
+            source,
+            checksum: package.checksum.clone(),
             manifest_checksum,
-            yanked: false,
+            yanked: package.yanked,
             publish_time: None,
             dependencies: deps,
         });
@@ -1346,12 +1512,21 @@ pub fn toolchain_fetch(root: &Path, version: &str, target: Option<&str>) -> Resu
 /// when everything is already stored.
 pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
     let manifest = load_manifest(root)?;
+    if !root.join("Tong.lock").is_file() {
+        println!("tong: no Tong.lock — running `tong lock` first");
+        lock(root, false)?;
+    }
     let store = store_dir(root, manifest.as_ref())?;
     let cas = Cas::open(&store)?;
     let lock =
         tong_fetch::TongLock::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
     let registry = registry_config(manifest.as_ref())?;
     let _ = offline;
+    let total = lock
+        .packages
+        .iter()
+        .filter(|package| package.source.starts_with("registry+") && package.checksum.is_some())
+        .count();
     let mut fetched = 0;
     for package in &lock.packages {
         if !package.source.starts_with("registry+") {
@@ -1360,13 +1535,20 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
         let Some(checksum) = &package.checksum else {
             continue;
         };
+        println!(
+            "  downloading {}/{} {} {}",
+            fetched + 1,
+            total,
+            package.name,
+            package.version
+        );
         let resolved = tong_fetch::ResolvedPackage {
             name: package.name.clone(),
             version: package.version.clone(),
-            checksum: checksum.clone(),
-            dependencies: Vec::new(),
-            features: Default::default(),
+            checksum: Some(checksum.clone()),
             yanked: package.yanked,
+            local: false,
+            dependencies: Vec::new(),
         };
         tong_fetch::fetch_crate(&cas, &registry, &resolved)
             .map_err(|err| BuildError::Manifest(err.to_string()))?;

@@ -1,107 +1,96 @@
-//! Cargo-style version resolution (pure, deterministic).
+//! Cargo-compatible version resolution (pure, deterministic).
 //!
-//! Greedy highest-first DFS with backtracking: candidate versions come
-//! from the sparse index (non-yanked, unless already in the lockfile, where
-//! the locked version is preferred for stability). On a unification
-//! conflict (two requirements with no common version) the resolver
-//! backtracks to the most recent package choice with a remaining
-//! candidate, restores the state before that choice, and re-checks every
-//! edge that touches the package (consumed edges are replayed from the
-//! history). Optional deps of registry packages are locked unconditionally
-//! (Cargo's lockfile completeness — build-time feature resolution decides
-//! what is compiled); workspace-member edges arrive feature-filtered from
-//! the caller (Phase B).
+//! Ported from cargo's resolver (`cargo/src/resolver/mod.rs`,
+//! `context.rs`, `conflict_cache.rs`, `types.rs` — MIT OR Apache-2.0,
+//! Copyright The Cargo Developers; port adapted for tong's model):
+//! greedy highest-first DFS with backtracking and a global conflict cache.
+//!
+//! The two properties that make this terminate on real graphs (and that
+//! tong's earlier one-version-per-name backtracker lacked):
+//!
+//! 1. **Semver-compatible activation keys.** A package is activated once
+//!    per semver-compatibility group (`major`, or `0.minor`, or `0.0.patch`).
+//!    Semver-incompatible versions — `syn 2.x` and `syn 3.x` — are
+//!    different activations and coexist in one lockfile, exactly like
+//!    cargo's. Only semver-compatible versions conflict.
+//! 2. **Backtrack frames with full context snapshots + conflict cache.**
+//!    Every candidate attempt is a cheap clone; on exhaustion the resolver
+//!    records the conflict set ("this dependency cannot resolve while these
+//!    packages are active") in a global trie and backjumps to the newest
+//!    frame that can change the outcome, skipping provably-dead frames.
+//!
+//! Workspace/path packages are part of the graph (roots): they activate at
+//! their exact versions and every dependency edge records the resolved
+//! version, so lockfiles stay correct when a name has multiple versions.
+//! Registry packages lock all non-dev dependencies (feature resolution
+//! happens separately, `tong-rust::resolve_features`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use semver::{Version, VersionReq};
+use tracing::{debug, info, warn};
 
 use crate::lockfile::TongLock;
-use crate::registry::FetchError;
 use crate::sparse_index::{IndexDepKind, IndexVersion};
 
 /// A version requirement edge in the resolution graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedDep {
-    /// Package name.
+    /// Package name the edge points at.
     pub name: String,
-    /// Version requirement.
-    pub req: VersionReq,
-    /// Features requested on the dependency.
-    pub features: Vec<String>,
-    /// Optional dependency.
+    /// Version requirement (`None` for local/path edges).
+    pub req: Option<VersionReq>,
+    /// Optional (feature-activated) dependency.
     pub optional: bool,
-    /// Whether the dependency's default feature is enabled.
+    /// Dev-dependency edge.
+    pub dev: bool,
+    /// Features requested on the target by this edge.
+    pub features: Vec<String>,
+    /// Whether the target's default features are requested.
     pub default_features: bool,
-    /// Dependency kind.
-    pub kind: DepKind,
-    /// Registry the dependency comes from (`None` = the default).
-    pub registry: Option<String>,
 }
 
-/// Dependency kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DepKind {
-    /// `[dependencies]`.
-    Normal,
-    /// `[dev-dependencies]`.
-    Dev,
-    /// `[build-dependencies]`.
-    Build,
-}
-
-impl From<IndexDepKind> for DepKind {
-    fn from(kind: IndexDepKind) -> Self {
-        match kind {
-            IndexDepKind::Normal => Self::Normal,
-            IndexDepKind::Dev => Self::Dev,
-            IndexDepKind::Build => Self::Build,
-        }
-    }
-}
-
-/// A resolved registry package.
+/// A local (workspace/path) package: activates at its exact version without
+/// an index query, and its dev-dependencies are locked (cargo semantics for
+/// workspace members).
 #[derive(Clone, Debug)]
-pub struct ResolvedPackage {
-    /// Package name.
+pub struct LocalPackage {
     pub name: String,
-    /// Resolved version.
     pub version: Version,
-    /// `.crate` archive SHA-256 (from the index).
-    pub checksum: String,
-    /// Dependency edges (normal + build; optional included for lockfile
-    /// completeness).
-    pub dependencies: Vec<ResolvedDep>,
-    /// Declared features (from the index).
-    pub features: BTreeMap<String, Vec<String>>,
-    /// Whether the chosen version is yanked (allowed when locked).
+    /// Dependencies: `None` req = local/path edge, `Some` = registry edge.
+    pub deps: Vec<ResolvedDep>,
+}
+
+/// A resolved package in the lockfile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPackage {
+    pub name: String,
+    pub version: Version,
+    /// Registry checksum (`None` for local packages).
+    pub checksum: Option<String>,
     pub yanked: bool,
+    /// Whether this is a workspace/path package (no registry source).
+    pub local: bool,
+    /// Resolved dependency edges: exact locked versions (deduplicated).
+    pub dependencies: Vec<(String, Version)>,
 }
 
 /// A source of index data (implemented by [`crate::IndexClient`]; tests use
 /// a fixture double).
 pub trait CrateSource {
-    /// Every index version entry for `name`.
-    fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, FetchError>;
+    fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, crate::FetchError>;
 }
 
 /// Resolution failure.
 #[derive(Debug)]
 pub enum ResolveError {
-    /// No version of a package satisfies its requirements.
-    NoMatchingVersion {
-        /// Package name.
-        package: String,
-        /// The requirements that could not be satisfied.
-        reqs: Vec<String>,
-    },
-    /// The requirement set is unsatisfiable after backtracking.
-    Unresolvable {
-        /// Human-readable description of the conflicting requirements.
-        chain: String,
-    },
-    /// Index fetch failure.
-    Fetch(FetchError),
+    /// No version of a package matches a requirement.
+    NoMatchingVersion { package: String, reqs: Vec<String> },
+    /// Requirements on a package are unsatisfiable together.
+    Unresolvable { chain: String },
+    /// Index failure.
+    Fetch(crate::FetchError),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -114,9 +103,7 @@ impl std::fmt::Display for ResolveError {
                     reqs.join(", ")
                 )
             }
-            Self::Unresolvable { chain } => {
-                write!(f, "unable to resolve dependencies: {chain}")
-            }
+            Self::Unresolvable { chain } => write!(f, "{chain}"),
             Self::Fetch(err) => write!(f, "{err}"),
         }
     }
@@ -124,435 +111,1644 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-impl From<FetchError> for ResolveError {
-    fn from(err: FetchError) -> Self {
+impl From<crate::FetchError> for ResolveError {
+    fn from(err: crate::FetchError) -> Self {
         Self::Fetch(err)
     }
 }
 
-/// A choice frame for backtracking.
-struct Frame {
-    /// The package being chosen.
-    package: String,
-    /// Candidate versions still to try, ascending (pop() = next highest).
-    remaining: Vec<Version>,
+// ---------------------------------------------------------------------------
+// Ported types (cargo src/resolver/{types,conflict_cache,context}.rs)
+// ---------------------------------------------------------------------------
+
+/// A package identity in the graph: name + exact version.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PackageId {
+    name: String,
+    version: Version,
 }
 
-/// A worklist entry: a requirement edge plus the package+version that
-/// generated it (root edges have no generator).
+impl PackageId {
+    fn new(name: &str, version: &Version) -> Self {
+        Self {
+            name: name.to_owned(),
+            version: version.clone(),
+        }
+    }
+}
+
+/// Cargo's `SemverCompatibility`: the group within which only one version
+/// may be activated. `1.0.2` and `1.2.0` share `Major(1)`; `0.1.x` and
+/// `0.2.x` differ; `0.0.x` is per-patch.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SemverCompat {
+    Major(u64),
+    Minor(u64),
+    Patch(u64),
+}
+
+impl From<&Version> for SemverCompat {
+    fn from(ver: &Version) -> Self {
+        if ver.major > 0 {
+            SemverCompat::Major(ver.major)
+        } else if ver.minor > 0 {
+            SemverCompat::Minor(ver.minor)
+        } else {
+            SemverCompat::Patch(ver.patch)
+        }
+    }
+}
+
+/// The summary of one package version: the unit of activation.
 #[derive(Clone, Debug)]
-struct Pending {
-    edge: ResolvedDep,
-    generated_by: Option<(String, Version)>,
+struct Summary {
+    id: PackageId,
+    /// All dependency edges (registry and local).
+    deps: Rc<Vec<ResolvedDep>>,
+    /// The package's feature table (feature → references), used to decide
+    /// which optional deps are enabled (cargo `build_requirements`).
+    features: BTreeMap<String, Vec<String>>,
+    checksum: Option<String>,
+    yanked: bool,
+    /// Workspace/path package: fixed version, dev-deps locked.
+    local: bool,
 }
 
-/// State snapshot taken before a package choice, restored on backtrack.
-struct Snapshot {
-    chosen: BTreeMap<String, ResolvedPackage>,
-    worklist: Vec<Pending>,
-    history: Vec<Pending>,
+/// Why a candidate was rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConflictReason {
+    /// A semver-compatible version of the same package is already active.
+    Semver,
 }
 
-/// Resolves versions for `roots` (feature-filtered workspace-member edges),
-/// preferring `locked` versions and allowing their yanked entries.
-pub fn resolve(
-    crates: &dyn CrateSource,
-    roots: &[ResolvedDep],
-    locked: &TongLock,
-) -> Result<Vec<ResolvedPackage>, ResolveError> {
-    let mut chosen: BTreeMap<String, ResolvedPackage> = BTreeMap::new();
-    let mut worklist: Vec<Pending> = roots
-        .iter()
-        .cloned()
-        .map(|edge| Pending {
-            edge,
-            generated_by: None,
+/// Activation outcome: a recoverable conflict, or a fatal error (index
+/// failure, missing local edge) that aborts resolution.
+enum ActivateError {
+    Fatal(ResolveError),
+    Conflict(PackageId, ConflictReason),
+}
+
+/// Package → reason, for one failed activation attempt.
+type ConflictMap = BTreeMap<PackageId, ConflictReason>;
+
+/// A cheap cloneable iterator over an `Rc<Vec<T>>` (cargo `RcVecIter`).
+struct RcVecIter<T: Clone> {
+    vec: Rc<Vec<T>>,
+    idx: usize,
+}
+
+impl<T: Clone> RcVecIter<T> {
+    fn new(vec: Rc<Vec<T>>) -> Self {
+        Self { vec, idx: 0 }
+    }
+    /// A non-advancing view of the not-yet-consumed items.
+    fn remaining(&self) -> impl Iterator<Item = &T> + '_ {
+        self.vec.get(self.idx..).into_iter().flatten()
+    }
+    fn peek(&self) -> Option<&T> {
+        self.vec.get(self.idx)
+    }
+}
+
+impl<T: Clone> Iterator for RcVecIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        let item = self.vec.get(self.idx)?.clone();
+        self.idx += 1;
+        Some(item)
+    }
+}
+
+impl<T: Clone> Clone for RcVecIter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            vec: Rc::clone(&self.vec),
+            idx: self.idx,
+        }
+    }
+}
+
+/// A dependency edge plus its candidate summaries.
+type DepInfo = (ResolvedDep, Rc<Vec<Summary>>);
+
+/// The pending deps of one activated package (cargo `DepsFrame`).
+#[derive(Clone)]
+struct DepsFrame {
+    parent: Summary,
+    /// Sorted with the fewest candidates first (most constrained).
+    remaining_siblings: RcVecIter<DepInfo>,
+}
+
+impl DepsFrame {
+    /// The least number of candidates of any remaining sibling.
+    fn min_candidates(&self) -> usize {
+        self.remaining_siblings
+            .peek()
+            .map(|(_, candidates)| candidates.len())
+            .unwrap_or(0)
+    }
+}
+
+impl PartialEq for DepsFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.min_candidates() == other.min_candidates()
+    }
+}
+impl Eq for DepsFrame {}
+impl PartialOrd for DepsFrame {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DepsFrame {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.min_candidates()
+            .cmp(&other.min_candidates())
+            .then_with(|| self.parent.id.name.cmp(&other.parent.id.name))
+    }
+}
+
+/// The set of pending dependency frames, most constrained first (cargo
+/// `RemainingDeps`; a monotonic counter keeps equal frames distinct).
+#[derive(Clone)]
+struct RemainingDeps {
+    time: u64,
+    data: BTreeSet<(DepsFrame, u64)>,
+}
+
+impl RemainingDeps {
+    fn new() -> Self {
+        Self {
+            time: 0,
+            data: BTreeSet::new(),
+        }
+    }
+    fn push(&mut self, frame: DepsFrame) {
+        self.data.insert((frame, self.time));
+        self.time += 1;
+    }
+    fn pop_most_constrained(&mut self) -> Option<(Summary, DepInfo)> {
+        while let Some((mut frame, _)) = self.data.pop_first() {
+            if let Some(sibling) = frame.remaining_siblings.next() {
+                let parent = frame.parent.clone();
+                self.data.insert((frame, self.time));
+                self.time += 1;
+                return Some((parent, sibling));
+            }
+        }
+        None
+    }
+    fn iter(&self) -> impl Iterator<Item = (PackageId, &ResolvedDep, usize)> + '_ {
+        self.data.iter().flat_map(|(frame, _)| {
+            let parent = frame.parent.id.clone();
+            frame
+                .remaining_siblings
+                .remaining()
+                .map(move |(dep, candidates)| (parent.clone(), dep, candidates.len()))
         })
-        .collect();
-    sort_worklist(&mut worklist);
-    let mut history: Vec<Pending> = Vec::new();
-    let mut frames: Vec<Frame> = Vec::new();
-    let mut snapshots: Vec<Snapshot> = Vec::new();
+    }
+}
 
-    while let Some(pending) = worklist.pop() {
-        let edge = &pending.edge;
-        history.push(pending.clone());
-        match chosen.get(&edge.name) {
-            Some(pkg) if edge.req.matches(&pkg.version) => continue,
-            Some(_) => {
-                // Unification conflict: backtrack to a re-openable choice.
-                let Some(rechosen) = backtrack(
-                    crates,
-                    &mut chosen,
-                    &mut worklist,
-                    &mut history,
-                    &mut frames,
-                    &mut snapshots,
-                )?
-                else {
-                    return Err(ResolveError::Unresolvable {
-                        chain: format!(
-                            "{} {} conflicts with the already-resolved version of `{}`",
-                            edge.name, edge.req, edge.name
-                        ),
-                    });
-                };
-                // The edge is still live unless its generator was
-                // re-chosen (whose new dep set supersedes the old one).
-                let stale = pending
-                    .generated_by
-                    .as_ref()
-                    .is_some_and(|(package, _)| package == &rechosen);
-                if !stale {
-                    worklist.push(pending);
-                    sort_worklist(&mut worklist);
+/// The per-dep candidate iterator: consumes exactly one candidate per
+/// call, skipping candidates whose semver group is already activated and
+/// recording the reason (cargo `RemainingCandidates`; direct consumption
+/// instead of cargo's peekable stash — each candidate is tried at most
+/// once, so the activation loop provably terminates).
+#[derive(Clone)]
+struct RemainingCandidates {
+    remaining: RcVecIter<Summary>,
+}
+
+impl RemainingCandidates {
+    fn new(candidates: &Rc<Vec<Summary>>) -> Self {
+        Self {
+            remaining: RcVecIter::new(Rc::clone(candidates)),
+        }
+    }
+    /// Returns the next activatable candidate and whether more remain.
+    fn next(
+        &mut self,
+        conflicting_prev_active: &mut ConflictMap,
+        activations: &BTreeMap<(String, SemverCompat), (Summary, usize)>,
+    ) -> Option<(Summary, bool)> {
+        let valid = |candidate: &Summary| {
+            let key = (
+                candidate.id.name.clone(),
+                SemverCompat::from(&candidate.id.version),
+            );
+            match activations.get(&key) {
+                Some((a, _)) => a.id == candidate.id,
+                None => true,
+            }
+        };
+        while let Some(b) = self.remaining.next() {
+            let key = (b.id.name.clone(), SemverCompat::from(&b.id.version));
+            if let Some((a, _)) = activations.get(&key)
+                && a.id != b.id
+            {
+                conflicting_prev_active
+                    .entry(a.id.clone())
+                    .or_insert(ConflictReason::Semver);
+                continue;
+            }
+            // `has_another` must mean "another *activatable* candidate":
+            // a saved frame is restored and its next() called against the
+            // same activations, so a merely-present candidate that fails
+            // the validity check would exhaust the restored frame and
+            // break the "a saved frame always has a next" invariant.
+            let has_another = self.remaining.remaining().any(valid);
+            return Some((b, has_another));
+        }
+        None
+    }
+}
+
+/// A saved state for backtracking (cargo `BacktrackFrame`).
+struct BacktrackFrame {
+    context: ResolverContext,
+    remaining_deps: RemainingDeps,
+    remaining_candidates: RemainingCandidates,
+    parent: Summary,
+    dep: ResolvedDep,
+    conflicting_activations: ConflictMap,
+}
+
+/// The resolution state: activations and recorded edges.
+/// The features requested on an activated package: the union over every
+/// dependency edge into it (cargo's `resolve_features`).
+#[derive(Clone, Default)]
+struct RequestedFeatures {
+    features: BTreeSet<String>,
+    default_features: bool,
+}
+
+#[derive(Clone)]
+struct ResolverContext {
+    /// Number of decisions made (backjump target ages).
+    age: usize,
+    /// Semver-compat group → activated summary + age.
+    activations: BTreeMap<(String, SemverCompat), (Summary, usize)>,
+    /// Every resolved edge: (parent, dep, child).
+    edges: Vec<(PackageId, ResolvedDep, PackageId)>,
+    /// Requested features per activated package (feature-aware optional
+    /// deps, cargo style).
+    requested: BTreeMap<PackageId, RequestedFeatures>,
+}
+
+impl ResolverContext {
+    fn new() -> Self {
+        Self {
+            age: 0,
+            activations: BTreeMap::new(),
+            edges: Vec::new(),
+            requested: BTreeMap::new(),
+        }
+    }
+    fn is_active(&self, id: &PackageId) -> Option<usize> {
+        let key = (id.name.clone(), SemverCompat::from(&id.version));
+        self.activations
+            .get(&key)
+            .and_then(|(s, age)| (s.id == *id).then_some(*age))
+    }
+    /// The newest age among `parent` and the conflict set, if all still
+    /// active — the backjump target (cargo `is_conflicting`).
+    fn is_conflicting(
+        &self,
+        parent: Option<&PackageId>,
+        conflicting: &ConflictMap,
+    ) -> Option<usize> {
+        let mut max = 0;
+        if let Some(parent) = parent {
+            max = std::cmp::max(max, self.is_active(parent)?);
+        }
+        for id in conflicting.keys() {
+            max = std::cmp::max(max, self.is_active(id)?);
+        }
+        Some(max)
+    }
+    /// Activates `summary`; `Err(Conflict)` when a semver-compatible
+    /// version is already active. Returns `true` when already activated.
+    fn flag_activated(&mut self, summary: &Summary) -> Result<bool, (PackageId, ConflictReason)> {
+        let id = summary.id.clone();
+        let age = self.age;
+        let key = (id.name.clone(), SemverCompat::from(&id.version));
+        match self.activations.get(&key) {
+            Some((a, _)) => {
+                if a.id != id {
+                    return Err((a.id.clone(), ConflictReason::Semver));
                 }
+                Ok(true)
             }
             None => {
-                let name = edge.name.clone();
-                let mut candidates = candidates(crates, locked, &edge.name, &edge.req)?;
-                if candidates.is_empty() {
-                    return Err(ResolveError::NoMatchingVersion {
-                        package: edge.name.clone(),
-                        reqs: vec![edge.req.to_string()],
-                    });
+                self.activations.insert(key, (summary.clone(), age));
+                Ok(false)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conflict cache (ported from cargo src/resolver/conflict_cache.rs)
+// ---------------------------------------------------------------------------
+
+/// A trie of conflict sets: "this dependency cannot resolve while any of
+/// these packages are active". Efficient subset search over all recorded
+/// sets.
+enum ConflictStoreTrie {
+    Leaf(ConflictMap),
+    Node(BTreeMap<PackageId, ConflictStoreTrie>),
+}
+
+impl ConflictStoreTrie {
+    /// Finds a recorded conflict set whose members are all active, with the
+    /// highest possible jump-back age.
+    fn find(
+        &self,
+        is_active: &impl Fn(&PackageId) -> Option<usize>,
+        must_contain: Option<&PackageId>,
+        mut max_age: usize,
+    ) -> Option<(&ConflictMap, usize)> {
+        let mut out = None;
+        match self {
+            ConflictStoreTrie::Leaf(con) => {
+                let age = con
+                    .keys()
+                    .filter(|id| must_contain.is_none_or(|must| *id == must))
+                    .map(is_active)
+                    .collect::<Option<BTreeSet<usize>>>()?
+                    .into_iter()
+                    .max()?;
+                if age > max_age {
+                    out = Some((con, age));
                 }
-                snapshots.push(Snapshot {
-                    chosen: chosen.clone(),
-                    worklist: worklist.clone(),
-                    history: history.clone(),
-                });
-                let version = candidates.remove(0);
-                frames.push(Frame {
-                    package: name.clone(),
-                    remaining: candidates.into_iter().rev().collect(),
-                });
-                let package = choose(crates, &name, &version)?;
-                let mut deps: Vec<Pending> = package
-                    .dependencies
-                    .iter()
-                    .filter(|dep| dep.kind != DepKind::Dev)
-                    .cloned()
-                    .map(|edge| Pending {
-                        edge,
-                        generated_by: Some((name.clone(), version.clone())),
-                    })
-                    .collect();
-                sort_worklist(&mut deps);
-                worklist.append(&mut deps);
-                worklist.push(pending);
-                sort_worklist(&mut worklist);
-                chosen.insert(name, package);
+            }
+            ConflictStoreTrie::Node(children) => {
+                for (id, child) in children {
+                    let Some(age) = is_active(id) else { continue };
+                    if age > max_age
+                        && let Some(found) = child.find(is_active, must_contain, max_age)
+                    {
+                        max_age = found.1;
+                        out = Some(found);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn insert(&mut self, mut iter: impl Iterator<Item = PackageId>, con: ConflictMap) {
+        match iter.next() {
+            Some(id) => {
+                let child = match self {
+                    ConflictStoreTrie::Node(children) => children
+                        .entry(id)
+                        .or_insert_with(|| ConflictStoreTrie::Node(BTreeMap::new())),
+                    ConflictStoreTrie::Leaf(_) => panic!("inserting into a leaf"),
+                };
+                child.insert(iter, con);
+            }
+            None => {
+                *self = ConflictStoreTrie::Leaf(con);
+            }
+        }
+    }
+}
+
+/// The global "past conflicts" cache (cargo `ConflictCache`).
+#[derive(Default)]
+struct ConflictCache {
+    /// (dep name, req) → conflict-set trie.
+    con_from_dep: BTreeMap<DepKey, ConflictStoreTrie>,
+    /// Package → deps that mention it (inverse index).
+    dep_from_pid: BTreeMap<PackageId, BTreeSet<DepKey>>,
+}
+
+/// Conflict-cache key for a dependency: name + req (string form —
+/// `semver::VersionReq` has no `Ord`).
+type DepKey = (String, String);
+
+impl ConflictCache {
+    fn insert(&mut self, dep: &ResolvedDep, conflicting: &ConflictMap) {
+        let key = dep_key(dep);
+        self.con_from_dep
+            .entry(key.clone())
+            .or_insert_with(|| ConflictStoreTrie::Node(BTreeMap::new()))
+            .insert(conflicting.keys().cloned(), conflicting.clone());
+        for id in conflicting.keys() {
+            self.dep_from_pid
+                .entry(id.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+
+    /// A conflict set for `dep` whose members are all active, if any.
+    fn conflicting(&self, ctx: &ResolverContext, dep: &ResolvedDep) -> Option<&ConflictMap> {
+        self.con_from_dep.get(&dep_key(dep)).and_then(|trie| {
+            trie.find(&|id| ctx.is_active(id), None, 0)
+                .map(|(con, _)| con)
+        })
+    }
+
+    /// Conflict sets of deps that involve `pid` (used to prune frames whose
+    /// deps are known unresolvable).
+    fn dependencies_conflicting_with(&self, pid: &PackageId) -> Option<BTreeSet<DepKey>> {
+        self.dep_from_pid.get(pid).cloned()
+    }
+
+    /// Finds a conflict set for `dep` that involves `pid` and whose other
+    /// members are active.
+    fn find_conflicting(
+        &self,
+        ctx: &ResolverContext,
+        dep: &ResolvedDep,
+        pid: &PackageId,
+    ) -> Option<&ConflictMap> {
+        self.con_from_dep.get(&dep_key(dep)).and_then(|trie| {
+            trie.find(&|id| ctx.is_active(id), Some(pid), 0)
+                .map(|(con, _)| con)
+        })
+    }
+}
+
+fn dep_key(dep: &ResolvedDep) -> DepKey {
+    (
+        dep.name.clone(),
+        dep.req
+            .as_ref()
+            .map(|req| req.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The resolver (ported from cargo src/resolver/mod.rs)
+// ---------------------------------------------------------------------------
+
+/// Resolves versions for `locals` (workspace/path packages) and their
+/// registry dependencies, preferring `locked` versions and allowing their
+/// yanked entries.
+pub fn resolve(
+    crates: &dyn CrateSource,
+    locals: &[LocalPackage],
+    locked: &TongLock,
+) -> Result<Vec<ResolvedPackage>, ResolveError> {
+    let t_resolve = std::time::Instant::now();
+    let locals_map: BTreeMap<String, Summary> = locals
+        .iter()
+        .map(|local| (local.name.clone(), local_summary(local)))
+        .collect();
+    let mut queryer = Queryer {
+        crates,
+        locked,
+        locals: &locals_map,
+        deps_cache: BTreeMap::new(),
+    };
+
+    let mut ctx = ResolverContext::new();
+    let mut backtrack_stack: Vec<BacktrackFrame> = Vec::new();
+    let mut remaining_deps = RemainingDeps::new();
+    let mut past_conflicting = ConflictCache::default();
+
+    // Activate all local packages to kick off the work.
+    for local in locals {
+        let summary = locals_map
+            .get(&local.name)
+            .expect("locals map covers every local")
+            .clone();
+        debug!(target: "tong::lock", phase = "resolve.activate_local", package = %local.name, version = %local.version);
+        let frame = activate(&mut ctx, &mut queryer, None, summary).map_err(|err| match err {
+            ActivateError::Fatal(err) => err,
+            ActivateError::Conflict(id, reason) => ResolveError::Unresolvable {
+                chain: format!(
+                    "cannot activate local package `{} v{}`: {:?}",
+                    id.name, id.version, reason
+                ),
+            },
+        })?;
+        if let Some(frame) = frame {
+            remaining_deps.push(frame);
+        }
+    }
+
+    let mut iterations: u64 = 0;
+    while let Some((parent, (dep, candidates))) = remaining_deps.pop_most_constrained() {
+        iterations += 1;
+        if iterations.is_multiple_of(50_000) {
+            warn!(
+                target: "tong::lock",
+                phase = "resolve.guard",
+                iterations,
+                dep = %dep.name,
+                parent = %parent.id.name,
+                activations = ctx.activations.len(),
+                pending = remaining_deps.data.len(),
+                backtrack_frames = backtrack_stack.len(),
+                duration_ms = t_resolve.elapsed().as_millis() as u64,
+            );
+        }
+
+        let mut conflicting_activations = ConflictMap::new();
+        let mut backtracked = false;
+        let mut remaining_candidates = RemainingCandidates::new(&candidates);
+
+        loop {
+            let next = remaining_candidates.next(&mut conflicting_activations, &ctx.activations);
+            let (candidate, has_another) = match next {
+                Some(tuple) => tuple,
+                None => {
+                    // All candidates exhausted: record the conflict set and
+                    // backjump to the newest frame that can change it.
+                    if !backtracked {
+                        past_conflicting.insert(&dep, &conflicting_activations);
+                    }
+                    match find_candidate(
+                        &ctx,
+                        &mut backtrack_stack,
+                        &parent,
+                        backtracked,
+                        &conflicting_activations,
+                    ) {
+                        Some((candidate, has_another, frame)) => {
+                            ctx = frame.context;
+                            remaining_deps = frame.remaining_deps;
+                            remaining_candidates = frame.remaining_candidates;
+                            backtracked = true;
+                            (candidate, has_another)
+                        }
+                        None => {
+                            warn!(
+                                target: "tong::lock",
+                                phase = "resolve.failed",
+                                package = %dep.name,
+                                req = ?dep.req,
+                                iterations,
+                                duration_ms = t_resolve.elapsed().as_millis() as u64,
+                            );
+                            return Err(activation_error(&parent, &dep, &conflicting_activations));
+                        }
+                    }
+                }
+            };
+
+            let backtrack = if has_another {
+                Some(BacktrackFrame {
+                    context: ctx.clone(),
+                    remaining_deps: remaining_deps.clone(),
+                    remaining_candidates: remaining_candidates.clone(),
+                    parent: parent.clone(),
+                    dep: dep.clone(),
+                    conflicting_activations: conflicting_activations.clone(),
+                })
+            } else {
+                None
+            };
+
+            let chosen = ctx.activations.len();
+            if chosen.is_multiple_of(25) {
+                println!(
+                    "  resolved {} packages so far ({} pending)",
+                    chosen,
+                    remaining_deps.data.len()
+                );
+            }
+            info!(
+                target: "tong::lock",
+                phase = "resolve.choose",
+                package = %dep.name,
+                version = %candidate.id.version,
+                chosen,
+                pending = remaining_deps.data.len(),
+                backtrack_frames = backtrack_stack.len(),
+                duration_ms = t_resolve.elapsed().as_millis() as u64,
+            );
+            let res = activate(&mut ctx, &mut queryer, Some((&parent, &dep)), candidate);
+
+            // If any of our frame's deps are known unresolvable, we are too
+            // (cargo's `has_past_conflicting_dep` pruning).
+            let mut has_past_conflicting_dep = false;
+            if let Ok(Some(ref frame)) = res {
+                let pid = frame.parent.id.clone();
+                if let Some(conflicting) = frame
+                    .remaining_siblings
+                    .remaining()
+                    .find_map(|(new_dep, _)| past_conflicting.conflicting(&ctx, new_dep))
+                {
+                    conflicting_activations.extend(
+                        conflicting
+                            .iter()
+                            .filter(|&(p, _)| p != &pid)
+                            .map(|(p, r)| (p.clone(), r.clone())),
+                    );
+                    has_past_conflicting_dep = true;
+                }
+                if !has_past_conflicting_dep
+                    && let Some(known_related_bad_deps) =
+                        past_conflicting.dependencies_conflicting_with(&pid)
+                    && let Some((other_parent, conflict)) = remaining_deps
+                        .iter()
+                        .filter(|(_, other_dep, _)| {
+                            known_related_bad_deps.contains(&dep_key(other_dep))
+                        })
+                        .filter_map(|(other_parent, other_dep, _)| {
+                            past_conflicting
+                                .find_conflicting(&ctx, other_dep, &pid)
+                                .map(|con| (other_parent, con))
+                        })
+                        .next()
+                {
+                    let rel = conflict
+                        .get(&pid)
+                        .cloned()
+                        .unwrap_or(ConflictReason::Semver);
+                    conflicting_activations.extend(
+                        conflict
+                            .iter()
+                            .filter(|&(p, _)| p != &pid)
+                            .map(|(p, r)| (p.clone(), r.clone())),
+                    );
+                    conflicting_activations.insert(other_parent, rel);
+                    has_past_conflicting_dep = true;
+                }
+            }
+
+            let successfully_activated = match res {
+                Ok(Some(frame)) => {
+                    if !has_past_conflicting_dep {
+                        remaining_deps.push(frame);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // Already activated: no extra work.
+                Ok(None) => true,
+                // Conflict: record the reason and try the next candidate.
+                Err(ActivateError::Conflict(id, reason)) => {
+                    conflicting_activations.insert(id, reason);
+                    false
+                }
+                // Fatal (index failure, missing local edge): abort.
+                Err(ActivateError::Fatal(err)) => return Err(err),
+            };
+
+            if successfully_activated {
+                backtrack_stack.extend(backtrack);
+                break;
+            }
+
+            // The failed activation may have mutated `ctx`; restore it.
+            if let Some(b) = backtrack {
+                ctx = b.context;
             }
         }
     }
 
-    let mut out: Vec<ResolvedPackage> = chosen.into_values().collect();
+    let mut out: Vec<ResolvedPackage> = ctx
+        .activations
+        .values()
+        .map(|(summary, _)| {
+            let mut dependencies: Vec<(String, Version)> = ctx
+                .edges
+                .iter()
+                .filter(|(parent, _, _)| *parent == summary.id)
+                .map(|(_, dep, child)| (dep.name.clone(), child.version.clone()))
+                .collect();
+            dependencies.sort();
+            dependencies.dedup();
+            ResolvedPackage {
+                name: summary.id.name.clone(),
+                version: summary.id.version.clone(),
+                checksum: summary.checksum.clone(),
+                yanked: summary.yanked,
+                local: summary.local,
+                dependencies,
+            }
+        })
+        .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+    check_cycles(&out)?;
+    println!("  resolved {} packages", out.len());
+    info!(
+        target: "tong::lock",
+        phase = "resolve.total",
+        packages = out.len(),
+        iterations,
+        duration_ms = t_resolve.elapsed().as_millis() as u64,
+    );
     Ok(out)
 }
 
-/// Builds a [`ResolvedPackage`] for the given version from the index.
-fn choose(
-    crates: &dyn CrateSource,
-    name: &str,
-    version: &Version,
-) -> Result<ResolvedPackage, ResolveError> {
-    let entry = crates
-        .versions(name)?
-        .into_iter()
-        .find(|entry| &entry.vers == version)
-        .ok_or_else(|| {
-            ResolveError::Fetch(FetchError::BadConfig(format!(
-                "index entry for {name} {version} vanished during resolution"
-            )))
-        })?;
-    Ok(package_from_index(name, &entry))
+/// The feature closure of a package's requested features (cargo
+/// `build_requirements`): which optional deps are enabled, and which
+/// features are requested on each enabled dep via `dep/feat` references.
+struct FeatureClosure {
+    enabled: BTreeSet<String>,
+    /// Features seen in the closure (plain references): a dep whose name
+    /// is seen is enabled via its implicit feature (crates.io's index v2
+    /// omits implicit feature keys).
+    seen: BTreeSet<String>,
+    dep_features: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Builds a [`ResolvedPackage`] from an index entry.
-fn package_from_index(name: &str, entry: &IndexVersion) -> ResolvedPackage {
-    let dependencies = entry
+fn feature_closure(summary: &Summary, requested: Option<&RequestedFeatures>) -> FeatureClosure {
+    let mut closure = FeatureClosure {
+        enabled: BTreeSet::new(),
+        seen: BTreeSet::new(),
+        dep_features: BTreeMap::new(),
+    };
+    let Some(requested) = requested else {
+        return closure;
+    };
+    let mut open: Vec<String> = requested.features.iter().cloned().collect();
+    if requested.default_features {
+        open.push("default".to_owned());
+    }
+    closure.seen = open.iter().cloned().collect();
+    while let Some(feature) = open.pop() {
+        let Some(references) = summary.features.get(&feature) else {
+            continue;
+        };
+        for reference in references {
+            if let Some(name) = reference.strip_prefix("dep:") {
+                closure
+                    .enabled
+                    .insert(name.trim_end_matches('?').to_owned());
+            } else if let Some((name, rest)) = reference.split_once('/') {
+                // `name/feat` and weak `name?/feat` — activating a feature
+                // of a dependency also activates the dependency itself and
+                // requests `feat` on it (cargo `require_dep_feature`).
+                closure
+                    .enabled
+                    .insert(name.trim_end_matches('?').to_owned());
+                if !rest.is_empty() {
+                    closure
+                        .dep_features
+                        .entry(name.trim_end_matches('?').to_owned())
+                        .or_default()
+                        .insert(rest.to_owned());
+                }
+            } else if closure.seen.insert(reference.clone()) {
+                open.push(reference.clone());
+            }
+        }
+    }
+    closure
+}
+
+/// Attempts to activate `candidate`, returning its dependency frame when
+/// newly activated. `Ok(None)` = already activated. `Err` = conflict.
+/// The caller pushes the returned frame onto `remaining_deps`.
+fn activate(
+    ctx: &mut ResolverContext,
+    queryer: &mut Queryer<'_>,
+    parent: Option<(&Summary, &ResolvedDep)>,
+    candidate: Summary,
+) -> Result<Option<DepsFrame>, ActivateError> {
+    ctx.age += 1;
+    // Cargo's re-activation: a new request for a feature (or defaults)
+    // this package has not seen before forces the deps to be recomputed
+    // with the extended set (cargo `flag_activated`'s subset check +
+    // `build_deps`). Without this, a package activated early (e.g. tokio
+    // via axum's `time`) would keep the deps from the first edge only.
+    let mut re_request = false;
+    if let Some((parent_summary, dep)) = parent {
+        ctx.edges
+            .push((parent_summary.id.clone(), dep.clone(), candidate.id.clone()));
+        let requested = ctx.requested.entry(candidate.id.clone()).or_default();
+        re_request = dep
+            .features
+            .iter()
+            .any(|feature| !requested.features.contains(feature))
+            || (dep.default_features && !requested.default_features);
+        requested.features.extend(dep.features.iter().cloned());
+        requested.default_features |= dep.default_features;
+    }
+    let already = ctx
+        .flag_activated(&candidate)
+        .map_err(|(id, reason)| ActivateError::Conflict(id, reason))?;
+    if already && !re_request {
+        return Ok(None);
+    }
+    // Dev-dependencies of registry packages are not locked (a documented
+    // divergence from Cargo.lock completeness: registry dev-deps like
+    // semver's `crates-index` pull enormous test-only closures). Local
+    // packages lock theirs (cargo semantics for workspace members).
+    // Feature-aware optional deps (cargo `build_deps`): an optional dep
+    // is locked only when the requested features enable it. The lock is
+    // the active feature graph — which is why cargo's lock for axum+tokio
+    // is ~50 packages, not the ~800 of the full optional closure.
+    // `dep/feat` references inside the closure also request the dep's
+    // feature (cargo `build_requirements`): tower's `log = ["tracing/log"]`
+    // must request `log` on the tracing edge.
+    let closure = feature_closure(&candidate, ctx.requested.get(&candidate.id));
+    let mut deps: Vec<ResolvedDep> = candidate
         .deps
         .iter()
-        .map(|dep| ResolvedDep {
-            name: dep.package.clone().unwrap_or_else(|| dep.name.clone()),
-            req: dep.req.clone(),
-            features: dep.features.clone(),
-            optional: dep.optional,
-            default_features: dep.default_features,
-            kind: dep.kind.into(),
-            registry: None,
+        .filter(|dep| !dep.dev || candidate.local)
+        .filter(|dep| {
+            !dep.optional || closure.enabled.contains(&dep.name) || closure.seen.contains(&dep.name)
         })
+        .cloned()
         .collect();
-    ResolvedPackage {
-        name: name.to_owned(),
-        version: entry.vers.clone(),
-        checksum: entry.cksum.clone(),
-        dependencies,
-        features: entry.features.clone(),
-        yanked: entry.yanked,
-    }
-}
-
-/// Candidate versions for `(name, req)`: index versions matching the
-/// requirement, not yanked unless already in the lockfile; the locked
-/// version (when it matches) is preferred for lockfile stability.
-fn candidates(
-    crates: &dyn CrateSource,
-    locked: &TongLock,
-    name: &str,
-    req: &VersionReq,
-) -> Result<Vec<Version>, ResolveError> {
-    let locked_version = locked.package(name).map(|package| package.version.clone());
-    let mut versions: Vec<Version> = crates
-        .versions(name)?
-        .into_iter()
-        .filter(|entry| req.matches(&entry.vers))
-        .filter(|entry| !entry.yanked || locked_version.as_ref() == Some(&entry.vers))
-        .map(|entry| entry.vers)
-        .collect();
-    versions.sort();
-    versions.reverse();
-    if let Some(locked) = &locked_version
-        && req.matches(locked)
-        && let Some(index) = versions.iter().position(|v| v == locked)
-    {
-        versions.remove(index);
-        versions.insert(0, locked.clone());
-    }
-    Ok(versions)
-}
-
-/// Backtracks: pops choice frames until one has a remaining candidate,
-/// restores its snapshot, and re-chooses with the next candidate, replaying
-/// every historical edge that touches the re-chosen package. Returns the
-/// re-chosen package, or `None` when no frame can be re-opened.
-fn backtrack(
-    crates: &dyn CrateSource,
-    chosen: &mut BTreeMap<String, ResolvedPackage>,
-    worklist: &mut Vec<Pending>,
-    history: &mut Vec<Pending>,
-    frames: &mut Vec<Frame>,
-    snapshots: &mut Vec<Snapshot>,
-) -> Result<Option<String>, ResolveError> {
-    while let (Some(mut frame), Some(snapshot)) = (frames.pop(), snapshots.pop()) {
-        if frame.remaining.is_empty() {
-            continue;
+    for dep in &mut deps {
+        if let Some(features) = closure.dep_features.get(&dep.name) {
+            for feature in features {
+                if !dep.features.contains(feature) {
+                    dep.features.push(feature.clone());
+                }
+            }
         }
-        // Restore the state before this package was chosen.
-        *chosen = snapshot.chosen;
-        *worklist = snapshot.worklist;
-        *history = snapshot.history;
-        let version = frame.remaining.pop().expect("non-empty");
-        let package = choose(crates, &frame.package, &version)?;
-        let mut deps: Vec<Pending> = package
-            .dependencies
-            .iter()
-            .filter(|dep| dep.kind != DepKind::Dev)
-            .cloned()
-            .map(|edge| Pending {
-                edge,
-                generated_by: Some((frame.package.clone(), version.clone())),
-            })
-            .collect();
-        sort_worklist(&mut deps);
-        worklist.append(&mut deps);
-        // Replay every edge that touches this package so previously
-        // satisfied requirements are re-checked against the new version.
-        let touching: Vec<Pending> = history
-            .iter()
-            .filter(|pending| pending.edge.name == frame.package)
-            .cloned()
-            .collect();
-        worklist.extend(touching);
-        sort_worklist(worklist);
-        chosen.insert(frame.package.clone(), package);
-        // A fresh frame for future backtracking.
-        frames.push(Frame {
-            package: frame.package.clone(),
-            remaining: frame.remaining,
-        });
-        snapshots.push(Snapshot {
-            chosen: chosen.clone(),
-            worklist: worklist.clone(),
-            history: history.clone(),
-        });
-        return Ok(Some(frame.package));
     }
-    Ok(None)
+    let mut infos: Vec<DepInfo> = Vec::with_capacity(deps.len());
+    for dep in deps {
+        let summaries = queryer
+            .query(&candidate, &dep)
+            .map_err(ActivateError::Fatal)?;
+        infos.push((dep, summaries));
+    }
+    // Most constrained first (fewest candidates) — deterministic ties by
+    // name via the DepsFrame ordering.
+    infos.sort_by(|a, b| {
+        a.1.len()
+            .cmp(&b.1.len())
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    Ok(Some(DepsFrame {
+        parent: candidate,
+        remaining_siblings: RcVecIter::new(Rc::new(infos)),
+    }))
 }
 
-/// Sorts worklist entries deterministically (by name, then kind).
-fn sort_worklist(worklist: &mut [Pending]) {
-    worklist.sort_by(|a, b| {
-        a.edge
-            .name
-            .cmp(&b.edge.name)
-            .then_with(|| format!("{:?}", a.edge.kind).cmp(&format!("{:?}", b.edge.kind)))
-    });
+/// The index query cache: candidates per (parent, dep).
+struct Queryer<'a> {
+    crates: &'a dyn CrateSource,
+    locked: &'a TongLock,
+    locals: &'a BTreeMap<String, Summary>,
+    deps_cache: BTreeMap<(String, String), Rc<Vec<Summary>>>,
+}
+
+impl Queryer<'_> {
+    /// Candidate summaries for `dep` of `parent`: the local package for
+    /// local edges, else versions matching the requirement — highest
+    /// first, the locked version preferred, yanked only when locked.
+    /// Cached per (parent, dep-name).
+    fn query(
+        &mut self,
+        parent: &Summary,
+        dep: &ResolvedDep,
+    ) -> Result<Rc<Vec<Summary>>, ResolveError> {
+        if let Some(cached) = self
+            .deps_cache
+            .get(&(parent.id.name.clone(), dep.name.clone()))
+        {
+            return Ok(Rc::clone(cached));
+        }
+        let summaries: Vec<Summary> = match &dep.req {
+            None => {
+                // Local edge: the target must be a local package.
+                let Some(summary) = self.locals.get(&dep.name) else {
+                    return Err(ResolveError::Unresolvable {
+                        chain: format!(
+                            "local dependency `{}` of `{}` names no workspace/path package",
+                            dep.name, parent.id.name
+                        ),
+                    });
+                };
+                vec![summary.clone()]
+            }
+            Some(req) => {
+                let locked_version = self.locked.package(&dep.name).map(|p| p.version.clone());
+                let mut versions: Vec<Summary> = self
+                    .crates
+                    .versions(&dep.name)?
+                    .into_iter()
+                    .filter(|entry| req.matches(&entry.vers))
+                    .filter(|entry| !entry.yanked || locked_version.as_ref() == Some(&entry.vers))
+                    .map(|entry| summary_from_index(&entry))
+                    .collect();
+                // Highest first; the locked version preferred for
+                // lockfile stability.
+                versions.sort_by(|a, b| b.id.version.cmp(&a.id.version));
+                if let Some(locked) = &locked_version
+                    && req.matches(locked)
+                    && let Some(index) = versions.iter().position(|s| s.id.version == *locked)
+                {
+                    let locked = versions.remove(index);
+                    versions.insert(0, locked);
+                }
+                versions
+            }
+        };
+        let summaries = Rc::new(summaries);
+        self.deps_cache.insert(
+            (parent.id.name.clone(), dep.name.clone()),
+            Rc::clone(&summaries),
+        );
+        Ok(summaries)
+    }
+}
+
+fn summary_from_index(entry: &IndexVersion) -> Summary {
+    Summary {
+        id: PackageId::new(&entry.name, &entry.vers),
+        deps: Rc::new(
+            entry
+                .deps
+                .iter()
+                .map(|dep| ResolvedDep {
+                    name: dep.package.clone().unwrap_or_else(|| dep.name.clone()),
+                    req: Some(dep.req.clone()),
+                    optional: dep.optional,
+                    dev: dep.kind == IndexDepKind::Dev,
+                    features: dep.features.clone(),
+                    default_features: dep.default_features,
+                })
+                .collect(),
+        ),
+        features: entry.features.clone(),
+        checksum: Some(entry.cksum.clone()),
+        yanked: entry.yanked,
+        local: false,
+    }
+}
+
+fn local_summary(local: &LocalPackage) -> Summary {
+    Summary {
+        id: PackageId::new(&local.name, &local.version),
+        deps: Rc::new(local.deps.clone()),
+        features: BTreeMap::new(),
+        checksum: None,
+        yanked: false,
+        local: true,
+    }
+}
+
+/// Backjumps: pops backtrack frames until one can change the failed
+/// outcome — its context predates the newest still-active conflict (cargo
+/// `find_candidate`, without the #4834 conflict generalization).
+fn find_candidate(
+    ctx: &ResolverContext,
+    backtrack_stack: &mut Vec<BacktrackFrame>,
+    parent: &Summary,
+    backtracked: bool,
+    conflicting_activations: &ConflictMap,
+) -> Option<(Summary, bool, BacktrackFrame)> {
+    let age = if !backtracked {
+        ctx.is_conflicting(Some(&parent.id), conflicting_activations)
+    } else {
+        None
+    };
+    let mut new_frame = None;
+    if let Some(age) = age {
+        while let Some(frame) = backtrack_stack.pop() {
+            if !(frame.context.age >= age) {
+                new_frame = Some(frame);
+                break;
+            }
+            debug!(
+                target: "tong::lock",
+                phase = "resolve.backjump_skip",
+                dep = %frame.dep.name,
+                parent = %frame.parent.id.name,
+                age = frame.context.age,
+                target_age = age,
+            );
+        }
+    } else {
+        new_frame = backtrack_stack.pop();
+    }
+    new_frame.map(|mut frame| {
+        let (candidate, has_another) = frame
+            .remaining_candidates
+            .next(
+                &mut frame.conflicting_activations,
+                &frame.context.activations,
+            )
+            .expect("a saved frame always has a next candidate");
+        (candidate, has_another, frame)
+    })
+}
+
+/// A diagnostic for an exhausted dependency (trimmed cargo
+/// `errors::activation_error`).
+fn activation_error(
+    parent: &Summary,
+    dep: &ResolvedDep,
+    conflicting: &ConflictMap,
+) -> ResolveError {
+    let mut chain = format!(
+        "failed to select a version for `{}` (required by {} v{})",
+        dep.name, parent.id.name, parent.id.version
+    );
+    if !conflicting.is_empty() {
+        let reasons: Vec<String> = conflicting
+            .keys()
+            .map(|id| format!("`{} v{}` is active", id.name, id.version))
+            .collect();
+        chain.push_str(&format!(
+            "; conflicting activations: {}",
+            reasons.join(", ")
+        ));
+    }
+    ResolveError::Unresolvable { chain }
+}
+
+/// Cycle check over the resolved edges (ported cargo `check_cycles`).
+fn check_cycles(packages: &[ResolvedPackage]) -> Result<(), ResolveError> {
+    let mut checked: BTreeSet<(String, Version)> = BTreeSet::new();
+    let mut path: Vec<(String, Version)> = Vec::new();
+    let mut visited: BTreeSet<(String, Version)> = BTreeSet::new();
+    for pkg in packages {
+        if !checked.contains(&(pkg.name.clone(), pkg.version.clone())) {
+            visit(
+                packages,
+                &(pkg.name.clone(), pkg.version.clone()),
+                &mut visited,
+                &mut path,
+                &mut checked,
+            )?;
+        }
+    }
+    return Ok(());
+
+    fn visit(
+        packages: &[ResolvedPackage],
+        id: &(String, Version),
+        visited: &mut BTreeSet<(String, Version)>,
+        path: &mut Vec<(String, Version)>,
+        checked: &mut BTreeSet<(String, Version)>,
+    ) -> Result<(), ResolveError> {
+        if !visited.insert(id.clone()) {
+            let cycle: Vec<String> = path
+                .iter()
+                .rev()
+                .take_while(|p| p != &id)
+                .map(|p| format!("{} v{}", p.0, p.1))
+                .collect();
+            return Err(ResolveError::Unresolvable {
+                chain: format!(
+                    "cyclic package dependency: package `{} v{}` depends on itself (cycle: {})",
+                    id.0,
+                    id.1,
+                    cycle.join(" -> ")
+                ),
+            });
+        }
+        if checked.insert(id.clone()) {
+            path.push(id.clone());
+            for (dep, version) in package_by_id(packages, id).dependencies.clone() {
+                visit(packages, &(dep, version), visited, path, checked)?;
+            }
+            path.pop();
+        }
+        visited.remove(id);
+        Ok(())
+    }
+}
+
+fn package_by_id<'a>(
+    packages: &'a [ResolvedPackage],
+    id: &(String, Version),
+) -> &'a ResolvedPackage {
+    packages
+        .iter()
+        .find(|p| p.name == id.0 && p.version == id.1)
+        .expect("edge target is a resolved package")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sparse_index::{IndexDep, IndexDepKind};
     use std::collections::BTreeMap;
 
-    /// A fixture index: name → index entries.
+    /// A fixture index: name → entries.
     struct Fixture(BTreeMap<String, Vec<IndexVersion>>);
 
-    impl CrateSource for Fixture {
-        fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, FetchError> {
-            Ok(self.0.get(name).cloned().unwrap_or_default())
+    impl Fixture {
+        fn entry(name: &str, vers: &str, deps: &[(&str, &str)], yanked: bool) -> IndexVersion {
+            IndexVersion {
+                name: name.to_owned(),
+                vers: Version::parse(vers).unwrap(),
+                deps: deps
+                    .iter()
+                    .map(|(dep, req)| IndexDep {
+                        name: (*dep).to_owned(),
+                        req: VersionReq::parse(req).unwrap(),
+                        features: Vec::new(),
+                        optional: false,
+                        default_features: true,
+                        target: None,
+                        kind: IndexDepKind::Normal,
+                        package: None,
+                    })
+                    .collect(),
+                cksum: format!("{name}-{vers}"),
+                features: BTreeMap::new(),
+                features2: None,
+                rust_version: None,
+                yanked,
+                v: 1,
+            }
         }
     }
 
-    fn entry(name: &str, version: &str, deps: &[(&str, &str, bool)]) -> IndexVersion {
-        IndexVersion {
-            name: name.to_owned(),
-            vers: Version::parse(version).unwrap(),
-            deps: deps
-                .iter()
-                .map(|(dep, req, optional)| crate::sparse_index::IndexDep {
-                    name: (*dep).to_owned(),
-                    req: VersionReq::parse(req).unwrap(),
-                    features: Vec::new(),
-                    optional: *optional,
-                    default_features: true,
-                    target: None,
-                    kind: IndexDepKind::Normal,
-                    package: None,
-                })
-                .collect(),
-            cksum: format!("cksum-{name}-{version}"),
-            features: BTreeMap::new(),
-            features2: None,
-            yanked: false,
-            rust_version: None,
-            v: 1,
+    impl CrateSource for Fixture {
+        fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, crate::FetchError> {
+            Ok(self.0.get(name).cloned().unwrap_or_default())
         }
     }
 
     fn edge(name: &str, req: &str) -> ResolvedDep {
         ResolvedDep {
             name: name.to_owned(),
-            req: VersionReq::parse(req).unwrap(),
-            features: Vec::new(),
+            req: Some(VersionReq::parse(req).unwrap()),
             optional: false,
+            dev: false,
+            features: Vec::new(),
             default_features: true,
-            kind: DepKind::Normal,
-            registry: None,
         }
     }
 
-    fn fixture() -> Fixture {
-        // a 1.0 requires b ^1; a 2.0 requires b ^2.
-        let mut index = BTreeMap::new();
-        index.insert(
-            "a".to_owned(),
-            vec![
-                entry("a", "2.0.0", &[("b", "^2", false)]),
-                entry("a", "1.0.0", &[("b", "^1", false)]),
-            ],
+    fn root(deps: Vec<ResolvedDep>) -> LocalPackage {
+        LocalPackage {
+            name: "root".to_owned(),
+            version: Version::new(0, 1, 0),
+            deps,
+        }
+    }
+
+    fn names(packages: &[ResolvedPackage], name: &str) -> Vec<String> {
+        packages
+            .iter()
+            .filter(|p| p.name == name)
+            .map(|p| p.version.to_string())
+            .collect()
+    }
+
+    /// The `syn 2.x + syn 3.x` case that hung the old one-version-per-name
+    /// resolver: two parents require semver-incompatible versions of the
+    /// same crate — both must coexist in the lockfile.
+    #[test]
+    fn semver_incompatible_versions_coexist() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "syn".to_owned(),
+                vec![
+                    Fixture::entry("syn", "2.0.0", &[], false),
+                    Fixture::entry("syn", "3.0.3", &[], false),
+                ],
+            ),
+            (
+                "tokio-macros".to_owned(),
+                vec![Fixture::entry(
+                    "tokio-macros",
+                    "2.7.2",
+                    &[("syn", "^3")],
+                    false,
+                )],
+            ),
+            (
+                "matchers".to_owned(),
+                vec![Fixture::entry("matchers", "0.1.0", &[("syn", "^2")], false)],
+            ),
+        ]));
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("tokio-macros", "*"), edge("matchers", "*")])],
+            &TongLock::default(),
+        )
+        .unwrap();
+        let syn = names(&packages, "syn");
+        assert!(syn.contains(&"2.0.0".to_owned()), "{syn:?}");
+        assert!(syn.contains(&"3.0.3".to_owned()), "{syn:?}");
+        // Each parent's edge pins the exact version it resolved to.
+        let macros = packages.iter().find(|p| p.name == "tokio-macros").unwrap();
+        assert_eq!(
+            macros.dependencies,
+            vec![("syn".to_owned(), Version::new(3, 0, 3))]
         );
-        index.insert(
-            "b".to_owned(),
-            vec![entry("b", "1.0.0", &[]), entry("b", "2.0.0", &[])],
+        let matchers = packages.iter().find(|p| p.name == "matchers").unwrap();
+        assert_eq!(
+            matchers.dependencies,
+            vec![("syn".to_owned(), Version::new(2, 0, 0))]
         );
-        Fixture(index)
     }
 
+    /// A genuinely unresolvable same-group conflict must terminate with an
+    /// error (the old resolver spun forever on similar graphs).
     #[test]
-    fn picks_highest_matching_non_yanked() {
-        let index = fixture();
-        let locked = TongLock::default();
-        let packages = resolve(&index, &[edge("a", "*")], &locked).unwrap();
-        assert_eq!(packages.len(), 2);
-        let a = packages.iter().find(|p| p.name == "a").unwrap();
-        let b = packages.iter().find(|p| p.name == "b").unwrap();
-        assert_eq!(a.version, Version::new(2, 0, 0));
-        assert_eq!(b.version, Version::new(2, 0, 0));
-    }
-
-    #[test]
-    fn prefers_locked_version() {
-        let index = fixture();
-        let mut locked = TongLock::default();
-        locked.packages.push(crate::lockfile::LockedPackage {
-            name: "a".to_owned(),
-            version: Version::new(1, 0, 0),
-            source: "registry+https://index.crates.io".to_owned(),
-            checksum: Some("x".to_owned()),
-            manifest_checksum: None,
-            yanked: false,
-            publish_time: None,
-            dependencies: Vec::new(),
-        });
-        let packages = resolve(&index, &[edge("a", "*")], &locked).unwrap();
-        let a = packages.iter().find(|p| p.name == "a").unwrap();
-        assert_eq!(a.version, Version::new(1, 0, 0));
-    }
-
-    #[test]
-    fn backtracks_on_conflict() {
-        // Root requires a * and b ^1: greedy picks a 2.0, which needs b ^2;
-        // backtracking must land on a 1.0.
-        let index = fixture();
-        let locked = TongLock::default();
-        let packages = resolve(&index, &[edge("a", "*"), edge("b", "^1")], &locked).unwrap();
-        let a = packages.iter().find(|p| p.name == "a").unwrap();
-        let b = packages.iter().find(|p| p.name == "b").unwrap();
-        assert_eq!(a.version, Version::new(1, 0, 0));
-        assert_eq!(b.version, Version::new(1, 0, 0));
-    }
-
-    #[test]
-    fn unresolvable_requirements_error() {
-        // a 1.0 requires b ^2, root wants b ^1: no solution.
-        let mut index = BTreeMap::new();
-        index.insert(
-            "a".to_owned(),
-            vec![entry("a", "1.0.0", &[("b", "^2", false)])],
-        );
-        index.insert("b".to_owned(), vec![entry("b", "1.0.0", &[])]);
-        let locked = TongLock::default();
-        let err =
-            resolve(&Fixture(index), &[edge("a", "*"), edge("b", "^1")], &locked).unwrap_err();
+    fn unresolvable_conflict_terminates() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "a".to_owned(),
+                vec![
+                    Fixture::entry("a", "1.0.0", &[("c", "~1.0")], false),
+                    Fixture::entry("a", "1.0.1", &[("c", "~1.0")], false),
+                    Fixture::entry("a", "1.0.2", &[("c", "~1.0")], false),
+                ],
+            ),
+            (
+                "b".to_owned(),
+                vec![Fixture::entry("b", "1.0.0", &[("c", "^1.1")], false)],
+            ),
+            (
+                "c".to_owned(),
+                vec![
+                    Fixture::entry("c", "1.0.0", &[], false),
+                    Fixture::entry("c", "1.1.0", &[], false),
+                    Fixture::entry("c", "1.2.0", &[], false),
+                ],
+            ),
+        ]));
+        // a picks c ~1.0 (only 1.0.0 matches); b requires c ^1.1 — both
+        // live in Major(1), so no version satisfies both; backtracking
+        // must exhaust and fail.
+        let err = resolve(
+            &fixture,
+            &[root(vec![edge("a", "*"), edge("b", "*")])],
+            &TongLock::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ResolveError::Unresolvable { .. }), "{err}");
     }
 
+    /// Backtracking finds the satisfying combination when it exists.
     #[test]
-    fn no_matching_version_error() {
-        let mut index = BTreeMap::new();
-        index.insert("a".to_owned(), vec![entry("a", "1.0.0", &[])]);
-        let locked = TongLock::default();
-        let err = resolve(&Fixture(index), &[edge("a", "^2")], &locked).unwrap_err();
+    fn backtracks_to_satisfy_all_requirements() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "a".to_owned(),
+                vec![Fixture::entry("a", "2.0.0", &[("c", "^2")], false)],
+            ),
+            (
+                "b".to_owned(),
+                vec![Fixture::entry("b", "1.0.0", &[("c", "^1")], false)],
+            ),
+            (
+                "c".to_owned(),
+                vec![
+                    Fixture::entry("c", "1.0.0", &[], false),
+                    Fixture::entry("c", "2.0.0", &[], false),
+                ],
+            ),
+        ]));
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("a", "*"), edge("b", "*")])],
+            &TongLock::default(),
+        )
+        .unwrap();
+        // a requires c ^2 → c 2.0.0; b requires c ^1 → c 1.0.0. Both
+        // coexist (different major groups).
+        let c = names(&packages, "c");
+        assert!(c.contains(&"1.0.0".to_owned()), "{c:?}");
+        assert!(c.contains(&"2.0.0".to_owned()), "{c:?}");
+    }
+
+    /// The locked version is preferred over the highest match.
+    #[test]
+    fn locked_version_is_preferred() {
+        let fixture = Fixture(BTreeMap::from([(
+            "alpha".to_owned(),
+            vec![
+                Fixture::entry("alpha", "1.0.0", &[], false),
+                Fixture::entry("alpha", "1.2.0", &[], false),
+                Fixture::entry("alpha", "1.5.0", &[], false),
+            ],
+        )]));
+        let locked = TongLock {
+            version: 1,
+            packages: vec![crate::lockfile::LockedPackage {
+                name: "alpha".to_owned(),
+                version: Version::new(1, 2, 0),
+                source: "registry+fixture".to_owned(),
+                checksum: Some("x".to_owned()),
+                manifest_checksum: None,
+                yanked: false,
+                publish_time: None,
+                dependencies: Vec::new(),
+            }],
+        };
+        let packages = resolve(&fixture, &[root(vec![edge("alpha", "^1")])], &locked).unwrap();
+        let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
+        assert_eq!(alpha.version.to_string(), "1.2.0");
+    }
+
+    /// Yanked versions are excluded unless already locked.
+    #[test]
+    fn yanked_versions_require_a_lock_entry() {
+        let fixture = Fixture(BTreeMap::from([(
+            "gamma".to_owned(),
+            vec![
+                Fixture::entry("gamma", "1.0.0", &[], true),
+                Fixture::entry("gamma", "1.1.0", &[], false),
+            ],
+        )]));
+        // No lock: the yanked 1.0.0 is excluded.
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("gamma", "*")])],
+            &TongLock::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&packages, "gamma"), vec!["1.1.0"]);
+        // Locked yanked version is allowed and preferred.
+        let locked = TongLock {
+            version: 1,
+            packages: vec![crate::lockfile::LockedPackage {
+                name: "gamma".to_owned(),
+                version: Version::new(1, 0, 0),
+                source: "registry+fixture".to_owned(),
+                checksum: Some("x".to_owned()),
+                manifest_checksum: None,
+                yanked: true,
+                publish_time: None,
+                dependencies: Vec::new(),
+            }],
+        };
+        let packages = resolve(&fixture, &[root(vec![edge("gamma", "*")])], &locked).unwrap();
+        assert_eq!(names(&packages, "gamma"), vec!["1.0.0"]);
+    }
+
+    /// 0.x compatibility: `0.1.x` and `0.2.x` coexist; `0.0.x` is
+    /// per-patch.
+    #[test]
+    fn zero_major_compatibility_groups() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "z".to_owned(),
+                vec![
+                    Fixture::entry("z", "0.1.5", &[], false),
+                    Fixture::entry("z", "0.2.0", &[], false),
+                    Fixture::entry("z", "0.0.2", &[], false),
+                    Fixture::entry("z", "0.0.1", &[], false),
+                ],
+            ),
+            (
+                "u".to_owned(),
+                vec![Fixture::entry("u", "1.0.0", &[("z", "^0.1")], false)],
+            ),
+            (
+                "v".to_owned(),
+                vec![Fixture::entry("v", "1.0.0", &[("z", "^0.2")], false)],
+            ),
+            (
+                "w".to_owned(),
+                vec![Fixture::entry("w", "1.0.0", &[("z", "=0.0.1")], false)],
+            ),
+        ]));
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("u", "*"), edge("v", "*"), edge("w", "*")])],
+            &TongLock::default(),
+        )
+        .unwrap();
+        let z = names(&packages, "z");
+        assert!(z.contains(&"0.1.5".to_owned()), "{z:?}");
+        assert!(z.contains(&"0.2.0".to_owned()), "{z:?}");
+        assert!(z.contains(&"0.0.1".to_owned()), "{z:?}");
+        assert!(!z.contains(&"0.0.2".to_owned()), "{z:?}");
+    }
+
+    /// A dev-dependency cycle (the real serde ↔ serde_core layout,
+    /// verified against the live index: serde_core's `serde ^1` edge is a
+    /// dev-dependency) must not create a graph cycle and resolves.
+    #[test]
+    fn dev_dependency_cycles_do_not_cycle() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "serde".to_owned(),
+                vec![Fixture::entry(
+                    "serde",
+                    "1.0.229",
+                    &[("serde_core", "^1"), ("serde_derive", "=1.0.229")],
+                    false,
+                )],
+            ),
+            (
+                "serde_core".to_owned(),
+                vec![IndexVersion {
+                    name: "serde_core".to_owned(),
+                    vers: Version::parse("1.0.229").unwrap(),
+                    deps: vec![
+                        IndexDep {
+                            name: "serde".to_owned(),
+                            req: VersionReq::parse("^1").unwrap(),
+                            features: Vec::new(),
+                            optional: false,
+                            default_features: true,
+                            target: None,
+                            kind: IndexDepKind::Dev,
+                            package: None,
+                        },
+                        IndexDep {
+                            name: "serde_derive".to_owned(),
+                            req: VersionReq::parse("=1.0.229").unwrap(),
+                            features: Vec::new(),
+                            optional: false,
+                            default_features: true,
+                            target: None,
+                            kind: IndexDepKind::Normal,
+                            package: None,
+                        },
+                    ],
+                    cksum: "serde_core-1.0.229".to_owned(),
+                    features: BTreeMap::new(),
+                    features2: None,
+                    rust_version: None,
+                    yanked: false,
+                    v: 1,
+                }],
+            ),
+            (
+                "serde_derive".to_owned(),
+                vec![Fixture::entry("serde_derive", "1.0.229", &[], false)],
+            ),
+        ]));
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("serde", "*"), edge("serde_derive", "^1")])],
+            &TongLock::default(),
+        )
+        .unwrap();
+        assert_eq!(names(&packages, "serde"), vec!["1.0.229"]);
+        assert_eq!(names(&packages, "serde_core"), vec!["1.0.229"]);
+        assert_eq!(names(&packages, "serde_derive"), vec!["1.0.229"]);
+        // serde_core's dev edge must not appear in its lock entry.
+        let core = packages.iter().find(|p| p.name == "serde_core").unwrap();
+        assert_eq!(
+            core.dependencies,
+            vec![("serde_derive".to_owned(), Version::new(1, 0, 229))]
+        );
+    }
+
+    /// A genuine normal-dependency cycle is rejected after resolution
+    /// (cargo `check_cycles`).
+    #[test]
+    fn normal_dependency_cycles_are_rejected() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "a".to_owned(),
+                vec![Fixture::entry("a", "1.0.0", &[("b", "^1")], false)],
+            ),
+            (
+                "b".to_owned(),
+                vec![Fixture::entry("b", "1.0.0", &[("a", "^1")], false)],
+            ),
+        ]));
+        let err = resolve(
+            &fixture,
+            &[root(vec![edge("a", "*")])],
+            &TongLock::default(),
+        )
+        .unwrap_err();
         assert!(
-            matches!(err, ResolveError::NoMatchingVersion { .. }),
+            matches!(err, ResolveError::Unresolvable { .. }) && err.to_string().contains("cyclic"),
             "{err}"
         );
     }
 
+    /// Optional deps are locked only when the requested features enable
+    /// them (cargo's feature-aware lockfile): the lock covers the active
+    /// feature graph, not the full optional closure.
     #[test]
-    fn locked_yanked_versions_are_allowed() {
-        let mut index = BTreeMap::new();
-        let mut yanked = entry("a", "1.0.0", &[]);
-        yanked.yanked = true;
-        index.insert("a".to_owned(), vec![yanked, entry("a", "2.0.0", &[])]);
-        let mut locked = TongLock::default();
-        locked.packages.push(crate::lockfile::LockedPackage {
-            name: "a".to_owned(),
-            version: Version::new(1, 0, 0),
-            source: "registry+https://index.crates.io".to_owned(),
-            checksum: Some("x".to_owned()),
-            manifest_checksum: None,
-            yanked: true,
-            publish_time: None,
-            dependencies: Vec::new(),
-        });
-        let packages = resolve(&Fixture(index), &[edge("a", "*")], &locked).unwrap();
-        let a = packages.iter().find(|p| p.name == "a").unwrap();
-        assert_eq!(a.version, Version::new(1, 0, 0));
-        assert!(a.yanked);
+    fn optional_deps_follow_requested_features() {
+        // A package with an optional dep enabled only by a non-default
+        // feature, and a default-feature optional dep.
+        let with_optional = IndexVersion {
+            name: "pkg".to_owned(),
+            vers: Version::parse("1.0.0").unwrap(),
+            deps: vec![
+                IndexDep {
+                    name: "base".to_owned(),
+                    req: VersionReq::parse("^1").unwrap(),
+                    features: Vec::new(),
+                    optional: false,
+                    default_features: true,
+                    target: None,
+                    kind: IndexDepKind::Normal,
+                    package: None,
+                },
+                IndexDep {
+                    name: "extra".to_owned(),
+                    req: VersionReq::parse("^1").unwrap(),
+                    features: Vec::new(),
+                    optional: true,
+                    default_features: true,
+                    target: None,
+                    kind: IndexDepKind::Normal,
+                    package: None,
+                },
+            ],
+            cksum: "pkg-1.0.0".to_owned(),
+            features: BTreeMap::from([
+                ("default".to_owned(), vec!["base".to_owned()]),
+                ("extra".to_owned(), vec!["extra".to_owned()]),
+            ]),
+            features2: None,
+            rust_version: None,
+            yanked: false,
+            v: 1,
+        };
+        let fixture = Fixture(BTreeMap::from([
+            ("pkg".to_owned(), vec![with_optional]),
+            (
+                "base".to_owned(),
+                vec![Fixture::entry("base", "1.0.0", &[], false)],
+            ),
+            (
+                "extra".to_owned(),
+                vec![Fixture::entry("extra", "1.0.0", &[], false)],
+            ),
+        ]));
+
+        // Default features only: `extra` stays out of the lock.
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("pkg", "^1")])],
+            &TongLock::default(),
+        )
+        .unwrap();
+        let pkg = packages.iter().find(|p| p.name == "pkg").unwrap();
+        assert_eq!(
+            pkg.dependencies,
+            vec![("base".to_owned(), Version::new(1, 0, 0))]
+        );
+
+        // The `extra` feature requested on the edge: `extra` is locked.
+        let mut deps = vec![edge("pkg", "^1")];
+        deps[0].features.push("extra".to_owned());
+        let packages = resolve(&fixture, &[root(deps)], &TongLock::default()).unwrap();
+        let pkg = packages.iter().find(|p| p.name == "pkg").unwrap();
+        assert_eq!(
+            pkg.dependencies,
+            vec![
+                ("base".to_owned(), Version::new(1, 0, 0)),
+                ("extra".to_owned(), Version::new(1, 0, 0)),
+            ]
+        );
+    }
+
+    /// Local packages activate at their exact versions and local edges
+    /// resolve without index queries.
+    #[test]
+    fn local_packages_and_edges() {
+        let fixture = Fixture(BTreeMap::new());
+        let packages = resolve(
+            &fixture,
+            &[
+                LocalPackage {
+                    name: "app".to_owned(),
+                    version: Version::new(0, 1, 0),
+                    deps: vec![ResolvedDep {
+                        name: "core".to_owned(),
+                        req: None,
+                        optional: false,
+                        dev: false,
+                        features: Vec::new(),
+                        default_features: true,
+                    }],
+                },
+                LocalPackage {
+                    name: "core".to_owned(),
+                    version: Version::new(0, 2, 0),
+                    deps: Vec::new(),
+                },
+            ],
+            &TongLock::default(),
+        )
+        .unwrap();
+        let app = packages.iter().find(|p| p.name == "app").unwrap();
+        assert_eq!(
+            app.dependencies,
+            vec![("core".to_owned(), Version::new(0, 2, 0))]
+        );
+        assert!(app.local);
+    }
+
+    /// The output is deterministic.
+    #[test]
+    fn resolution_is_deterministic() {
+        let fixture = Fixture(BTreeMap::from([
+            (
+                "a".to_owned(),
+                vec![Fixture::entry("a", "1.0.0", &[("c", "^1")], false)],
+            ),
+            (
+                "b".to_owned(),
+                vec![Fixture::entry("b", "1.0.0", &[("c", "^1")], false)],
+            ),
+            (
+                "c".to_owned(),
+                vec![Fixture::entry("c", "1.0.0", &[], false)],
+            ),
+        ]));
+        let deps = vec![edge("a", "*"), edge("b", "*")];
+        let first = resolve(&fixture, &[root(deps.clone())], &TongLock::default()).unwrap();
+        let second = resolve(&fixture, &[root(deps)], &TongLock::default()).unwrap();
+        assert_eq!(first, second);
     }
 }

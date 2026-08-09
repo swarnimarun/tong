@@ -31,10 +31,6 @@ use tong_store::{ActionCache, Cas};
 enum Status {
     /// Package set, versions, features, and edges all match cargo.
     Pass,
-    /// Tong fails with a targeted diagnostic (asserted).
-    Unsupported,
-    /// A documented difference (asserted against the documented shape).
-    Divergent,
 }
 
 struct Fixture {
@@ -51,7 +47,7 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         name: "targets",
-        status: Status::Divergent,
+        status: Status::Pass,
         reason: "target-specific deps are filtered at import (host only); cargo keeps them in the resolve graph for lockfile completeness",
     },
     Fixture {
@@ -71,7 +67,7 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         name: "examples",
-        status: Status::Unsupported,
+        status: Status::Pass,
         reason: "[[example]] targets are not supported in this wave",
     },
 ];
@@ -419,12 +415,6 @@ fn differential_suite() {
             Status::Pass => {
                 check_pass(fixture);
             }
-            Status::Unsupported => {
-                check_unsupported(fixture);
-            }
-            Status::Divergent => {
-                check_divergent(fixture);
-            }
         }
         println!(
             "{:<14} {:<11} {}",
@@ -464,56 +454,54 @@ fn check_pass(fixture: &Fixture) {
                 tong_fetch::RegistryConfig::from_url(&format!("file://{}", index.display()))
                     .unwrap();
             let index_client = tong_fetch::IndexClient::new(store.join("index"), config.clone());
-            let roots = [
-                tong_fetch::ResolvedDep {
-                    name: "alpha".to_owned(),
-                    req: semver::VersionReq::parse("1").unwrap(),
-                    features: Vec::new(),
-                    optional: false,
-                    default_features: true,
-                    kind: tong_fetch::DepKind::Normal,
-                    registry: None,
-                },
-                tong_fetch::ResolvedDep {
-                    name: "beta".to_owned(),
-                    req: semver::VersionReq::parse("1").unwrap(),
-                    features: Vec::new(),
-                    optional: false,
-                    default_features: true,
-                    kind: tong_fetch::DepKind::Normal,
-                    registry: None,
-                },
-            ];
+            let locals = [tong_fetch::LocalPackage {
+                name: "root".to_owned(),
+                version: semver::Version::new(0, 1, 0),
+                deps: vec![
+                    tong_fetch::ResolvedDep {
+                        name: "alpha".to_owned(),
+                        req: Some(semver::VersionReq::parse("1").unwrap()),
+                        features: Vec::new(),
+                        optional: false,
+                        default_features: true,
+                        dev: false,
+                    },
+                    tong_fetch::ResolvedDep {
+                        name: "beta".to_owned(),
+                        req: Some(semver::VersionReq::parse("1").unwrap()),
+                        features: Vec::new(),
+                        optional: false,
+                        default_features: true,
+                        dev: false,
+                    },
+                ],
+            }];
             let packages =
-                tong_fetch::resolve(&index_client, &roots, &Default::default()).expect("resolve");
+                tong_fetch::resolve(&index_client, &locals, &Default::default()).expect("resolve");
             let mut lock = tong_fetch::TongLock {
                 version: tong_fetch::LOCKFILE_VERSION,
                 packages: Vec::new(),
             };
             for package in &packages {
-                let deps = package
+                // `package.dependencies` carries exact (name, version) edges.
+                let deps: Vec<String> = package
                     .dependencies
                     .iter()
-                    .map(|dep| {
-                        let version = packages
-                            .iter()
-                            .find(|p| p.name == dep.name)
-                            .map(|p| p.version.to_string())
-                            .unwrap_or_else(|| dep.req.to_string());
-                        format!("{} {version} registry+file", dep.name)
-                    })
+                    .map(|(name, version)| format!("{name} {version} registry+file"))
                     .collect();
                 lock.packages.push(tong_fetch::LockedPackage {
                     name: package.name.clone(),
                     version: package.version.clone(),
                     source: "registry+file".to_owned(),
-                    checksum: Some(package.checksum.clone()),
+                    checksum: package.checksum.clone(),
                     manifest_checksum: None,
                     yanked: package.yanked,
                     publish_time: None,
                     dependencies: deps,
                 });
-                tong_fetch::fetch_crate(&cas, &config, package).expect("fetch crate");
+                if !package.local {
+                    tong_fetch::fetch_crate(&cas, &config, package).expect("fetch crate");
+                }
             }
             let provider = LockedSource::new(lock, store.clone());
             let _ = dl_root;
@@ -527,50 +515,6 @@ fn check_pass(fixture: &Fixture) {
     assert_matches(&tong, &cargo, fixture);
 }
 
-fn check_unsupported(fixture: &Fixture) {
-    let work = fixture_copy(fixture.name);
-    let dir = work.path();
-    let host = host_triple();
-    let err = import_cargo_workspace(dir, &host, &NoLock).unwrap_err();
-    let message = err.to_string();
-    assert!(
-        message.contains("example"),
-        "fixture {}: expected a targeted [[example]] diagnostic, got: {message}",
-        fixture.name
-    );
-}
-
-fn check_divergent(fixture: &Fixture) {
-    let work = fixture_copy(fixture.name);
-    let dir = work.path();
-    let host = host_triple();
-    let model = import_cargo_workspace(dir, &host, &NoLock).expect("import");
-    let tong = tong_view(&model, true);
-    let cargo = cargo_view(&cargo_metadata(dir));
-    match fixture.name {
-        // Host-only target filtering: tong's edge set is a subset of
-        // cargo's (which keeps all-platform edges); package set, versions,
-        // and features still match.
-        "targets" => {
-            assert_eq!(
-                tong.packages, cargo.packages,
-                "package set must still match"
-            );
-            assert_eq!(tong.features, cargo.features, "features must still match");
-            assert!(
-                tong.edges.iter().all(|edge| cargo.edges.contains(edge)),
-                "tong edges must be a subset of cargo's"
-            );
-            assert!(
-                tong.edges.len() < cargo.edges.len(),
-                "the host-only filtering divergence must actually differ"
-            );
-        }
-        other => panic!("no divergence asserted for fixture {other:?}"),
-    }
-}
-
-/// The host triple via rustc.
 fn host_triple() -> String {
     let output = Command::new("rustc")
         .args(["-vV"])

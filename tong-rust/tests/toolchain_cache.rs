@@ -177,3 +177,76 @@ fn capture_cache_reuse_invalidation_and_self_healing() {
     let r6 = capture(&cas6, &wrapper, &other_cache);
     assert_eq!(r6.sysroot_tree, r1.sysroot_tree);
 }
+
+/// Writes a fake cache entry (a directory with one file); the real cache
+/// stores object files, but pruning only inspects entry dirs and sizes.
+fn fake_entry(cache_dir: &Path, name: &str, bytes: u64) {
+    let dir = cache_dir.join("toolchains").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    let file = fs::File::create(dir.join("snapshot")).unwrap();
+    file.set_len(bytes).unwrap();
+}
+
+/// The real cache entry's manifest: the one entry holding a `capture`
+/// file (pruning tests mix in fake entries).
+fn real_manifest(cache_dir: &Path) -> PathBuf {
+    cache_entries(cache_dir)
+        .into_iter()
+        .find(|dir| dir.join("capture").is_file())
+        .expect("real capture entry present")
+        .join("capture")
+}
+
+fn cache_entries(cache_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(cache_dir.join("toolchains"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn capture_cache_prunes_oldest_entries_beyond_count_cap() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let sysroot = fake_sysroot(tmp.path());
+    let wrapper = rustc_wrapper(&sysroot, tmp.path());
+    let cache = tmp.path().join("cache");
+
+    // 65 stale entries (cap is 64): the next store must evict oldest
+    // entries but keep the freshly captured one.
+    for index in 0..65 {
+        fake_entry(&cache, &format!("dead-{index:02}"), 100);
+    }
+    let cas = Cas::open(tmp.path().join("store")).unwrap();
+    let captured = capture(&cas, &wrapper, &cache);
+    let entries = cache_entries(&cache);
+    assert_eq!(entries.len(), 64, "expected eviction down to the cap");
+    let manifest = real_manifest(&cache);
+    let real = fs::read_to_string(&manifest).unwrap();
+    assert!(real.contains(&captured.rustc_blob.digest().to_hex()));
+    assert!(entries.iter().all(|dir| {
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        !name.starts_with("dead-") || fs::read_dir(dir).is_ok()
+    }));
+}
+
+#[test]
+fn capture_cache_prunes_by_total_size() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let sysroot = fake_sysroot(tmp.path());
+    let wrapper = rustc_wrapper(&sysroot, tmp.path());
+    let cache = tmp.path().join("cache");
+
+    // One sparse 600 MB entry (cap is 512 MB): a store must evict it.
+    fake_entry(&cache, "huge", 600 * 1024 * 1024);
+    let cas = Cas::open(tmp.path().join("store")).unwrap();
+    let captured = capture(&cas, &wrapper, &cache);
+    let entries = cache_entries(&cache);
+    assert_eq!(entries.len(), 1, "expected the oversized entry evicted");
+    let manifest = real_manifest(&cache);
+    let real = fs::read_to_string(&manifest).unwrap();
+    assert!(real.contains(&captured.rustc_blob.digest().to_hex()));
+}

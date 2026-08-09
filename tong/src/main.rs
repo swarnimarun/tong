@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod dockerfile;
 mod driver;
 mod manifest_mode;
 
@@ -40,6 +41,11 @@ enum Command {
         /// Activate every declared feature of the selected packages.
         #[arg(long)]
         all_features: bool,
+        /// Execute only non-workspace (dependency) actions; workspace
+        /// actions are skipped and nothing is assembled. Docker dep
+        /// layers: busts only when the lockfile or toolchain changes.
+        #[arg(long)]
+        deps_only: bool,
     },
     /// Build and run a binary target.
     Run {
@@ -105,6 +111,22 @@ enum Command {
         #[command(subcommand)]
         command: ToolchainCommand,
     },
+    /// Generate a layer-cache-friendly Dockerfile and .dockerignore.
+    Dockerfile {
+        /// Profile baked into the generated commands.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Toolchain-stage base image (required unless `[toolchain.rust]`
+        /// version is pinned in Tong.toml).
+        #[arg(long)]
+        base: Option<String>,
+        /// Runtime-stage base image.
+        #[arg(long, default_value = "debian:bookworm-slim")]
+        runtime_base: String,
+        /// Directory to write Dockerfile and .dockerignore into.
+        #[arg(long, default_value = ".")]
+        output: PathBuf,
+    },
     /// Garbage-collect the store: delete unreferenced cache objects.
     Gc {
         /// Delete unmarked objects older than this duration (`0` = all).
@@ -156,6 +178,7 @@ fn main() -> ExitCode {
             features,
             no_default_features,
             all_features,
+            deps_only,
         } => {
             let options = BuildOptions {
                 profile,
@@ -166,6 +189,7 @@ fn main() -> ExitCode {
                     all_features,
                 },
                 sandbox: None,
+                deps_only,
             };
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
@@ -195,6 +219,7 @@ fn main() -> ExitCode {
                     all_features,
                 },
                 sandbox: None,
+                deps_only: false,
             };
             match driver::run(&workspace, &target, &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -231,6 +256,7 @@ fn main() -> ExitCode {
                     all_features,
                 },
                 sandbox: None,
+                deps_only: false,
             };
             match driver::test(&workspace, label.as_deref(), &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -300,15 +326,65 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Dockerfile {
+            profile,
+            base,
+            runtime_base,
+            output,
+        } => {
+            let options = dockerfile::Options {
+                profile,
+                base,
+                runtime_base,
+                output: output.clone(),
+            };
+            match dockerfile::generate(&workspace, &options) {
+                Ok(generated) => {
+                    let dir = &options.output;
+                    if let Err(err) = std::fs::create_dir_all(dir) {
+                        eprintln!("tong: error: {}", err);
+                        return ExitCode::FAILURE;
+                    }
+                    let dockerfile_path = dir.join("Dockerfile");
+                    let dockerignore_path = dir.join(".dockerignore");
+                    if let Err(err) = std::fs::write(&dockerfile_path, &generated.dockerfile) {
+                        eprintln!("tong: error: {}", err);
+                        return ExitCode::FAILURE;
+                    }
+                    if let Err(err) = std::fs::write(&dockerignore_path, &generated.dockerignore) {
+                        eprintln!("tong: error: {}", err);
+                        return ExitCode::FAILURE;
+                    }
+                    println!("wrote {}", dockerfile_path.display());
+                    println!("wrote {}", dockerignore_path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
 fn print_summary(outcome: &BuildOutcome) {
     println!();
-    println!(
-        "build complete: {} actions ({} cached, {} executed)",
-        outcome.actions_total, outcome.actions_cached, outcome.actions_executed
-    );
+    if outcome.actions_skipped > 0 {
+        println!(
+            "build complete: {} actions ({} cached, {} executed, {} skipped)",
+            outcome.actions_total,
+            outcome.actions_cached,
+            outcome.actions_executed,
+            outcome.actions_skipped
+        );
+        println!("deps-only: workspace actions skipped, nothing assembled");
+    } else {
+        println!(
+            "build complete: {} actions ({} cached, {} executed)",
+            outcome.actions_total, outcome.actions_cached, outcome.actions_executed
+        );
+    }
     for artifact in &outcome.artifacts {
         println!("artifact: {}", artifact.display());
     }

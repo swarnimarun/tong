@@ -358,6 +358,12 @@ type FileStat = (u64, u64, u32);
 /// Process-unique suffix for atomic temp files (pid + counter).
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Entry-count cap for the per-machine capture cache: pruning evicts the
+/// oldest entries beyond this many (docs/fingerprint-cache.md).
+const MAX_ENTRIES: usize = 64;
+/// Total size cap (bytes) for the per-machine capture cache.
+const MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 impl ToolchainCache {
     /// Opens the user-level cache: `$TONG_CACHE_DIR`, else
     /// `$HOME/.cache/tong`. `None` when no location is available.
@@ -559,7 +565,61 @@ impl ToolchainCache {
         );
         // The manifest is the commit point: it is written last, so a
         // partial entry is never loadable.
-        write_atomic(&dir.join("capture"), manifest.as_bytes())
+        write_atomic(&dir.join("capture"), manifest.as_bytes())?;
+        // Bounded cache: evict the oldest entries beyond the caps — never
+        // the entry just committed. Best-effort; cache hygiene is a
+        // performance concern, not a correctness one.
+        self.prune(key);
+        Ok(())
+    }
+
+    /// Deletes the oldest cache entries until the entry count and total
+    /// size stay within [`MAX_ENTRIES`]/[`MAX_BYTES`]. The entry named
+    /// `keep` (the one just stored) is never evicted. Failures only skip
+    /// the optimization.
+    fn prune(&self, keep: &Digest) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut dirs: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(size) = dir_size(&path) else {
+                continue;
+            };
+            dirs.push((path, modified, size));
+        }
+        if dirs.len() <= MAX_ENTRIES && dirs.iter().map(|d| d.2).sum::<u64>() <= MAX_BYTES {
+            return;
+        }
+        dirs.sort_by_key(|(_, modified, _)| *modified);
+        let mut count = dirs.len();
+        let mut bytes: u64 = dirs.iter().map(|d| d.2).sum();
+        let keep_hex = keep.to_hex();
+        for (path, _, size) in dirs {
+            if count <= MAX_ENTRIES && bytes <= MAX_BYTES {
+                break;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(&keep_hex) {
+                continue;
+            }
+            if fs::remove_dir_all(&path).is_ok() {
+                count -= 1;
+                bytes -= size;
+            }
+        }
     }
 }
 
@@ -648,6 +708,21 @@ fn file_mode(meta: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn file_mode(_meta: &fs::Metadata) -> u32 {
     0
+}
+
+/// Recursive total size of a cache entry directory.
+fn dir_size(dir: &Path) -> io::Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
 }
 
 /// Reads one cached object file; `Ok(None)` when absent.

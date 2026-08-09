@@ -180,14 +180,22 @@ fn registry_end_to_end_offline_build() {
     let index = registry_root.join("index");
     let ws = workspace.path();
 
-    // `tong build` before locking: targeted error mentioning `tong lock`.
+    // `tong build` from a clean state: the build auto-runs `tong lock`
+    // (cargo generates Cargo.lock the same way) and `tong fetch` (sources
+    // arrive on demand), logging both, and completes.
     let output = run_tong(ws, &index, &["build"]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("tong lock"),
-        "expected a `tong lock` hint, got: {stderr}"
+        output.status.success(),
+        "build failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no Tong.lock — running `tong lock` first"),
+        "expected the auto-lock notice, got: {stdout}"
+    );
+    assert!(ws.join("Tong.lock").is_file(), "auto-lock wrote Tong.lock");
 
     // `tong lock --offline` (file:// index, no network) writes Tong.lock.
     let output = run_tong(ws, &index, &["lock", "--offline"]);

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tong_core::digest::{Digest, Hasher};
-use tong_fetch::{DepKind, IndexClient, RegistryConfig, ResolvedDep, TongLock, resolve};
+use tong_fetch::{IndexClient, LocalPackage, RegistryConfig, ResolvedDep, TongLock, resolve};
 use tong_store::Cas;
 
 /// A crate published to the fixture registry.
@@ -155,12 +155,20 @@ fn client(registry: &FixtureRegistry) -> IndexClient {
 fn edge(name: &str, req: &str) -> ResolvedDep {
     ResolvedDep {
         name: name.to_owned(),
-        req: semver::VersionReq::parse(req).unwrap(),
-        features: Vec::new(),
+        req: Some(semver::VersionReq::parse(req).unwrap()),
         optional: false,
+        dev: false,
+        features: Vec::new(),
         default_features: true,
-        kind: DepKind::Normal,
-        registry: None,
+    }
+}
+
+/// A synthetic local root carrying the given registry edges.
+fn root(deps: Vec<ResolvedDep>) -> LocalPackage {
+    LocalPackage {
+        name: "root".to_owned(),
+        version: semver::Version::new(0, 1, 0),
+        deps,
     }
 }
 
@@ -191,7 +199,12 @@ fn resolve_picks_highest_and_backtracks() {
     // initially, then backtrack to alpha 1.0.0 (alpha 2.0.0 is compatible
     // with beta's ^1 only if... ^1 excludes 2.0.0, so the resolver must
     // choose alpha 1.0.0).
-    let packages = resolve(&client, &[edge("alpha", "*"), edge("beta", "*")], &locked).unwrap();
+    let packages = resolve(
+        &client,
+        &[root(vec![edge("alpha", "*"), edge("beta", "*")])],
+        &locked,
+    )
+    .unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
     let beta = packages.iter().find(|p| p.name == "beta").unwrap();
     assert_eq!(alpha.version.to_string(), "1.0.0");
@@ -215,7 +228,7 @@ fn resolve_prefers_locked_version() {
         publish_time: None,
         dependencies: Vec::new(),
     });
-    let packages = resolve(&client, &[edge("alpha", "*")], &locked).unwrap();
+    let packages = resolve(&client, &[root(vec![edge("alpha", "*")])], &locked).unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
     assert_eq!(alpha.version.to_string(), "1.0.0");
 }
@@ -226,7 +239,12 @@ fn fetch_crate_verifies_and_rejects_corruption() {
     let store = tempfile::tempdir().unwrap();
     let cas = Cas::open(store.path().join("store")).unwrap();
     let client = client(&registry);
-    let packages = resolve(&client, &[edge("alpha", "*")], &TongLock::default()).unwrap();
+    let packages = resolve(
+        &client,
+        &[root(vec![edge("alpha", "*")])],
+        &TongLock::default(),
+    )
+    .unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
     let tree = tong_fetch::fetch_crate(&cas, &registry.config, alpha).unwrap();
     assert_eq!(
@@ -235,7 +253,7 @@ fn fetch_crate_verifies_and_rejects_corruption() {
     );
 
     // Corrupt the stored blob: fetch must now reject it with Checksum.
-    let blob = tong_fetch::crate_blob_path(cas.root(), &alpha.checksum);
+    let blob = tong_fetch::crate_blob_path(cas.root(), alpha.checksum.as_deref().unwrap());
     let mut bytes = fs::read(&blob).unwrap();
     bytes[0] ^= 0xff;
     fs::write(&blob, &bytes).unwrap();

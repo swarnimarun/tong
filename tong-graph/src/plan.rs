@@ -38,6 +38,11 @@ pub struct PlannedAction {
     pub mnemonic: String,
     /// Actions that must complete first.
     pub deps: Vec<ActionId>,
+    /// Whether the action belongs to a package outside the workspace
+    /// (registry, git, or path dependencies). `tong build --deps-only`
+    /// executes only external actions, so docker dep layers bust only when
+    /// the lockfile or toolchain changes.
+    pub external: bool,
     /// Assembles the final `ActionSpec` from completed dependencies.
     pub make: MakeSpec,
 }
@@ -179,6 +184,7 @@ mod tests {
             logical_id,
             mnemonic: "Test".to_owned(),
             deps,
+            external: false,
             make: Box::new(move |completed, cas| {
                 let mut inputs = vec![(RelativePath::new(".").unwrap(), {
                     let tree = Tree::default();

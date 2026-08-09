@@ -353,6 +353,18 @@ However, Nix should be one environment-bundle provider, not a mandatory Linux de
 
 A system-captured bundle should be marked non-portable unless all referenced files have been imported and fingerprinted.
 
+### System toolchain capture cache
+
+Per-machine toolchain captures (docs/fingerprint-cache.md) are cached
+outside the project (`$TONG_CACHE_DIR`, default `~/.cache/tong`) and keyed
+by a cheap stat snapshot — toolchain path, `rustc -vV`, and per-file
+`(relpath, mtime_ns, size, mode)` over the sysroot — so warm builds pay a
+~10–30 ms snapshot instead of re-hashing the sysroot. A changed snapshot
+triggers a full content re-capture; the cache never invents digests, and
+cached objects are digest-verified on restore. The cache is per-machine:
+captures remain non-portable and are never published to shared caches.
+Entries are pruned oldest-first beyond 64 entries / 512 MB.
+
 ---
 
 ## 6. Target, Rule, and Provider Model
@@ -801,7 +813,12 @@ of the build:
 The three newest manifests per project are retained on disk (superseded
 state is deleted at write time — "rebuilding clears the old cache"); only
 the *latest* manifest of each project is a GC root, so a rebuild makes the
-previous graph's objects garbage immediately.
+previous graph's objects garbage immediately. A `--deps-only` build
+records only dependency actions and invalidates nothing: its manifest
+merges the previous manifest's object closure (actions, sources,
+toolchains, artifacts — deduped by digest) plus every captured package
+tree, so GC roots always cover what the current workspace references and
+never orphan the local cache (docs/docker-caching.md).
 
 Garbage collection (`tong-store::gc`) is reachability-based mark-and-sweep
 over the whole store, mirroring Cargo's GC direction (#5026/#16804) but
@@ -1017,6 +1034,8 @@ Tong should expose both porcelain commands and plumbing data.
 Core commands:
 
 ```text
+tong build --deps-only
+tong dockerfile
 tong build
 tong check
 tong test
@@ -1030,6 +1049,11 @@ tong explain
 tong clean
 tong doctor
 ```
+
+`tong build --deps-only` executes only actions owned by non-workspace
+packages (docs/docker-caching.md): docker dep layers bust only when the
+lockfile or toolchain changes. `tong dockerfile` generates the
+layer-cache-friendly `Dockerfile` + `.dockerignore` for the workspace.
 
 Required diagnostic workflows:
 
@@ -1103,6 +1127,7 @@ Cargo’s vision specifically identifies plumbing commands and structured histor
 * Per-action cache.
 * Structured event log.
 * `query`, `graph`, and `explain` plumbing.
+* `build --deps-only` and `dockerfile` CLI generation.
 
 ### Repository strategy
 
@@ -1277,6 +1302,8 @@ tong-store/
 * Platform-capability matching.
 * Cache integrity verification.
 * Upload and download concurrency control.
+* `tong store export|import` bundle snapshots (seeding docker builders
+  and CI with a populated store; bundle storage exists — §10).
 
 ### Exit criteria
 
@@ -1425,6 +1452,10 @@ Cover:
 * Toolchain changes.
 * Environment changes.
 * Platform mismatch.
+* Docker-stage flow: a deps-only build from a manifests-only context
+  (member manifests staged at their real relative paths), then a full
+  build in the same store asserting every dep action was a cache hit and
+  only workspace actions executed (`tong/tests/docker_stage.rs`).
 
 ---
 

@@ -15,5 +15,5 @@ pub mod sparse_index;
 pub use download::{crate_blob_path, fetch_crate, materialize_source, verify_crate_bytes};
 pub use lockfile::{LOCKFILE_VERSION, LockedPackage, TongLock};
 pub use registry::{FetchError, RegistryConfig, fetch_url};
-pub use resolve::{CrateSource, DepKind, ResolveError, ResolvedDep, ResolvedPackage, resolve};
+pub use resolve::{CrateSource, LocalPackage, ResolveError, ResolvedDep, ResolvedPackage, resolve};
 pub use sparse_index::{IndexClient, IndexDep, IndexVersion};

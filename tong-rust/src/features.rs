@@ -156,6 +156,7 @@ pub fn resolve_features(
         default_on: BTreeMap::new(),
         active_optional: BTreeMap::new(),
         queue: Vec::new(),
+        pending_weak: Vec::new(),
         native_imports: &native_imports,
     };
 
@@ -180,9 +181,37 @@ pub fn resolve_features(
         }
     }
 
-    // Fixpoint: process queued (package, feature) activations.
-    while let Some((package, feature)) = state.queue.pop() {
-        state.process(&package, &feature, include_dev_deps)?;
+    // Fixpoint: process queued (package, feature) activations, then
+    // re-check deferred weak refs whose dep became active meanwhile.
+    loop {
+        while let Some((package, feature)) = state.queue.pop() {
+            state.process(&package, &feature, include_dev_deps)?;
+        }
+        let mut retry = false;
+        let mut pending = std::mem::take(&mut state.pending_weak);
+        for (parent, dep_name, feature, reference) in pending.drain(..) {
+            let dep_extern = dep_name.clone();
+            let Some(dep) = state.edge_by_extern(&parent, &dep_extern, include_dev_deps) else {
+                continue;
+            };
+            let active = !dep.optional
+                || state
+                    .active_optional
+                    .get(&parent)
+                    .is_some_and(|active| active.contains(&dep.extern_name));
+            let dep = dep.clone();
+            if active {
+                state.enqueue_dep_feature(&parent, &dep, &feature, &reference)?;
+                retry = true;
+            } else {
+                state
+                    .pending_weak
+                    .push((parent, dep_name, feature, reference));
+            }
+        }
+        if !retry {
+            break;
+        }
     }
 
     Ok(FeatureMap {
@@ -198,6 +227,10 @@ struct Resolver<'a> {
     default_on: BTreeMap<String, bool>,
     active_optional: BTreeMap<String, BTreeSet<String>>,
     queue: Vec<(String, String)>,
+    /// Weak `dep?/feat` references whose dep was not active yet; re-checked
+    /// at the fixpoint until the dep activates (cargo semantics: the
+    /// feature applies once the dep is enabled, regardless of ref order).
+    pending_weak: Vec<(String, String, String, String)>,
     native_imports: &'a BTreeSet<&'a str>,
 }
 
@@ -223,13 +256,27 @@ impl<'a> Resolver<'a> {
     }
 
     fn edge<'b>(&self, package: &'b Package, name: &str, include_dev: bool) -> Option<&'b Dep> {
-        self.edges(package, include_dev)
-            .into_iter()
-            .find(|dep| dep.extern_name == name)
+        self.edges(package, include_dev).into_iter().find(|dep| {
+            // Feature references use the TOML name (hyphenated); the model
+            // keeps the underscored `--extern` name alongside.
+            dep.package == name || dep.extern_name == name
+        })
     }
 
     /// Requests the package's default feature (idempotent); only enqueues
     /// when the package declares one.
+    fn edge_by_extern<'b>(
+        &'b self,
+        package_name: &str,
+        extern_name: &str,
+        include_dev: bool,
+    ) -> Option<&'b Dep> {
+        let package = self.packages.get(package_name)?;
+        self.edges(package, include_dev)
+            .into_iter()
+            .find(|dep| dep.extern_name == extern_name)
+    }
+
     fn mark_default(&mut self, package: &str) {
         if self.default_on.get(package).copied().unwrap_or(false) {
             return;
@@ -369,27 +416,44 @@ impl<'a> Resolver<'a> {
         };
         if weak {
             // `dep?/feat` — activate the dep feature only when the dep is
-            // already active.
+            // already active; defer until the fixpoint sees it active.
             if dep_active {
-                self.enqueue_dep_feature(package, dep, feature, reference)?;
+                self.enqueue_dep_feature(&package.name, dep, feature, reference)?;
+            } else {
+                let pending = (
+                    package.name.clone(),
+                    dep.extern_name.clone(),
+                    feature.to_owned(),
+                    reference.to_owned(),
+                );
+                if !self.pending_weak.contains(&pending) {
+                    self.pending_weak.push(pending);
+                }
             }
             return Ok(());
         }
         // `dep/feat` — strong reference: activates the dep and its
         // feature.
         self.activate_edge(package, dep, include_dev)?;
-        self.enqueue_dep_feature(package, dep, feature, reference)
+        self.enqueue_dep_feature(&package.name, dep, feature, reference)
     }
 
     fn enqueue_dep_feature(
         &mut self,
-        _parent: &Package,
+        _parent_name: &str,
         dep: &Dep,
         feature: &str,
         reference: &str,
     ) -> Result<(), FeatureError> {
         let dep_package = self.pkg(&dep.package)?;
-        if !dep_package.features.contains_key(feature) {
+        // The feature may be the implicit feature of an optional dep
+        // (e.g. `tracing/log` — tracing's `log` dep has no explicit
+        // feature entry; cargo resolves the reference to the dep).
+        let implicit = dep_package
+            .deps
+            .iter()
+            .any(|dep| dep.optional && (dep.package == feature || dep.extern_name == feature));
+        if !dep_package.features.contains_key(feature) && !implicit {
             return Err(FeatureError::UnknownDepFeature {
                 package: dep_package.name.clone(),
                 feature: reference.to_owned(),

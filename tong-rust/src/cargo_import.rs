@@ -69,6 +69,7 @@ struct CargoManifest {
     #[serde(default)]
     bench: Vec<CargoTest>,
     #[serde(default)]
+    #[allow(dead_code)]
     example: Vec<CargoExample>,
     #[serde(default)]
     profile: BTreeMap<String, CargoProfile>,
@@ -200,10 +201,29 @@ struct CargoTest {
     harness: Option<bool>,
 }
 
-/// `[[example]]` entry — unsupported in this wave (targeted diagnostic).
-#[derive(Deserialize)]
+/// `[[example]]` entry — parsed and ignored: tong does not build examples
+/// (cargo builds them only on demand), but the tables must deserialize.
+#[derive(Deserialize, Default)]
+#[allow(dead_code)]
 #[serde(rename_all = "kebab-case")]
-struct CargoExample;
+struct CargoExample {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    required_features: Option<Vec<String>>,
+    #[serde(default)]
+    crate_type: Option<String>,
+    #[serde(default)]
+    harness: Option<bool>,
+    #[serde(default)]
+    test: Option<bool>,
+    #[serde(default)]
+    doc: Option<bool>,
+    #[serde(default)]
+    edition: Option<String>,
+}
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -322,6 +342,7 @@ pub fn import_cargo_workspace(
     for member in &members {
         import_package(
             member,
+            true,
             &mut packages,
             &mut visiting,
             &inherited,
@@ -451,8 +472,10 @@ fn expand_members(
 /// Imports the package at `dir` (a workspace member or a path dependency)
 /// into `packages`, recursing into its path dependencies. Returns the
 /// package's declared name. Cycles are rejected, matching Cargo.
+#[allow(clippy::too_many_arguments)]
 fn import_package(
     dir: &Path,
+    is_member: bool,
     packages: &mut BTreeMap<PathBuf, Package>,
     visiting: &mut Vec<PathBuf>,
     inherited: &Inherited,
@@ -594,12 +617,8 @@ fn import_package(
 
         // Test targets: [[test]] / [[bench]] entries whose source exists
         // (Cargo drops targets without source files), plus the auto-derived
-        // lib unit test. [[example]] is not in this wave.
-        if !manifest.example.is_empty() {
-            return Err(CargoImportError::Unsupported(
-                "[[example]] targets are not supported yet".to_owned(),
-            ));
-        }
+        // lib unit test. [[example]] targets are ignored (tong does not
+        // build examples; cargo builds them only on demand).
         for (entry, default_dir, kind) in [
             (&manifest.test, "tests", "test"),
             (&manifest.bench, "benches", "bench"),
@@ -665,15 +684,19 @@ fn import_package(
             host_triple,
             sources,
         )?;
-        let resolved_dev_deps = resolve_deps(
-            &dev_dependencies,
-            &pkg.name,
-            &canonical,
-            workspace_root,
-            &inherited.deps,
-            host_triple,
-            sources,
-        )?;
+        let resolved_dev_deps = if is_member {
+            resolve_deps(
+                &dev_dependencies,
+                &pkg.name,
+                &canonical,
+                workspace_root,
+                &inherited.deps,
+                host_triple,
+                sources,
+            )?
+        } else {
+            Vec::new()
+        };
         let mut deps = Vec::new();
         let mut build_deps = Vec::new();
         let mut dev_deps = Vec::new();
@@ -687,6 +710,7 @@ fn import_package(
                     Some(path) => {
                         let imported = import_package(
                             &path,
+                            false,
                             packages,
                             visiting,
                             &inherited,
@@ -717,6 +741,7 @@ fn import_package(
                         let dir = sources.source_dir(&dep.package, &version)?;
                         let imported = import_package(
                             &dir,
+                            false,
                             packages,
                             visiting,
                             &inherited,
@@ -742,7 +767,7 @@ fn import_package(
                     optional: dep.optional,
                     default_features: dep.default_features,
                     features: dep.features,
-                    target: None,
+                    target: dep.target,
                 });
             }
         }
@@ -805,6 +830,7 @@ struct ResolvedDep {
     optional: bool,
     default_features: bool,
     features: Vec<String>,
+    target: Option<String>,
     locked_version: Option<semver::Version>,
 }
 
@@ -814,7 +840,7 @@ fn resolve_deps(
     member: &Path,
     workspace_root: &Path,
     inherited: &BTreeMap<String, DepValue>,
-    host_triple: &str,
+    _host_triple: &str,
     sources: &dyn LockedSourceProvider,
 ) -> Result<Vec<ResolvedDep>, CargoImportError> {
     let mut out = Vec::new();
@@ -822,7 +848,7 @@ fn resolve_deps(
         // The effective table: the member's own table merged over the
         // inherited `[workspace.dependencies]` table (Cargo semantics:
         // features concatenate, other keys override).
-        let (path, package, optional, default_features, features, req) = match value {
+        let (path, package, optional, default_features, features, target, req) = match value {
             DepValue::Version(version) => {
                 // Registry dependency: resolved through the lockfile.
                 let edge = RegistryEdge {
@@ -841,6 +867,7 @@ fn resolve_deps(
                     false,
                     true,
                     Vec::new(),
+                    None,
                     Some((edge, locked)),
                 )
             }
@@ -854,13 +881,10 @@ fn resolve_deps(
                 features,
                 target,
             } => {
-                if let Some(target) = target {
-                    // Target-specific dependency: drop the edge when the
-                    // host does not match.
-                    if !target_matches(target, host_triple, &format!("dependency {name:?}"))? {
-                        continue;
-                    }
-                }
+                // Target-specific deps stay in the model with their target
+                // recorded (the backend filters them at plan time); the
+                // feature walk and the lock need them regardless of host
+                // (cargo locks all-target deps).
                 let optional = optional.unwrap_or(false);
                 let default_features = default_features.unwrap_or(true);
                 let features = features.clone().unwrap_or_default();
@@ -872,6 +896,7 @@ fn resolve_deps(
                         optional,
                         default_features,
                         features,
+                        target.clone(),
                         None,
                     )
                 } else if *workspace == Some(true) {
@@ -899,6 +924,7 @@ fn resolve_deps(
                                 optional || inherited_optional.unwrap_or(false),
                                 default_features && inherited_default_features.unwrap_or(true),
                                 merged_features,
+                                target.clone(),
                                 None,
                             )
                         }
@@ -920,6 +946,7 @@ fn resolve_deps(
                                 optional,
                                 default_features,
                                 features,
+                                target.clone(),
                                 Some((edge, locked)),
                             )
                         }
@@ -943,6 +970,7 @@ fn resolve_deps(
                                 optional,
                                 default_features,
                                 features,
+                                target.clone(),
                                 Some((edge, locked)),
                             )
                         }
@@ -971,6 +999,7 @@ fn resolve_deps(
                         optional,
                         default_features,
                         features,
+                        target.clone(),
                         Some((edge, locked)),
                     )
                 } else {
@@ -990,6 +1019,7 @@ fn resolve_deps(
                 optional,
                 default_features,
                 features,
+                target,
                 locked_version: None,
             });
         } else if let Some((_edge, locked)) = req
@@ -1002,6 +1032,7 @@ fn resolve_deps(
                 optional,
                 default_features,
                 features,
+                target,
                 locked_version: locked,
             });
         }
@@ -1029,17 +1060,44 @@ fn merge_target_tables(
     let mut build_dependencies = manifest.build_dependencies.clone();
     let mut dev_dependencies = manifest.dev_dependencies.clone();
     for (key, table) in &manifest.target {
-        if !target_matches(key, host_triple, &format!("target table {key:?}"))? {
-            continue;
-        }
+        // Every target table's deps enter the model with the target key
+        // recorded (the backend filters at plan time), so the feature walk
+        // and the lock see all targets. Cargo's override semantics: a
+        // target-specific dep replaces the same-name general dep only when
+        // the target matches the host; on a non-matching host the general
+        // dep applies (tokio's `tokio_unstable`-gated mio must not shadow
+        // the real one).
+        let matching = target_matches(key, host_triple, &format!("target table {key:?}"))?;
+        let with_target = |dep: &DepValue| -> DepValue {
+            let mut dep = dep.clone();
+            if let DepValue::Table { target, .. } = &mut dep {
+                *target = Some(key.clone());
+            }
+            dep
+        };
         for (name, dep) in &table.dependencies {
-            dependencies.insert(name.clone(), dep.clone());
+            let dep = with_target(dep);
+            if matching {
+                dependencies.insert(name.clone(), dep);
+            } else {
+                dependencies.entry(name.clone()).or_insert(dep);
+            }
         }
         for (name, dep) in &table.build_dependencies {
-            build_dependencies.insert(name.clone(), dep.clone());
+            let dep = with_target(dep);
+            if matching {
+                build_dependencies.insert(name.clone(), dep);
+            } else {
+                build_dependencies.entry(name.clone()).or_insert(dep);
+            }
         }
         for (name, dep) in &table.dev_dependencies {
-            dev_dependencies.insert(name.clone(), dep.clone());
+            let dep = with_target(dep);
+            if matching {
+                dev_dependencies.insert(name.clone(), dep);
+            } else {
+                dev_dependencies.entry(name.clone()).or_insert(dep);
+            }
         }
     }
     Ok((dependencies, build_dependencies, dev_dependencies))
@@ -1047,7 +1105,11 @@ fn merge_target_tables(
 
 /// Whether a target key (`cfg(...)` expression or literal triple) matches
 /// the host triple.
-fn target_matches(key: &str, host_triple: &str, what: &str) -> Result<bool, CargoImportError> {
+pub(crate) fn target_matches(
+    key: &str,
+    host_triple: &str,
+    what: &str,
+) -> Result<bool, CargoImportError> {
     if key.trim_start().starts_with("cfg(") {
         tong_core::platform::eval_cfg(key, host_triple)
             .map_err(|err| CargoImportError::Unsupported(format!("{what}: {}", err)))
@@ -1205,13 +1267,20 @@ mod tests {
     const NO_LOCK: NoLock = NoLock;
 
     fn write_tree(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+        // The returned tempdir owns the fixture's parent: entries may
+        // reference "../" siblings (path dependencies), and those siblings
+        // must never collide with other fixtures in the shared system temp
+        // root (concurrent test binaries and stale dirs from earlier runs
+        // used to corrupt them).
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
         for (path, content) in files {
-            let full = dir.path().join(path);
+            let full = root.join(path);
             fs::create_dir_all(full.parent().unwrap()).unwrap();
             fs::write(full, content).unwrap();
         }
-        dir
+        parent
     }
 
     #[test]
@@ -1251,7 +1320,9 @@ calc-core = { path = "../calc-core" }
             ),
             ("crates/calc-cli/src/main.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         assert_eq!(model.packages.len(), 2);
         let cli = model
             .packages
@@ -1290,7 +1361,8 @@ serde = "1"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
+        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+            .unwrap_err();
         assert!(err.to_string().contains("registry dependency"), "{err}");
     }
 
@@ -1318,7 +1390,9 @@ APP_GREETING = "hello"
 "#,
             ),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         assert_eq!(model.global_rustflags, vec!["--cfg", "advanced_mode"]);
         assert_eq!(model.global_env.get("APP_GREETING").unwrap(), "hello");
     }
@@ -1348,7 +1422,9 @@ sdl3-sys = { path = "../../shared/sdl3-sys" }
             ),
             ("shared/sdl3-sys/src/lib.rs", "pub fn init() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         assert_eq!(model.packages.len(), 2);
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 1);
@@ -1361,7 +1437,7 @@ sdl3-sys = { path = "../../shared/sdl3-sys" }
             .unwrap();
         assert_eq!(
             sys.dir,
-            fs::canonicalize(dir.path().join("shared/sdl3-sys")).unwrap()
+            fs::canonicalize(dir.path().join("ws/shared/sdl3-sys")).unwrap()
         );
         assert!(sys.lib.is_some());
     }
@@ -1397,7 +1473,8 @@ a = { path = "../a" }
             ),
             ("b/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
+        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+            .unwrap_err();
         assert!(err.to_string().contains("cyclic"), "{err}");
     }
 
@@ -1426,7 +1503,9 @@ edition.workspace = true
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.version, "1.2.3");
         assert_eq!(app.edition, Edition::E2021);
@@ -1446,7 +1525,8 @@ version.workspace = true
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
+        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+            .unwrap_err();
         assert!(err.to_string().contains("inherits version"), "{err}");
     }
 
@@ -1474,7 +1554,9 @@ name = "app_core"
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.lib.as_ref().unwrap().name.as_deref(), Some("app_core"));
     }
@@ -1496,7 +1578,9 @@ members = ["app"]
             ("app/src/lib.rs", ""),
             ("app/build.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(
             app.build_script.as_deref(),
@@ -1522,7 +1606,9 @@ members = ["app"]
             // A build.rs exists, but the manifest opts out (Cargo semantics).
             ("app/build.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert!(app.build_script.is_none());
     }
@@ -1543,7 +1629,8 @@ members = ["app"]
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
+        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+            .unwrap_err();
         assert!(err.to_string().contains("build = true"), "{err}");
     }
 
@@ -1568,7 +1655,9 @@ overflow-checks = false
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
         let release = model.profiles.get("release").unwrap();
         assert_eq!(release.opt_level, "2");
         assert_eq!(release.lto, Lto::Thin);
@@ -1618,19 +1707,36 @@ win-only = { path = "../win-only" }
             ),
             ("../win-only/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        // Target-specific deps stay in the model with their target
+        // recorded (cargo locks all targets); the backend filters them at
+        // plan time.
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         let names: Vec<&str> = app.deps.iter().map(|d| d.package.as_str()).collect();
         assert!(names.contains(&"common"));
         assert!(names.contains(&"unix-only"));
-        assert!(!names.contains(&"win-only"));
-        assert!(!model.packages.iter().any(|p| p.name == "win-only"));
+        assert!(names.contains(&"win-only"));
+        let win = app.deps.iter().find(|d| d.package == "win-only").unwrap();
+        assert_eq!(win.target.as_deref(), Some("cfg(windows)"));
+        assert_eq!(
+            app.deps
+                .iter()
+                .find(|d| d.package == "unix-only")
+                .unwrap()
+                .target
+                .as_deref(),
+            Some("cfg(unix)")
+        );
 
-        // The same workspace imported for Windows keeps the other branch.
-        let model = import_cargo_workspace(dir.path(), "x86_64-pc-windows-msvc", &NO_LOCK).unwrap();
+        // The Windows import keeps the same model shape (targets recorded).
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "x86_64-pc-windows-msvc", &NO_LOCK)
+                .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         let names: Vec<&str> = app.deps.iter().map(|d| d.package.as_str()).collect();
-        assert!(!names.contains(&"unix-only"));
+        assert!(names.contains(&"unix-only"));
         assert!(names.contains(&"win-only"));
     }
 
@@ -1662,14 +1768,20 @@ win-only = { path = "../win-only", target = "cfg(windows)" }
             ),
             ("../win-only/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        // Both target-keyed deps are in the model with their targets; the
+        // backend filters at plan time.
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
-        assert_eq!(app.deps.len(), 1);
+        assert_eq!(app.deps.len(), 2);
         assert_eq!(app.deps[0].package, "unix-only");
+        assert_eq!(app.deps[1].package, "win-only");
+        assert_eq!(app.deps[1].target.as_deref(), Some("cfg(windows)"));
     }
 
     #[test]
-    fn rejects_unknown_cfg_predicates() {
+    fn unknown_cfg_predicates_evaluate_false() {
         let dir = write_tree(&[
             (
                 "Cargo.toml",
@@ -1679,7 +1791,7 @@ name = "app"
 version = "0.1.0"
 edition = "2021"
 
-[target.'cfg(target_pointer_width = "64")'.dependencies]
+[target.'cfg(target_unknown = "x")'.dependencies]
 foo = { path = "../foo" }
 "#,
             ),
@@ -1690,8 +1802,18 @@ foo = { path = "../foo" }
             ),
             ("../foo/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
-        assert!(err.to_string().contains("unsupported cfg"), "{err}");
+        // An unknown predicate is never set by the compiler: the import
+        // records it as the dep's target (no error); the backend filters
+        // it out at plan time.
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        let app = model.packages.iter().find(|p| p.name == "app").unwrap();
+        assert_eq!(app.deps.len(), 1);
+        assert_eq!(
+            app.deps[0].target.as_deref(),
+            Some("cfg(target_unknown = \"x\")")
+        );
     }
 
     #[test]
@@ -1711,7 +1833,8 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
+        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+            .unwrap_err();
         assert!(err.to_string().contains("strip"), "{err}");
     }
 }

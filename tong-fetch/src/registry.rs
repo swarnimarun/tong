@@ -63,8 +63,11 @@ impl RegistryConfig {
         })
     }
 
-    /// Substitutes the download markers into the `dl` template, or appends
-    /// the Cargo default path when no marker is present.
+    /// Substitutes the download markers into the `dl` template; a
+    /// marker-less `dl` (the modern crates.io config:
+    /// `https://static.crates.io/crates`) uses the static layout
+    /// `{dl}/{crate}/{crate}-{version}.crate`; an empty `dl` falls back to
+    /// the legacy index download path.
     pub fn download_url(&self, name: &str, version: &semver::Version, checksum: &str) -> String {
         let lower = name.to_ascii_lowercase();
         let (prefix, lowerprefix) = match lower.len() {
@@ -81,10 +84,15 @@ impl RegistryConfig {
                 .replace("{prefix}", &prefix)
                 .replace("{lowerprefix}", &lowerprefix)
                 .replace("{sha256-checksum}", checksum);
-        } else {
+        } else if self.dl.is_empty() {
             url = format!(
                 "{}/crate/{name}/{version}/download",
                 self.index_url.trim_end_matches('/')
+            );
+        } else {
+            url = format!(
+                "{}/{lower}/{lower}-{version}.crate",
+                self.dl.trim_end_matches('/')
             );
         }
         url
@@ -153,6 +161,18 @@ impl From<io::Error> for FetchError {
 
 /// Fetches a URL: `file://` reads the local path; `http(s)://` uses ureq.
 /// Responses are size-capped.
+/// Builds the HTTP agent for index and crate downloads: bounded
+/// connect/overall timeouts so a stuck server cannot hang `tong lock`
+/// forever (the default agent has no timeout and a dead connection
+/// blocks indefinitely).
+pub(crate) fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .new_agent()
+}
+
 pub fn fetch_url(url: &str, max_size: usize) -> Result<Vec<u8>, FetchError> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = Path::new(path);
@@ -179,7 +199,8 @@ pub fn fetch_url(url: &str, max_size: usize) -> Result<Vec<u8>, FetchError> {
             "unsupported URL scheme in {url:?} (expected http://, https://, or file://)"
         )));
     }
-    let agent = ureq::Agent::new_with_defaults();
+    let agent = http_agent();
+    let t_fetch = std::time::Instant::now();
     let mut response = agent.get(url).call().map_err(|err| match err {
         ureq::Error::StatusCode(404) => FetchError::NotFound(url.to_owned()),
         other => FetchError::Http(format!("GET {url}: {other}")),
@@ -195,6 +216,13 @@ pub fn fetch_url(url: &str, max_size: usize) -> Result<Vec<u8>, FetchError> {
             }
             other => FetchError::Http(format!("GET {url}: {other}")),
         })?;
+    tracing::debug!(
+        target: "tong::fetch",
+        url,
+        status = response.status().as_u16(),
+        bytes = body.len(),
+        duration_ms = t_fetch.elapsed().as_millis() as u64,
+    );
     Ok(body)
 }
 

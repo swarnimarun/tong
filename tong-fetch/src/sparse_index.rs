@@ -99,6 +99,14 @@ pub struct IndexClient {
     /// Never touch the network (`tong lock --offline`); a missing cache
     /// entry is an error.
     offline: bool,
+    /// Names already reported as fetched (progress dedup: the resolver
+    /// may ask for one crate's versions repeatedly).
+    reported: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Per-run memo of parsed index entries: the resolver asks for one
+    /// crate's versions once per parent edge, and every repeated ask is
+    /// otherwise a fresh HTTP revalidation (~120 ms each — thousands of
+    /// round trips on a real graph).
+    memo: std::cell::RefCell<std::collections::BTreeMap<String, Vec<IndexVersion>>>,
 }
 
 impl IndexClient {
@@ -109,6 +117,8 @@ impl IndexClient {
             cache_dir,
             config,
             offline: false,
+            reported: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            memo: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -129,6 +139,18 @@ impl IndexClient {
 
     /// Fetches (or serves from cache) every version entry of `name`.
     pub fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, FetchError> {
+        if let Some(cached) = self.memo.borrow().get(name) {
+            return Ok(cached.clone());
+        }
+        let versions = self.versions_uncached(name)?;
+        self.memo
+            .borrow_mut()
+            .insert(name.to_owned(), versions.clone());
+        Ok(versions)
+    }
+
+    /// The uncached fetch path (memoized by [`Self::versions`]).
+    fn versions_uncached(&self, name: &str) -> Result<Vec<IndexVersion>, FetchError> {
         let path = index_path_for_name(name);
         let url = format!("{}/{}", self.config.index_url.trim_end_matches('/'), path);
         let cache_file = self.cache_file(name);
@@ -160,13 +182,31 @@ impl IndexClient {
 
         // Revalidate when a cache exists.
         if cached.is_some() {
-            let agent = ureq::Agent::new_with_defaults();
+            if self.reported.borrow_mut().insert(name.to_owned()) {
+                tracing::info!(target: "tong::lock", phase = "index", package = %name);
+            }
+            let t_fetch = std::time::Instant::now();
+            let agent = crate::registry::http_agent();
             let mut request = agent.get(&url);
             if let Some(etag) = &etag {
                 request = request.header("If-None-Match", etag);
             }
             match request.call() {
                 Ok(mut response) => {
+                    // ureq 3.4 surfaces 304 as `Ok` with an empty body
+                    // (verified), not as `Err(StatusCode(304))`. Treat
+                    // both: a 304 must parse the cached copy and must
+                    // never clobber the cache with the empty body.
+                    if response.status() == 304 {
+                        tracing::debug!(
+                            target: "tong::lock",
+                            phase = "index.revalidate",
+                            package = %name,
+                            status = 304,
+                            duration_ms = t_fetch.elapsed().as_millis() as u64,
+                        );
+                        return parse(cached.as_deref().unwrap_or(""), "index cache");
+                    }
                     let body = response
                         .body_mut()
                         .with_config()
@@ -174,6 +214,14 @@ impl IndexClient {
                         .read_to_vec()
                         .map_err(|err| FetchError::Http(err.to_string()))?;
                     let text = String::from_utf8_lossy(&body);
+                    tracing::debug!(
+                        target: "tong::lock",
+                        phase = "index.revalidate",
+                        package = %name,
+                        status = response.status().as_u16(),
+                        bytes = body.len(),
+                        duration_ms = t_fetch.elapsed().as_millis() as u64,
+                    );
                     let parsed = parse(&text, &url)?;
                     // Cache the fresh copy.
                     if let (Some(dir), Ok(mut file)) =
@@ -210,8 +258,19 @@ impl IndexClient {
             }
         } else {
             // Cold cache: plain GET.
+            if self.reported.borrow_mut().insert(name.to_owned()) {
+                tracing::info!(target: "tong::lock", phase = "index", package = %name);
+            }
+            let t_fetch = std::time::Instant::now();
             let bytes = fetch_url(&url, crate::registry::INDEX_SIZE_LIMIT)?;
             let text = String::from_utf8_lossy(&bytes);
+            tracing::debug!(
+                target: "tong::lock",
+                phase = "index.fetch",
+                package = %name,
+                bytes = bytes.len(),
+                duration_ms = t_fetch.elapsed().as_millis() as u64,
+            );
             let parsed = parse(&text, &url)?;
             if let Some(parent) = cache_file.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -235,13 +294,17 @@ impl crate::resolve::CrateSource for IndexClient {
     }
 }
 
-/// The index path for a crate name (Cargo book rules).
+/// The index path for a crate name (current crates.io sparse layout):
+/// 1-2 letters keep the flat shard, 3-letter names add the first
+/// character as an extra directory (`3/s/syn`), everything else is
+/// `{first2}/{next2}/{name}`. Verified against cargo's cached index
+/// (2026-08-09): the legacy `/3/<name>` 404s on index.crates.io.
 fn index_path_for_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     match lower.len() {
         1 => format!("1/{lower}"),
         2 => format!("2/{lower}"),
-        3 => format!("3/{lower}"),
+        3 => format!("3/{}/{lower}", &lower[..1]),
         _ => format!("{}/{}/{}", &lower[..2], &lower[2..4], lower),
     }
 }
@@ -283,6 +346,7 @@ fn parse_index(text: &str, name: &str, source: &str) -> Result<Vec<IndexVersion>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn index_client() -> (tempfile::TempDir, IndexClient) {
         let dir = tempfile::tempdir().unwrap();
@@ -316,7 +380,7 @@ mod tests {
             ),
         );
         let config = RegistryConfig {
-            index_url: url.trim_end_matches("/3/foo").to_owned(),
+            index_url: url.trim_end_matches("/3/f/foo").to_owned(),
             dl: String::new(),
             api: None,
         };
@@ -335,7 +399,7 @@ mod tests {
         let line = r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"x","features":{"a":["b"]},"features2":{"a":["c"]},"yanked":false,"v":2}"#;
         let url = write_index_file(dir.path(), "foo", line);
         let config = RegistryConfig {
-            index_url: url.trim_end_matches("/3/foo").to_owned(),
+            index_url: url.trim_end_matches("/3/f/foo").to_owned(),
             dl: String::new(),
             api: None,
         };
@@ -352,7 +416,7 @@ mod tests {
         let line = r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"x","features":{},"yanked":true,"v":1}"#;
         let url = write_index_file(dir.path(), "foo", line);
         let config = RegistryConfig {
-            index_url: url.trim_end_matches("/3/foo").to_owned(),
+            index_url: url.trim_end_matches("/3/f/foo").to_owned(),
             dl: String::new(),
             api: None,
         };
@@ -365,7 +429,82 @@ mod tests {
     fn cache_paths_follow_cargo_rules() {
         assert_eq!(index_path_for_name("a"), "1/a");
         assert_eq!(index_path_for_name("ab"), "2/ab");
+        // 3-letter crates moved to `3/<first>/<name>` on index.crates.io;
+        // the legacy `/3/<name>` 404s (verified 2026-08-09).
+        assert_eq!(index_path_for_name("syn"), "3/s/syn");
+        assert_eq!(index_path_for_name("cc"), "2/cc");
         assert_eq!(index_path_for_name("serde"), "se/rd/serde");
         assert_eq!(index_path_for_name("serde_derive"), "se/rd/serde_derive");
+    }
+
+    /// A minimal HTTP index server for revalidation tests: serves the
+    /// entry with an ETag on the first request and 304 on any request
+    /// carrying a matching `If-None-Match`.
+    struct RevalidateServer {
+        addr: std::net::SocketAddr,
+    }
+
+    impl RevalidateServer {
+        fn start(body: &'static str, etag: &'static str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = stream.read(&mut buf) else {
+                        continue;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let (status, extra) = if request.contains("If-None-Match") {
+                        ("304 Not Modified", "")
+                    } else {
+                        ("200 OK", &format!("ETag: {etag}\r\n")[..])
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}\r\n",
+                        if status.starts_with("304") {
+                            0
+                        } else {
+                            body.len()
+                        }
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    if status.starts_with("200") {
+                        let _ = stream.write_all(body.as_bytes());
+                    }
+                }
+            });
+            Self { addr }
+        }
+    }
+
+    /// ureq 3.4 surfaces 304 as `Ok(status=304)` with an empty body (not
+    /// as an error): revalidation must parse the cached copy and never
+    /// clobber it with the empty body.
+    #[test]
+    fn revalidation_serves_cached_copy_on_304() {
+        let server = RevalidateServer::start(INDEX_ENTRY, "\"tag-1\"");
+        let dir = tempfile::tempdir().unwrap();
+        let config = RegistryConfig {
+            index_url: format!("http://{}", server.addr),
+            dl: String::new(),
+            api: None,
+        };
+        let client = IndexClient::new(dir.path().join("index"), config);
+
+        // Cold fetch: 200 + body, cached with the ETag.
+        let versions = client.versions("foo").unwrap();
+        assert_eq!(versions.len(), 1);
+        let cache_file = dir.path().join("index/3/f/foo");
+        let cached = fs::read_to_string(&cache_file).unwrap();
+        assert!(cached.contains("1.0.0"), "{cached}");
+
+        // Warm revalidation: the server answers 304; the cached copy is
+        // parsed and left intact.
+        let versions = client.versions("foo").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].vers, Version::new(1, 0, 0));
+        assert_eq!(fs::read_to_string(&cache_file).unwrap(), cached);
     }
 }

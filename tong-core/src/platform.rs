@@ -65,6 +65,8 @@ pub struct TargetFacts {
     pub env: String,
     /// `target_vendor` value (e.g. `apple`, `unknown`, `pc`).
     pub vendor: String,
+    /// `target_pointer_width` value (`64` or `32`).
+    pub pointer_width: String,
 }
 
 /// Parses a rustc-style target triple into [`TargetFacts`]. Supported
@@ -107,12 +109,18 @@ pub fn parse_triple(triple: &str) -> Result<TargetFacts, CfgError> {
         }
         _ => return Err(CfgError::UnsupportedTriple(triple.to_owned())),
     };
+    let pointer_width = if arch == "x86_64" || arch == "aarch64" {
+        "64".to_owned()
+    } else {
+        "32".to_owned()
+    };
     Ok(TargetFacts {
         arch,
         os,
         family,
         env,
         vendor,
+        pointer_width,
     })
 }
 
@@ -121,9 +129,11 @@ pub fn parse_triple(triple: &str) -> Result<TargetFacts, CfgError> {
 /// Supports `all(...)`, `any(...)`, `not(...)`, and the predicates
 /// `target_os`, `target_arch`, `target_family`, `target_env`,
 /// `target_vendor`, `unix`, and `windows`. The expression may be wrapped in
-/// `cfg(...)` (as in `[target.'cfg(unix)'.dependencies]`). `feature = "x"`
-/// and unknown predicates are [`CfgError::Unsupported`] — targets never see
-/// feature cfgs, and Cargo rejects them in target tables too.
+/// `cfg(...)` (as in `[target.'cfg(unix)'.dependencies]`).
+/// Unknown predicates evaluate to `false` — custom cfgs (e.g. tokio's
+/// `cfg(loom)`) are never set by the compiler, exactly as Cargo treats
+/// them. `feature = "..."` is an error: targets never see feature cfgs,
+/// and Cargo rejects them in target tables too.
 pub fn eval_cfg(expr: &str, triple: &str) -> Result<bool, CfgError> {
     let facts = parse_triple(triple)?;
     let text = expr.trim();
@@ -150,8 +160,8 @@ enum CfgExpr {
 pub enum CfgError {
     /// The triple is not one of the supported host triples.
     UnsupportedTriple(String),
-    /// `feature = "..."` or an unknown predicate (Cargo rejects these in
-    /// target tables too).
+    /// `feature = "..."` (targets never see feature cfgs; Cargo rejects
+    /// them in target tables too).
     Unsupported(String),
     /// Malformed expression.
     Malformed(String),
@@ -264,12 +274,16 @@ fn parse_expr(tokens: &mut Tokenizer<'_>) -> Result<CfgExpr, CfgError> {
         "all" | "any" => {
             tokens.eat('(')?;
             let mut items = Vec::new();
-            loop {
-                items.push(parse_expr(tokens)?);
-                if tokens.peek() == Some(',') {
-                    tokens.eat(',')?;
-                } else {
-                    break;
+            // Empty argument lists are legal (e.g. `cfg(any())` appears in
+            // generated manifests): `all()` is true, `any()` is false.
+            if tokens.peek() != Some(')') {
+                loop {
+                    items.push(parse_expr(tokens)?);
+                    if tokens.peek() == Some(',') {
+                        tokens.eat(',')?;
+                    } else {
+                        break;
+                    }
                 }
             }
             tokens.eat(')')?;
@@ -319,6 +333,7 @@ fn eval_predicate(name: &str, value: Option<&str>, facts: &TargetFacts) -> Resul
             "target_arch" => Some(&facts.arch),
             "target_env" => Some(&facts.env),
             "target_vendor" => Some(&facts.vendor),
+            "target_pointer_width" => Some(&facts.pointer_width),
             "target_family" | "unix" | "windows" => Some(&facts.family),
             "feature" => {
                 return Err(CfgError::Unsupported(format!(
@@ -326,10 +341,12 @@ fn eval_predicate(name: &str, value: Option<&str>, facts: &TargetFacts) -> Resul
                      target-specific deps"
                 )));
             }
+            // Unknown predicates are never set by the compiler: the
+            // target never matches (cargo semantics — tokio's
+            // `cfg(loom)` table is dropped, not an error).
             other => {
-                return Err(CfgError::Unsupported(format!(
-                    "unknown predicate {other:?}"
-                )));
+                let _ = other;
+                return Ok(false);
             }
         };
         return Ok(key.map(String::as_str) == Some(expected));
@@ -341,9 +358,11 @@ fn eval_predicate(name: &str, value: Option<&str>, facts: &TargetFacts) -> Resul
             "feature = {:?}; feature cfgs never apply to target-specific deps",
             value.unwrap_or("")
         ))),
-        other => Err(CfgError::Malformed(format!(
-            "bare predicate {other:?} needs a value"
-        ))),
+        // A bare custom predicate (e.g. `loom`) is never set: false.
+        other => {
+            let _ = other;
+            Ok(false)
+        }
     }
 }
 
@@ -416,10 +435,16 @@ mod tests {
             eval_cfg("feature = \"foo\"", "aarch64-apple-darwin"),
             Err(CfgError::Unsupported(_))
         ));
-        assert!(matches!(
-            eval_cfg("target_pointer_width = \"64\"", "aarch64-apple-darwin"),
-            Err(CfgError::Unsupported(_))
-        ));
+        assert!(eval_cfg("target_pointer_width = \"64\"", "aarch64-apple-darwin").unwrap());
+        assert!(!eval_cfg("target_pointer_width = \"32\"", "aarch64-apple-darwin").unwrap());
+        // Custom predicates are never set by the compiler: false, not an
+        // error (tokio's `cfg(loom)` tables are dropped, cargo-style).
+        assert!(!eval_cfg("loom", "aarch64-apple-darwin").unwrap());
+        assert!(!eval_cfg("target_unknown = \"x\"", "aarch64-apple-darwin").unwrap());
+        // Empty composites: `all()` true, `any()` false (generated
+        // manifests emit `cfg(any())`).
+        assert!(eval_cfg("all()", "aarch64-apple-darwin").unwrap());
+        assert!(!eval_cfg("any()", "aarch64-apple-darwin").unwrap());
         assert!(eval_cfg("all(unix", "aarch64-apple-darwin").is_err());
         assert!(eval_cfg("", "aarch64-apple-darwin").is_err());
     }

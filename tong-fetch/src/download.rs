@@ -41,21 +41,24 @@ pub fn fetch_crate(
     config: &RegistryConfig,
     pkg: &ResolvedPackage,
 ) -> Result<TreeDigest, FetchError> {
-    let blob_path = crate_blob_path(cas.root(), &pkg.checksum);
+    let checksum = pkg
+        .checksum
+        .as_deref()
+        .expect("registry packages always carry a checksum");
+    let blob_path = crate_blob_path(cas.root(), checksum);
     if !blob_path.is_file() {
-        let url = config.download_url(&pkg.name, &pkg.version, &pkg.checksum);
-        println!("  downloading {} {}", pkg.name, pkg.version);
+        let url = config.download_url(&pkg.name, &pkg.version, checksum);
         let bytes = fetch_crate_bytes(&url)?;
-        verify_crate_bytes(&bytes, &pkg.checksum, &pkg.name)?;
+        verify_crate_bytes(&bytes, checksum, &pkg.name)?;
         fs::create_dir_all(blob_path.parent().expect("sources dir"))?;
         fs::write(&blob_path, bytes)?;
     } else {
         // Content-addressing is only sound if the stored blob really has
         // the expected checksum; verify instead of trusting the path.
-        verify_crate_bytes(&fs::read(&blob_path)?, &pkg.checksum, &pkg.name)?;
+        verify_crate_bytes(&fs::read(&blob_path)?, checksum, &pkg.name)?;
     }
 
-    let checkout = checkout_dir(cas.root(), &pkg.name, &pkg.version, &pkg.checksum);
+    let checkout = checkout_dir(cas.root(), &pkg.name, &pkg.version, checksum);
     if !checkout.is_dir() {
         extract_crate(&blob_path, &checkout)?;
     }
@@ -208,10 +211,10 @@ mod tests {
         let pkg = ResolvedPackage {
             name: "foo".to_owned(),
             version: Version::new(1, 0, 0),
-            checksum: checksum.to_owned(),
-            dependencies: Vec::new(),
-            features: Default::default(),
+            checksum: Some(checksum.to_owned()),
             yanked: false,
+            local: false,
+            dependencies: Vec::new(),
         };
         let config = RegistryConfig::crates_io();
         let tree = fetch_crate(&cas, &config, &pkg).unwrap();

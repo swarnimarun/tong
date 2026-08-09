@@ -181,8 +181,9 @@ speed without dropping the content identity.
 
 ## Follow-ups
 
-- Cache GC: entries are ~1–2 MB per toolchain and currently never
-  pruned; add age/size-based pruning when multiple toolchains accumulate.
+- ~~Cache GC~~ — done 2026-08-09: entries are evicted oldest-first
+  (never the just-written entry) beyond 64 entries / 512 MB total
+  (`ToolchainCache::prune`).
 - Phase 3 (git-style stat fast path for source trees) and Phase 4
   (shared/remote cache) remain deferred — see
   `docs/fingerprint-cache.md`.

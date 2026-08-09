@@ -80,6 +80,9 @@ enum DepSpec {
 struct Ctx {
     logical_id: ActionId,
     mnemonic: String,
+    /// Whether the owning package is outside the workspace (a dependency):
+    /// `tong build --deps-only` executes only external actions.
+    external: bool,
     kind: CtxKind,
     source_tree: TreeDigest,
     rustc: BlobDigest,
@@ -129,6 +132,14 @@ struct BuildScriptRunSpec {
     host_triple: String,
     opt_level: String,
     debug: bool,
+    /// The real rustc path (build scripts expect `$RUSTC`, cargo sets it).
+    rustc_path: PathBuf,
+    /// Profile name (`$PROFILE`).
+    profile: String,
+    /// `CARGO_CFG_*` values computed from the host triple.
+    cfgs: Vec<(String, String)>,
+    /// The package's activated features (`CARGO_FEATURE_*`).
+    features: Vec<String>,
 }
 
 struct TestRunSpec {
@@ -443,6 +454,7 @@ impl<'a> RustBackend<'a> {
             let run_ctx = Ctx {
                 logical_id: run_id.clone(),
                 mnemonic: "RustTestRun".to_owned(),
+                external: self.pkg_external(pkg),
                 kind: CtxKind::TestRun(TestRunSpec {
                     compile: compile_id.clone(),
                     binary: target.name.clone(),
@@ -610,9 +622,13 @@ impl<'a> RustBackend<'a> {
                 script_tree = self.narrowed_script_tree(pkg, script_tree, directives)?;
                 // rerun-if-env-changed: declared env vars become explicit
                 // run-action inputs (the digest then covers their values).
+                // An unset var stays absent — forcing it to "" would change
+                // what the script observes (a script's `unwrap_or(default)`
+                // fallback must keep working on rebuilds).
                 for var in &directives.rerun_if_env_changed {
-                    let value = std::env::var(var).unwrap_or_default();
-                    run_env.insert(var.clone(), value);
+                    if let Ok(value) = std::env::var(var) {
+                        run_env.insert(var.clone(), value);
+                    }
                 }
             }
             let script = self.crate_root_for(&pkg.name, script);
@@ -641,6 +657,7 @@ impl<'a> RustBackend<'a> {
             let run_ctx = Ctx {
                 logical_id: run_id.clone(),
                 mnemonic: "RustBuildScriptRun".to_owned(),
+                external: self.pkg_external(pkg),
                 kind: CtxKind::BuildScriptRun(BuildScriptRunSpec {
                     compile: compile_id.clone(),
                     binary: binary.clone(),
@@ -649,6 +666,16 @@ impl<'a> RustBackend<'a> {
                     host_triple: self.toolchain.host_triple.clone(),
                     opt_level: self.profile.opt_level.clone(),
                     debug: self.profile.debug,
+                    rustc_path: self.toolchain.rustc.clone(),
+                    profile: self.profile_name.clone(),
+                    cfgs: build_script_cfgs(&self.toolchain.host_triple),
+                    features: self
+                        .model
+                        .feature_map
+                        .packages
+                        .get(&pkg.name)
+                        .map(|features| features.iter().cloned().collect())
+                        .unwrap_or_default(),
                 }),
                 source_tree: run_source_tree,
                 rustc: self.toolchain.rustc_blob,
@@ -657,6 +684,7 @@ impl<'a> RustBackend<'a> {
                 global_env: self.model.global_env.clone(),
                 pkg_env: {
                     let mut env = pkg.env.clone();
+                    env.extend(self.pkg_version_env(pkg));
                     env.extend(run_env);
                     env
                 },
@@ -767,6 +795,18 @@ impl<'a> RustBackend<'a> {
         Ok(())
     }
 
+    /// Captured source-tree digests of every package (the inputs of the
+    /// planned graph). `tong build --deps-only` records them in the
+    /// build-state manifest so GC keeps the local packages' manifest-only
+    /// trees — the deps stage captures them and the app stage re-captures
+    /// identical digests (docs/docker-caching.md).
+    pub fn captured_source_trees(&self) -> Vec<tong_core::digest::Digest> {
+        self.source_trees
+            .values()
+            .map(|tree| tree.digest())
+            .collect()
+    }
+
     /// Final runnable artifacts (binaries) with their runtime closures.
     pub fn final_artifacts(&self) -> Vec<FinalArtifact> {
         let mut out = Vec::new();
@@ -856,13 +896,21 @@ impl<'a> RustBackend<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        let extra_flags: Vec<String> = self
+        let mut extra_flags: Vec<String> = self
             .model
             .global_rustflags
             .iter()
             .chain(pkg.rustflags.iter())
             .cloned()
             .collect();
+        // Cargo passes `--cap-lints allow` to registry dependencies (lints
+        // of external crates are the maintainers' concern, and deny-by-
+        // default lints in newer rustc would break old crates like mime).
+        // Workspace packages keep their lints.
+        if self.pkg_external(pkg) {
+            extra_flags.push("--cap-lints".to_owned());
+            extra_flags.push("allow".to_owned());
+        }
         // LTO is not supported for proc-macro crate types; Cargo disables it
         // automatically.
         let mut profile_flags = self.profile.rustc_flags();
@@ -883,6 +931,7 @@ impl<'a> RustBackend<'a> {
         let ctx = Ctx {
             logical_id: ActionId(logical_id.to_owned()),
             mnemonic: mnemonic.to_owned(),
+            external: self.pkg_external(pkg),
             kind: CtxKind::Compile(CompileSpec {
                 crate_name,
                 edition: pkg.edition,
@@ -903,7 +952,11 @@ impl<'a> RustBackend<'a> {
             bundle: Some(self.toolchain.bundle_ref()),
             properties: self.base_properties(),
             global_env: self.model.global_env.clone(),
-            pkg_env: pkg.env.clone(),
+            pkg_env: {
+                let mut env = pkg.env.clone();
+                env.extend(self.pkg_version_env(pkg));
+                env
+            },
             cc,
             profile_flags: profile_flags.clone(),
         };
@@ -913,12 +966,44 @@ impl<'a> RustBackend<'a> {
         Ok(id)
     }
 
+    /// Whether a package belongs to the workspace (`model.members`);
+    /// everything else — registry, git, and path-outside-workspace
+    /// dependencies — is external. `tong build --deps-only` executes only
+    /// external actions.
+    fn pkg_external(&self, pkg: &Package) -> bool {
+        !self.model.members.contains(&pkg.name)
+    }
+
+    /// `CARGO_PKG_VERSION_*` env vars (crates use `env!` at compile time).
+    fn pkg_version_env(&self, pkg: &Package) -> Vec<(String, String)> {
+        let Ok(version) = semver::Version::parse(&pkg.version) else {
+            return Vec::new();
+        };
+        vec![
+            (
+                "CARGO_PKG_VERSION_MAJOR".to_owned(),
+                version.major.to_string(),
+            ),
+            (
+                "CARGO_PKG_VERSION_MINOR".to_owned(),
+                version.minor.to_string(),
+            ),
+            (
+                "CARGO_PKG_VERSION_PATCH".to_owned(),
+                version.patch.to_string(),
+            ),
+            ("CARGO_PKG_VERSION_PRE".to_owned(), version.pre.to_string()),
+        ]
+    }
+
     fn boxed(&self, ctx: Ctx) -> PlannedAction {
         let logical_id = ctx.logical_id.clone();
         let mnemonic = ctx.mnemonic.clone();
+        let external = ctx.external;
         PlannedAction {
             logical_id,
             mnemonic,
+            external,
             deps: ctx.deps(),
             make: Box::new(move |completed, cas| concretize(&ctx, completed, cas)),
         }
@@ -1056,8 +1141,17 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Whether a dep edge is live: non-optional edges always; optional
-    /// edges only when the feature resolution activated them.
+    /// edges only when the feature resolution activated them; target-
+    /// specific edges only when the target matches the host (the import
+    /// keeps every target's deps in the model — cargo locks all targets —
+    /// so the plan filters here).
     fn dep_active(&self, pkg_name: &str, dep: &Dep) -> bool {
+        if let Some(target) = &dep.target {
+            let host = self.toolchain.host_triple.clone();
+            if !crate::cargo_import::target_matches(target, &host, "dependency").unwrap_or(false) {
+                return false;
+            }
+        }
         if !dep.optional {
             return true;
         }
@@ -1082,8 +1176,9 @@ impl<'a> RustBackend<'a> {
             .find(|p| p.name == dep.package)
             .ok_or_else(|| {
                 PlanError::Message(format!(
-                    "dependency {:?} of {:?} names no imported package or cc_import \
-                     (registry dependencies are unsupported until Phase 3 locking)",
+                    "dependency {:?} of {:?} names no imported package or cc_import; \
+                     if it is a registry dependency missing from Tong.lock, run \
+                     `tong lock` (the lockfile may be stale for the requested features)",
                     dep.extern_name, dep.package
                 ))
             })?;
@@ -1272,6 +1367,30 @@ impl Ctx {
 }
 
 /// Concretizes a planned action into a full `ActionSpec`.
+/// `CARGO_CFG_*` values for build scripts, from the host triple (cargo
+/// sets these for every build script).
+fn build_script_cfgs(host_triple: &str) -> Vec<(String, String)> {
+    let facts = tong_core::platform::parse_triple(host_triple).unwrap_or_default();
+    let mut out = vec![
+        ("target_arch".to_owned(), facts.arch.clone()),
+        ("target_os".to_owned(), facts.os.clone()),
+        ("target_family".to_owned(), facts.family.clone()),
+        ("target_env".to_owned(), facts.env.clone()),
+        ("target_vendor".to_owned(), facts.vendor.clone()),
+        (
+            "target_pointer_width".to_owned(),
+            facts.pointer_width.clone(),
+        ),
+    ];
+    if facts.family == "unix" {
+        out.push(("unix".to_owned(), String::new()));
+    }
+    if facts.family == "windows" {
+        out.push(("windows".to_owned(), String::new()));
+    }
+    out
+}
+
 fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionSpec, PlanError> {
     let mut mounts: Vec<(RelativePath, TreeDigest)> =
         vec![(RelativePath::new(".").unwrap(), ctx.source_tree)];
@@ -1293,7 +1412,16 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                 ("HOST".to_owned(), spec.host_triple.clone()),
                 ("OPT_LEVEL".to_owned(), spec.opt_level.clone()),
                 ("DEBUG".to_owned(), spec.debug.to_string()),
+                ("PROFILE".to_owned(), spec.profile.clone()),
                 ("NUM_JOBS".to_owned(), "1".to_owned()),
+                ("RUSTC".to_owned(), spec.rustc_path.display().to_string()),
+                (
+                    "CARGO".to_owned(),
+                    std::env::current_exe()
+                        .unwrap_or_default()
+                        .display()
+                        .to_string(),
+                ),
                 ("CARGO_PKG_NAME".to_owned(), spec.pkg_name.clone()),
                 ("CARGO_PKG_VERSION".to_owned(), spec.pkg_version.clone()),
                 (
@@ -1301,6 +1429,34 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                     format!("{EXEC_ROOT_VAR}/in"),
                 ),
             ]);
+            for (name, value) in &spec.cfgs {
+                env.insert(
+                    format!("CARGO_CFG_{}", name.to_ascii_uppercase()),
+                    value.clone(),
+                );
+            }
+            for feature in &spec.features {
+                let key = format!(
+                    "CARGO_FEATURE_{}",
+                    feature.to_ascii_uppercase().replace('-', "_")
+                );
+                env.insert(key, "1".to_owned());
+            }
+            if let Ok(version) = semver::Version::parse(&spec.pkg_version) {
+                env.insert(
+                    "CARGO_PKG_VERSION_MAJOR".to_owned(),
+                    version.major.to_string(),
+                );
+                env.insert(
+                    "CARGO_PKG_VERSION_MINOR".to_owned(),
+                    version.minor.to_string(),
+                );
+                env.insert(
+                    "CARGO_PKG_VERSION_PATCH".to_owned(),
+                    version.patch.to_string(),
+                );
+                env.insert("CARGO_PKG_VERSION_PRE".to_owned(), version.pre.to_string());
+            }
         }
         CtxKind::TestRun(spec) => {
             // The test binary runs with the package source tree as its

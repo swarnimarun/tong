@@ -147,7 +147,9 @@ Components:
 3. Cache location: `$TONG_CACHE_DIR` → `$HOME/.cache/tong` (unix);
    atomic writes (tmp + rename, marker file commits the entry); corrupt
    or partial entries are treated as misses and overwritten.
-4. No GC initially (entries are ~1–2 MB per toolchain); note in docs.
+4. Bounded growth: entries are pruned oldest-first (never the
+   just-written entry) beyond 64 entries / 512 MB total
+   (implemented 2026-08-09).
 5. PLAN.md §5 alignment note: the cache is per-machine local, never
    published to a shared cache; toolchain identity remains a content
    digest in every action.
