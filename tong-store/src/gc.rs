@@ -212,7 +212,7 @@ pub fn sweep(cas: &Cas, state: &StateStore, opts: &GcOptions) -> io::Result<GcRe
     }
 
     let mut deleted: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut delete = |candidate: &Candidate, report: &mut GcReport, deleted: &mut BTreeSet<PathBuf>| -> io::Result<()> {
+    let delete = |candidate: &Candidate, report: &mut GcReport, deleted: &mut BTreeSet<PathBuf>| -> io::Result<()> {
         if !opts.dry_run {
             fs::remove_file(&candidate.path)?;
         }
@@ -245,28 +245,28 @@ pub fn sweep(cas: &Cas, state: &StateStore, opts: &GcOptions) -> io::Result<GcRe
     }
 
     // --- Sweep by budget ---------------------------------------------------
-    if let Some(budget) = opts.max_size {
-        if report.store_bytes > budget {
-            let mut remaining: Vec<&Candidate> = candidates
-                .iter()
-                .filter(|candidate| !deleted.contains(&candidate.path))
-                .filter(|candidate| candidate.mtime_secs + BUDGET_AGE_FLOOR.as_secs() <= opts.now)
-                .collect();
-            remaining.sort_by_key(|candidate| candidate.mtime_secs);
-            let mut current = report.store_bytes - report.freed_bytes;
-            for candidate in remaining {
-                if current <= budget {
-                    break;
-                }
-                let is_result = candidate.path.starts_with(root.join("results"));
-                if is_result {
-                    report.deleted_results += 1;
-                } else {
-                    report.deleted_objects += 1;
-                }
-                current -= candidate.size;
-                delete(candidate, &mut report, &mut deleted)?;
+    if let Some(budget) = opts.max_size
+        && report.store_bytes > budget
+    {
+        let mut remaining: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|candidate| !deleted.contains(&candidate.path))
+            .filter(|candidate| candidate.mtime_secs + BUDGET_AGE_FLOOR.as_secs() <= opts.now)
+            .collect();
+        remaining.sort_by_key(|candidate| candidate.mtime_secs);
+        let mut current = report.store_bytes - report.freed_bytes;
+        for candidate in remaining {
+            if current <= budget {
+                break;
             }
+            let is_result = candidate.path.starts_with(root.join("results"));
+            if is_result {
+                report.deleted_results += 1;
+            } else {
+                report.deleted_objects += 1;
+            }
+            current -= candidate.size;
+            delete(candidate, &mut report, &mut deleted)?;
         }
     }
 
@@ -465,10 +465,10 @@ mod tests {
 
         // A blob and tree only referenced by the dead action.
         let dead_blob = blob_in(&cas, b"dead-blob");
-        let dead_tree = tree_in(&cas, "f", dead_blob);
+        let _dead_tree = tree_in(&cas, "f", dead_blob);
         let live_blob = blob_in(&cas, b"live-blob");
         let live_tree = tree_in(&cas, "f", live_blob);
-        let bundle = bundle_in(&cas);
+        let _bundle = bundle_in(&cas);
 
         // The manifest's source tree keeps the live blob/tree alive.
         let mut manifest = manifest_marking(&cas, &[live]);
