@@ -2,10 +2,10 @@
 //!
 //! Cargo manifests are translated into the same [`RustModel`] the native
 //! `Tong.toml` targets produce; Cargo is never invoked during a Tong build.
-//! Version 1 supports offline workspace-local projects: path dependencies
-//! only. Registry and git dependencies fail with a targeted diagnostic —
-//! locked fetching is Phase 3 (PLAN.md section 9) and must not silently
-//! change semantics (section 15, Phase 5 exit criteria).
+//! Path and workspace dependencies import directly; registry dependencies
+//! resolve through `Tong.lock` + the source store (the driver's
+//! [`LockedSourceProvider`]). Git dependencies are not yet supported and
+//! fail with a targeted diagnostic.
 
 use std::collections::BTreeMap;
 use std::fs;
