@@ -168,6 +168,9 @@ pub struct TargetConfig {
     /// Dependencies as labels (`:name`).
     #[serde(default)]
     pub deps: Vec<String>,
+    /// Dev-dependencies as labels (`:name`) — used by `rust_test` targets.
+    #[serde(default)]
+    pub dev_deps: Vec<String>,
     /// Extra rustc flags.
     #[serde(default)]
     pub rustflags: Vec<String>,

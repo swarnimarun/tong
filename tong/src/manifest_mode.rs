@@ -40,6 +40,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                         path,
                     }),
                     bins: Vec::new(),
+                    tests: Vec::new(),
                     build_script: target.build_script.as_ref().map(PathBuf::from),
                     deps: parse_deps(&target.deps),
                     build_deps: Vec::new(),
@@ -66,6 +67,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                         name: name.clone(),
                         path,
                     }],
+                    tests: Vec::new(),
                     build_script: target.build_script.as_ref().map(PathBuf::from),
                     deps: parse_deps(&target.deps),
                     build_deps: Vec::new(),
@@ -85,6 +87,37 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     });
                 }
                 model.packages.push(pkg);
+            }
+            "rust_test" => {
+                // A test target: crate_root (default `tests/<name>.rs`) +
+                // normal deps + dev-deps, lowering to the same TestTarget
+                // model Cargo's `[[test]]` produces.
+                let path = target
+                    .crate_root
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("tests/{name}.rs")));
+                model.packages.push(Package {
+                    name: name.clone(),
+                    dir: root.to_path_buf(),
+                    version: "0.0.0".to_owned(),
+                    edition: parse_edition(target.edition.as_deref()),
+                    lib: None,
+                    bins: Vec::new(),
+                    tests: vec![tong_rust::model::TestTarget {
+                        name: name.clone(),
+                        path,
+                        harness: true,
+                    }],
+                    build_script: None,
+                    deps: parse_deps(&target.deps),
+                    build_deps: Vec::new(),
+                    dev_deps: parse_deps(&target.dev_deps),
+                    features: BTreeMap::new(),
+                    has_default_feature: false,
+                    rustflags: target.rustflags.clone(),
+                    env: target.env.clone(),
+                });
             }
             "cc_import" => {
                 let shared = target.shared.clone().map(PathBuf::from).unwrap_or_default();

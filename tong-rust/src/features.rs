@@ -398,6 +398,7 @@ mod tests {
             edition: crate::model::Edition::E2021,
             lib: None,
             bins: Vec::new(),
+            tests: Vec::new(),
             build_script: None,
             deps: Vec::new(),
             build_deps: Vec::new(),

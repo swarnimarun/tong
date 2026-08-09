@@ -191,7 +191,7 @@ fn semantic_changes_change_the_digest() {
     assert_ne!(base_digest, network.digest());
 
     let mut not_cacheable = base.clone();
-    not_cacheable.cache_policy = CachePolicy::Disabled;
+    not_cacheable.cache_policy = CachePolicy::NoCache;
     assert_ne!(base_digest, not_cacheable.digest());
 
     let mut other_schema = base.clone();

@@ -17,6 +17,6 @@ pub use cargo_import::{CargoImportError, import_cargo_workspace};
 pub use features::{FeatureError, FeatureMap, FeatureRequest, resolve_features};
 pub use model::{
     BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PanicStrategy,
-    ProfileSpec, RustModel,
+    ProfileSpec, RustModel, TestTarget,
 };
 pub use toolchain::{SystemRust, ToolchainError, capture_system_rust, host_triple};

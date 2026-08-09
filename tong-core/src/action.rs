@@ -93,16 +93,17 @@ pub enum CachePolicy {
     /// Result may be memoized, cached locally, and published to shared
     /// caches subject to hermeticity level.
     Enabled,
-    /// Result must never be cached or uploaded — for example actions
-    /// receiving secrets (PLAN.md section 5).
-    Disabled,
+    /// Result must never be cached or uploaded — for example test runs
+    /// (test-result caching is PLAN Phase 8) or actions receiving secrets
+    /// (PLAN.md section 5).
+    NoCache,
 }
 
 impl CanonicalEncode for CachePolicy {
     fn encode(&self, enc: &mut Encoder) {
         enc.write_u32(match self {
             Self::Enabled => 0,
-            Self::Disabled => 1,
+            Self::NoCache => 1,
         });
     }
 }

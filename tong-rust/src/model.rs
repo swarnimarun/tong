@@ -41,6 +41,8 @@ pub struct Package {
     pub lib: Option<LibTarget>,
     /// Binary targets.
     pub bins: Vec<BinTarget>,
+    /// Test targets (`[[test]]`, `[[bench]]`, auto lib unit test).
+    pub tests: Vec<TestTarget>,
     /// Build script, relative to `dir`.
     pub build_script: Option<PathBuf>,
     /// Normal dependencies.
@@ -108,6 +110,18 @@ pub struct BinTarget {
     pub path: PathBuf,
 }
 
+/// A test target (`[[test]]`, `[[bench]]`, or the auto-derived lib unit
+/// test).
+#[derive(Clone, Debug)]
+pub struct TestTarget {
+    /// Target name (the test binary name).
+    pub name: String,
+    /// Crate root, relative to the package dir.
+    pub path: PathBuf,
+    /// Whether the target uses the libtest harness (`--test`).
+    pub harness: bool,
+}
+
 /// A dependency on another package in the workspace.
 #[derive(Clone, Debug)]
 pub struct Dep {
@@ -162,7 +176,64 @@ pub struct CcImport {
     pub link_name: String,
 }
 
-/// A resolved build profile (PLAN.md section 8.5).
+/// The crate name of a package's library: the `[lib] name` override when
+/// present, else the sanitized package name. Binaries, tests, and
+/// dependents must agree on this for `--crate-name` and the rlib filename.
+pub fn lib_crate_name(pkg: &Package) -> String {
+    match &pkg.lib {
+        Some(lib) => lib
+            .name
+            .as_deref()
+            .map(crate_name)
+            .unwrap_or_else(|| crate_name(&pkg.name)),
+        None => crate_name(&pkg.name),
+    }
+}
+
+/// Sanitizes a package/target name for rustc (`--crate-name`).
+pub fn crate_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_names_sanitize_hyphens() {
+        assert_eq!(crate_name("voxel-city"), "voxel_city");
+        assert_eq!(crate_name("plain"), "plain");
+    }
+
+    #[test]
+    fn lib_crate_name_uses_lib_override() {
+        let mut pkg = Package {
+            name: "my-lib".to_owned(),
+            dir: PathBuf::from("."),
+            version: "0.1.0".to_owned(),
+            edition: Edition::E2021,
+            lib: None,
+            bins: Vec::new(),
+            tests: Vec::new(),
+            build_script: None,
+            deps: Vec::new(),
+            build_deps: Vec::new(),
+            dev_deps: Vec::new(),
+            features: BTreeMap::new(),
+            has_default_feature: false,
+            rustflags: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        assert_eq!(lib_crate_name(&pkg), "my_lib");
+        pkg.lib = Some(LibTarget {
+            name: Some("renamed".to_owned()),
+            crate_types: Vec::new(),
+            proc_macro: false,
+            path: PathBuf::from("src/lib.rs"),
+        });
+        assert_eq!(lib_crate_name(&pkg), "renamed");
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ProfileSpec {
     /// Optimization level: `0`-`3`, `s`, `z`.

@@ -29,7 +29,9 @@ use tong_graph::{Completed, PlanError, PlannedAction};
 use tong_store::{CAPTURE_EXCLUDES, Cas};
 
 use crate::build_directives::{Directives, parse_directives};
-use crate::model::{CrateType, Dep, Edition, Package, ProfileSpec, RustModel};
+use crate::model::{
+    CrateType, Dep, Edition, Package, ProfileSpec, RustModel, crate_name, lib_crate_name,
+};
 use crate::toolchain::{SystemRust, dll_extension, host_platform};
 
 /// A final runnable artifact produced by the build.
@@ -92,6 +94,7 @@ struct Ctx {
 enum CtxKind {
     Compile(CompileSpec),
     BuildScriptRun(BuildScriptRunSpec),
+    TestRun(TestRunSpec),
 }
 
 struct CompileSpec {
@@ -113,6 +116,9 @@ struct CompileSpec {
     feature_cfgs: Vec<String>,
     /// Direct deps plus the transitive closure (all mounted at `deps/`).
     transitive_deps: Vec<DepSpec>,
+    /// The package's library is a proc macro (test compiles need
+    /// `--extern proc_macro` too).
+    is_proc_macro: bool,
 }
 
 struct BuildScriptRunSpec {
@@ -123,6 +129,13 @@ struct BuildScriptRunSpec {
     host_triple: String,
     opt_level: String,
     debug: bool,
+}
+
+struct TestRunSpec {
+    compile: ActionId,
+    binary: String,
+    harness: bool,
+    args: Vec<String>,
 }
 
 /// The Rust backend: plans actions from a [`RustModel`].
@@ -140,6 +153,10 @@ pub struct RustBackend<'a> {
     cc: BTreeMap<String, CcInfo>,
     cc_closure: BTreeMap<String, Vec<String>>,
     planned_ids: BTreeMap<String, ActionId>,
+    /// Whether test targets are planned and run (`tong test`).
+    tests_enabled: bool,
+    /// Arguments passed to the test binaries (after `--`).
+    test_args: Vec<String>,
 }
 
 impl<'a> RustBackend<'a> {
@@ -149,6 +166,19 @@ impl<'a> RustBackend<'a> {
         model: &'a RustModel,
         toolchain: SystemRust,
         profile_name: &str,
+    ) -> Result<Self, PlanError> {
+        Self::with_tests(cas, model, toolchain, profile_name, false, &[])
+    }
+
+    /// Creates a backend; `tests_enabled` plans and runs test targets,
+    /// `test_args` are passed to the test binaries.
+    pub fn with_tests(
+        cas: Cas,
+        model: &'a RustModel,
+        toolchain: SystemRust,
+        profile_name: &str,
+        tests_enabled: bool,
+        test_args: &[String],
     ) -> Result<Self, PlanError> {
         let profile = model
             .profiles
@@ -166,6 +196,8 @@ impl<'a> RustBackend<'a> {
             cc: BTreeMap::new(),
             cc_closure: BTreeMap::new(),
             planned_ids: BTreeMap::new(),
+            tests_enabled,
+            test_args: test_args.to_vec(),
         })
     }
 
@@ -288,7 +320,7 @@ impl<'a> RustBackend<'a> {
 
         // 5. Plan actions. Libraries, proc macros, and build scripts first
         //    (their planned ids must exist before binaries resolve their
-        //    dependency actions), then binaries.
+        //    dependency actions), then binaries, then tests.
         let mut actions = Vec::new();
         for pkg in &self.model.packages {
             self.plan_package_library(&mut actions, pkg)?;
@@ -296,8 +328,87 @@ impl<'a> RustBackend<'a> {
         for pkg in &self.model.packages {
             self.plan_package_bins(&mut actions, pkg)?;
         }
+        if self.tests_enabled {
+            for pkg in &self.model.packages {
+                self.plan_package_tests(&mut actions, pkg)?;
+            }
+        }
 
         Ok(actions)
+    }
+
+    /// Plans a package's test targets: one compile action per target
+    /// (`rustc --test`, deps + dev-deps + the package's own lib) and one
+    /// uncached run action executing the test binary.
+    fn plan_package_tests(
+        &mut self,
+        actions: &mut Vec<PlannedAction>,
+        pkg: &Package,
+    ) -> Result<(), PlanError> {
+        let source_tree = self.source_trees[&pkg.name];
+        let cc = self.cc_for(&pkg.name);
+        let bs_run: Option<ActionId> = self
+            .planned_ids
+            .get(&format!("bs-run:{}", pkg.name))
+            .cloned();
+
+        for target in &pkg.tests {
+            // deps + dev-deps + the package's own library.
+            let mut deps = pkg.deps.clone();
+            deps.extend(pkg.dev_deps.iter().cloned());
+            if pkg.lib.is_some() {
+                deps.insert(
+                    0,
+                    Dep {
+                        extern_name: lib_crate_name(pkg),
+                        package: pkg.name.clone(),
+                        optional: false,
+                        default_features: true,
+                        features: Vec::new(),
+                        target: None,
+                    },
+                );
+            }
+            let crate_name = crate_name(&target.name);
+            let compile_id = self.plan_compile(
+                actions,
+                &format!("test-compile:{}:{}", pkg.name, target.name),
+                &format!("rust:test-compile:{}:{}", pkg.name, target.name),
+                "RustTestCompile",
+                pkg,
+                source_tree,
+                cc.clone(),
+                crate_name,
+                "test",
+                Some(target.name.clone()),
+                &deps,
+                bs_run.clone(),
+                self.crate_root_for(&pkg.name, &target.path),
+            )?;
+
+            let run_id = ActionId(format!("rust:test-run:{}:{}", pkg.name, target.name));
+            let run_ctx = Ctx {
+                logical_id: run_id.clone(),
+                mnemonic: "RustTestRun".to_owned(),
+                kind: CtxKind::TestRun(TestRunSpec {
+                    compile: compile_id.clone(),
+                    binary: target.name.clone(),
+                    harness: target.harness,
+                    args: self.test_args.clone(),
+                }),
+                source_tree,
+                rustc: self.toolchain.rustc_blob,
+                bundle: Some(self.toolchain.bundle_ref()),
+                properties: self.base_properties(),
+                global_env: self.model.global_env.clone(),
+                pkg_env: pkg.env.clone(),
+                cc: Vec::new(),
+                profile_flags: Vec::new(),
+            };
+            actions.push(self.boxed(run_ctx));
+            let _ = &run_id;
+        }
+        Ok(())
     }
 
     /// Plans a package's build-script, library, and proc-macro actions.
@@ -585,6 +696,7 @@ impl<'a> RustBackend<'a> {
                 extra_flags,
                 feature_cfgs,
                 transitive_deps,
+                is_proc_macro: pkg.lib.as_ref().is_some_and(|lib| lib.proc_macro),
             }),
             source_tree,
             rustc: self.toolchain.rustc_blob,
@@ -926,6 +1038,7 @@ impl Ctx {
                 .chain(spec.build_script.clone())
                 .collect(),
             CtxKind::BuildScriptRun(spec) => vec![spec.compile.clone()],
+            CtxKind::TestRun(spec) => vec![spec.compile.clone()],
         };
         deps.sort();
         deps.dedup();
@@ -933,11 +1046,20 @@ impl Ctx {
     }
 
     /// The executable artifact, resolved once dependencies complete (a
-    /// build-script binary lives inside its compile action's output tree).
+    /// build-script binary lives inside its compile action's output tree;
+    /// a test binary inside its test-compile action's output tree).
     fn executable(&self, completed: &dyn Completed) -> Result<ArtifactRef, PlanError> {
         match &self.kind {
             CtxKind::Compile(_) => Ok(ArtifactRef::Blob(self.rustc)),
             CtxKind::BuildScriptRun(spec) => {
+                let tree = completed
+                    .output_tree(&spec.compile)
+                    .ok_or_else(|| PlanError::MissingDependency(spec.compile.clone()))?;
+                let path = RelativePath::new(&spec.binary)
+                    .map_err(|err| PlanError::Message(err.to_string()))?;
+                Ok(ArtifactRef::TreeFile { tree, path })
+            }
+            CtxKind::TestRun(spec) => {
                 let tree = completed
                     .output_tree(&spec.compile)
                     .ok_or_else(|| PlanError::MissingDependency(spec.compile.clone()))?;
@@ -979,6 +1101,18 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                     format!("{EXEC_ROOT_VAR}/in"),
                 ),
             ]);
+        }
+        CtxKind::TestRun(spec) => {
+            // The test binary runs with the package source tree as its
+            // working directory (relative test data paths behave like
+            // Cargo). The binary itself is resolved from the compile
+            // action's output tree at execution time.
+            args.extend(spec.args.iter().cloned());
+            if !spec.harness {
+                // Custom harness: the binary is a plain program; it gets
+                // the source tree as working directory.
+                let _ = &spec.binary;
+            }
         }
         CtxKind::Compile(spec) => {
             let mut directives = Directives::default();
@@ -1110,11 +1244,18 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
 
             args.push("--crate-name".to_owned());
             args.push(spec.crate_name.clone());
-            args.push("--crate-type".to_owned());
-            args.push(spec.crate_type.clone());
-            if spec.crate_type == "proc-macro" {
+            if spec.crate_type == "test" {
+                // Test harness compile (`[[test]]` / lib unit tests).
+                args.push("--test".to_owned());
+            } else {
+                args.push("--crate-type".to_owned());
+                args.push(spec.crate_type.clone());
+            }
+            if spec.crate_type == "proc-macro" || (spec.is_proc_macro && spec.crate_type == "test")
+            {
                 // rustc only exposes the proc_macro crate to explicitly
-                // requested externs.
+                // requested externs (also needed by unit tests of
+                // proc-macro crates).
                 args.push("--extern".to_owned());
                 args.push("proc_macro".to_owned());
             }
@@ -1139,8 +1280,13 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             CtxKind::Compile(spec) => vec![OutputPath::new(&spec.output).map_err(|err| {
                 PlanError::Message(format!("invalid output {}: {err}", spec.output))
             })?],
-            CtxKind::BuildScriptRun(_) => Vec::new(),
+            CtxKind::BuildScriptRun(_) | CtxKind::TestRun(_) => Vec::new(),
         };
+    // Test runs are never cached (test-result caching is PLAN Phase 8).
+    let cache_policy = match &ctx.kind {
+        CtxKind::TestRun(_) => CachePolicy::NoCache,
+        _ => CachePolicy::Enabled,
+    };
 
     Ok(ActionSpec {
         schema_version: ACTION_SCHEMA_VERSION,
@@ -1157,7 +1303,7 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
         target_platform: None,
         timeout: None,
         network_policy: NetworkPolicy::Deny,
-        cache_policy: CachePolicy::Enabled,
+        cache_policy,
         resource_requirements: ResourceRequirements::default(),
         properties: ctx.properties.clone(),
     })
@@ -1174,22 +1320,4 @@ fn link_search_arg(value: &str, build_out: &str) -> String {
         return value.to_owned();
     }
     format!("{build_out}/{value}")
-}
-
-/// The crate name of a package's library: the `[lib] name` override when
-/// present, else the sanitized package name. Binaries and dependents must
-/// agree on this for `--crate-name` and the rlib filename.
-fn lib_crate_name(pkg: &Package) -> String {
-    match &pkg.lib {
-        Some(lib) => lib
-            .name
-            .as_deref()
-            .map(crate_name)
-            .unwrap_or_else(|| crate_name(&pkg.name)),
-        None => crate_name(&pkg.name),
-    }
-}
-
-fn crate_name(name: &str) -> String {
-    name.replace('-', "_")
 }

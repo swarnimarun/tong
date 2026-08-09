@@ -179,51 +179,12 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// Builds the workspace at `root` and materializes artifacts under
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
-    let tong_dir = root.join(".tong");
-    let manifest = load_manifest(root)?;
-    let store = store_dir(root, manifest.as_ref())?;
-    let exec = tong_dir.join("exec");
-    let cas = Cas::open(&store)?;
-    let cache = ActionCache::open(&cas)?;
-
-    // Model first: manifest errors fail fast, before the expensive system
-    // toolchain capture (rustc import + sysroot fingerprinting).
-    let mut model = load_model(root, manifest.as_ref())?;
-
-    // Resolve features (Cargo resolver-v2 semantics) before planning so
-    // `--cfg feature=...` flags and optional-dep edges are baked into the
-    // action graph.
-    let requests = feature_requests(&model, options, manifest.as_ref())?;
-    let feature_map = tong_rust::resolve_features(&model, &requests, false)
-        .map_err(|err| BuildError::Manifest(err.to_string()))?;
-    model.feature_map = feature_map;
-
-    // Build-start hygiene: prune stale exec roots. Exec content is fully
-    // reproducible (everything is in the CAS); failed builds keep their
-    // roots until the next build, which is the diagnosis window.
-    prune_exec_dir(&exec)?;
-
-    // Toolchain: needed by the backend for action identity.
-    let toolchain = capture_system_rust(&cas)?;
-
-    let mut executor = LocalExecutor::new(cas.clone(), &exec)?;
-    executor.register_system_tool(toolchain.rustc_blob, toolchain.rustc.clone());
-    executor.register_bundle_root(toolchain.bundle.digest(), toolchain.root.clone());
-
-    // Plan.
-    let mut backend = RustBackend::new(cas.clone(), &model, toolchain, &options.profile)?;
-    let planned = backend.plan()?;
-    let artifacts = backend.final_artifacts();
-
-    let order = match topological_order(&planned) {
-        Ok(order) => order,
-        Err(cycle) => {
-            return Err(BuildError::Cycle(format!(
-                "action cycle: {:?}",
-                cycle.remaining
-            )));
-        }
-    };
+    let prepared = prepare(root, options, false, false, &[])?;
+    let tong_dir = &prepared.tong_dir;
+    let cas = &prepared.cas;
+    let cache = &prepared.cache;
+    let executor = &prepared.executor;
+    let order = &prepared.order;
 
     // Schedule: concretize, check cache, execute.
     let mut completed = CompletedMap(BTreeMap::new());
@@ -236,8 +197,9 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         ..Default::default()
     };
 
-    for (index, action) in order.iter().enumerate() {
-        let spec = (action.make)(&completed, &cas)?;
+    for index in 0..order.len() {
+        let action = &prepared.planned[order[index]];
+        let spec = (action.make)(&completed, cas)?;
         let digest = spec.digest();
         let cached = if let Some(result) = cache.get(digest)? {
             outcome.actions_cached += 1;
@@ -310,7 +272,8 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
 
     // Assemble requested final artifacts.
     let out_dir = tong_dir.join("out").join(&options.profile);
-    let requested: Vec<&tong_rust::FinalArtifact> = artifacts
+    let requested: Vec<&tong_rust::FinalArtifact> = prepared
+        .artifacts
         .iter()
         .filter(|artifact| {
             options.targets.is_empty()
@@ -348,11 +311,307 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         outcome.artifacts.push(dest.join(&artifact.name));
     }
 
-    // Record the build-state manifest (the GC root set) and run the
-    // automatic GC. Both are best-effort: cache correctness is unaffected,
-    // and a failed write leaves the previous manifest in place.
+    record_state(
+        root,
+        &prepared,
+        &recorded,
+        &graph_pairs,
+        &sources,
+        &toolchains,
+        &artifact_pairs,
+        &options.profile,
+    )?;
+
+    Ok(outcome)
+}
+
+/// Runs the workspace's test targets (`tong test`). Returns the process
+/// exit code: 0 when every executed test suite passed, 1 on the first
+/// failing suite.
+pub fn test(
+    root: &Path,
+    label: Option<&str>,
+    libtest_args: &[String],
+    options: &BuildOptions,
+) -> Result<i32, BuildError> {
+    let prepared = prepare(root, options, true, true, libtest_args)?;
+    let cas = &prepared.cas;
+    let cache = &prepared.cache;
+    let executor = &prepared.executor;
+    let order = &prepared.order;
+
+    let mut completed = CompletedMap(BTreeMap::new());
+    let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
+    let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
+    let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
+    let mut toolchains: Vec<tong_core::digest::Digest> = Vec::new();
+    // Executed test runs in (label, stdout blob) order.
+    let mut test_runs: Vec<(String, tong_core::artifact::BlobDigest)> = Vec::new();
+    let mut failed = false;
+
+    for index in 0..order.len() {
+        let action = &prepared.planned[order[index]];
+        let spec = (action.make)(&completed, cas)?;
+        let digest = spec.digest();
+
+        // Test runs: skipped when they do not match the label filter.
+        let is_test_run = spec.logical_id.0.starts_with("rust:test-run:");
+        if is_test_run
+            && let Some(label) = label
+            && !test_run_matches(&spec.logical_id.0, label)
+        {
+            continue;
+        }
+
+        let cached = if let Some(result) = cache.get(digest)? {
+            println!(
+                "  [{}/{}] {} ({}) [cached]",
+                index + 1,
+                order.len(),
+                spec.logical_id.0,
+                spec.mnemonic
+            );
+            result
+        } else {
+            println!(
+                "  [{}/{}] {} ({})",
+                index + 1,
+                order.len(),
+                spec.logical_id.0,
+                spec.mnemonic
+            );
+            let result = match executor.execute(&spec) {
+                Ok(outcome) => outcome,
+                Err(ExecError::Exit { code, stderr, .. }) => {
+                    let stderr_text = cas
+                        .read_blob(stderr)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    eprintln!("test {} failed with exit code {code}", spec.logical_id.0);
+                    eprintln!("{stderr_text}");
+                    if is_test_run {
+                        failed = true;
+                        break;
+                    }
+                    return Err(BuildError::Exec(ExecError::Exit {
+                        code,
+                        stderr,
+                        exec_root: PathBuf::new(),
+                    }));
+                }
+                Err(err) => return Err(BuildError::Exec(err)),
+            };
+            let cached = CachedResult {
+                outputs: result.outputs,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                duration_millis: result.duration.as_millis() as u64,
+            };
+            cache.put(digest, &cached)?;
+            cached
+        };
+        if is_test_run {
+            test_runs.push((spec.logical_id.0.clone(), cached.stdout));
+        }
+        graph_pairs.insert(spec.logical_id.0.clone(), digest);
+        sources.push(spec.input_root.digest());
+        if let Some(reference) = &spec.environment_bundle {
+            toolchains.push(reference.digest());
+        }
+        recorded.push(tong_store::RecordedAction {
+            action_digest: digest,
+            logical_id: spec.logical_id.0.clone(),
+            mnemonic: spec.mnemonic.clone(),
+            input_root: spec.input_root,
+            executable: match &spec.executable {
+                tong_core::artifact::ArtifactRef::Blob(blob) => Some(*blob),
+                _ => None,
+            },
+            env_bundle: spec.environment_bundle.as_ref().map(|r| r.digest()),
+            outputs: cached.outputs,
+            stdout: cached.stdout,
+            stderr: cached.stderr,
+            duration_millis: cached.duration_millis,
+        });
+        completed.0.insert(spec.logical_id.clone(), cached);
+    }
+
+    // Summary: parse the libtest result lines from each executed suite.
+    let mut passed = 0usize;
+    let mut failed_tests = 0usize;
+    for (id, stdout) in &test_runs {
+        let text = cas
+            .read_blob(*stdout)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let result_line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("test result:"))
+            .unwrap_or("test result: (no summary)");
+        println!("{result_line} ({id})");
+        let tokens: Vec<&str> = result_line.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            let number = tokens
+                .get(index.wrapping_sub(1))
+                .and_then(|n| n.parse::<usize>().ok());
+            if token.starts_with("passed") {
+                passed += number.unwrap_or(0);
+            } else if token.starts_with("failed") {
+                failed_tests += number.unwrap_or(0);
+            }
+        }
+    }
+    println!();
+    println!("tests: {passed} passed, {failed_tests} failed");
+
+    record_state(
+        root,
+        &prepared,
+        &recorded,
+        &graph_pairs,
+        &sources,
+        &toolchains,
+        &[],
+        &options.profile,
+    )?;
+
+    Ok(if failed || failed_tests > 0 { 1 } else { 0 })
+}
+
+/// Whether a test-run logical id (`rust:test-run:<pkg>:<name>`) matches a
+/// label: the test name, the package name (all its tests), or `pkg:name`.
+fn test_run_matches(logical_id: &str, label: &str) -> bool {
+    let rest = logical_id
+        .strip_prefix("rust:test-run:")
+        .unwrap_or(logical_id);
+    let (pkg, name) = rest.split_once(':').unwrap_or((rest, ""));
+    let label = label
+        .strip_prefix(':')
+        .or_else(|| {
+            label
+                .strip_prefix("//")
+                .and_then(|rest| rest.rsplit_once(':').map(|(_, name)| name))
+        })
+        .unwrap_or(label);
+    label == name
+        || label == pkg
+        || label == format!("{pkg}:{name}")
+        || artifact_name_matches(label, name)
+}
+
+/// Everything a build or test run needs after planning: the open store,
+/// resolved model, executor, and the planned action graph.
+struct Prepared {
+    tong_dir: PathBuf,
+    store: PathBuf,
+    manifest: Option<Manifest>,
+    cas: Cas,
+    cache: ActionCache,
+    executor: LocalExecutor,
+    planned: Vec<tong_graph::PlannedAction>,
+    artifacts: Vec<tong_rust::FinalArtifact>,
+    /// Topological order as indices into `planned`.
+    order: Vec<usize>,
+}
+
+/// Shared build/test setup: store → model → features → toolchain → plan.
+fn prepare(
+    root: &Path,
+    options: &BuildOptions,
+    include_dev_deps: bool,
+    tests_enabled: bool,
+    test_args: &[String],
+) -> Result<Prepared, BuildError> {
+    let tong_dir = root.join(".tong");
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let exec = tong_dir.join("exec");
+    let cas = Cas::open(&store)?;
+    let cache = ActionCache::open(&cas)?;
+
+    // Model first: manifest errors fail fast, before the expensive system
+    // toolchain capture (rustc import + sysroot fingerprinting).
+    let mut model = load_model(root, manifest.as_ref())?;
+
+    // Resolve features (Cargo resolver-v2 semantics) before planning so
+    // `--cfg feature=...` flags and optional-dep edges are baked into the
+    // action graph. Test builds additionally activate dev-dep edges.
+    let requests = feature_requests(&model, options, manifest.as_ref())?;
+    let feature_map = tong_rust::resolve_features(&model, &requests, include_dev_deps)
+        .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    model.feature_map = feature_map;
+
+    // Build-start hygiene: prune stale exec roots. Exec content is fully
+    // reproducible (everything is in the CAS); failed builds keep their
+    // roots until the next build, which is the diagnosis window.
+    prune_exec_dir(&exec)?;
+
+    // Toolchain: needed by the backend for action identity.
+    let toolchain = capture_system_rust(&cas)?;
+
+    let mut executor = LocalExecutor::new(cas.clone(), &exec)?;
+    executor.register_system_tool(toolchain.rustc_blob, toolchain.rustc.clone());
+    executor.register_bundle_root(toolchain.bundle.digest(), toolchain.root.clone());
+
+    // Plan.
+    let mut backend = RustBackend::with_tests(
+        cas.clone(),
+        &model,
+        toolchain,
+        &options.profile,
+        tests_enabled,
+        test_args,
+    )?;
+    let planned = backend.plan()?;
+    let artifacts = backend.final_artifacts();
+
+    let order = match topological_order(&planned) {
+        Ok(order) => order,
+        Err(cycle) => {
+            return Err(BuildError::Cycle(format!(
+                "action cycle: {:?}",
+                cycle.remaining
+            )));
+        }
+    };
+    let order: Vec<usize> = order
+        .iter()
+        .map(|action| {
+            planned
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, *action))
+                .expect("topological order references planned actions")
+        })
+        .collect();
+
+    Ok(Prepared {
+        tong_dir,
+        store,
+        manifest,
+        cas,
+        cache,
+        executor,
+        planned,
+        artifacts,
+        order,
+    })
+}
+
+/// Records the build-state manifest and runs the automatic GC (best-effort:
+/// failures only warn — cache correctness is unaffected).
+#[allow(clippy::too_many_arguments)]
+fn record_state(
+    root: &Path,
+    prepared: &Prepared,
+    recorded: &[tong_store::RecordedAction],
+    graph_pairs: &BTreeMap<String, tong_core::digest::Digest>,
+    sources: &[tong_core::digest::Digest],
+    toolchains: &[tong_core::digest::Digest],
+    artifact_pairs: &[(String, TreeDigest)],
+    profile: &str,
+) -> Result<(), BuildError> {
     if let Ok(project_hash) = project_hash(root) {
-        let state = StateStore::open(&store)?;
+        let state = StateStore::open(&prepared.store)?;
         let build_manifest = tong_store::BuildManifest {
             schema_version: tong_store::BUILD_MANIFEST_SCHEMA_VERSION,
             project_hash,
@@ -360,19 +619,19 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            graph_digest: graph_digest(&graph_pairs),
-            profiles: vec![options.profile.clone()],
-            sources,
-            toolchains,
-            actions: recorded,
-            artifacts: artifact_pairs,
+            graph_digest: graph_digest(graph_pairs),
+            profiles: vec![profile.to_owned()],
+            sources: sources.to_vec(),
+            toolchains: toolchains.to_vec(),
+            actions: recorded.to_vec(),
+            artifacts: artifact_pairs.to_vec(),
         };
         match state.write(&build_manifest) {
             Ok(()) => {
-                let retention = retention_policy(manifest.as_ref())?;
-                let max_size = max_size_policy(manifest.as_ref())?;
+                let retention = retention_policy(prepared.manifest.as_ref())?;
+                let max_size = max_size_policy(prepared.manifest.as_ref())?;
                 let report = sweep(
-                    &cas,
+                    &prepared.cas,
                     &state,
                     &GcOptions {
                         older_than: Some(retention),
@@ -395,8 +654,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
             ),
         }
     }
-
-    Ok(outcome)
+    Ok(())
 }
 
 /// Removes every entry of the exec directory (stale exec roots from failed

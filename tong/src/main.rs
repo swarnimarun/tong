@@ -63,6 +63,26 @@ enum Command {
     },
     /// Remove the project-local `.tong` directory.
     Clean,
+    /// Build and run the test targets.
+    Test {
+        /// Test label: a test name, a package name, or `pkg:name`.
+        label: Option<String>,
+        /// Profile name (dev or release by default).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Features to activate on the selected packages.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        /// Disable the selected packages' default feature.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Activate every declared feature of the selected packages.
+        #[arg(long)]
+        all_features: bool,
+        /// Arguments passed to the test binaries.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Garbage-collect the store: delete unreferenced cache objects.
     Gc {
         /// Delete unmarked objects older than this duration (`0` = all).
@@ -143,6 +163,31 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Test {
+            label,
+            profile,
+            features,
+            no_default_features,
+            all_features,
+            args,
+        } => {
+            let options = BuildOptions {
+                profile,
+                targets: Vec::new(),
+                features: driver::FeatureOptions {
+                    features,
+                    no_default_features,
+                    all_features,
+                },
+            };
+            match driver::test(&workspace, label.as_deref(), &args, &options) {
+                Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Gc {
             older_than,
             max_size,

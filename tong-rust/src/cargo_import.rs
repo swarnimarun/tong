@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use crate::model::{
     BinTarget, Dep, Edition, LibTarget, Lto, Package, PanicStrategy, ProfileSpec, RustModel,
+    TestTarget, lib_crate_name,
 };
 
 /// Cargo import failure.
@@ -62,6 +63,12 @@ struct CargoManifest {
     lib: Option<CargoLib>,
     #[serde(default)]
     bin: Vec<CargoBin>,
+    #[serde(default)]
+    test: Vec<CargoTest>,
+    #[serde(default)]
+    bench: Vec<CargoTest>,
+    #[serde(default)]
+    example: Vec<CargoExample>,
     #[serde(default)]
     profile: BTreeMap<String, CargoProfile>,
 }
@@ -181,6 +188,21 @@ struct CargoBin {
     name: Option<String>,
     path: Option<String>,
 }
+
+/// `[[test]]` / `[[bench]]` entry. Cargo defaults: path is
+/// `tests/<name>.rs` / `benches/<name>.rs`, harness defaults to true.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct CargoTest {
+    name: Option<String>,
+    path: Option<String>,
+    harness: Option<bool>,
+}
+
+/// `[[example]]` entry — unsupported in this wave (targeted diagnostic).
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct CargoExample;
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -473,6 +495,7 @@ fn import_package(
             edition: parse_edition(&edition)?,
             lib: None,
             bins: Vec::new(),
+            tests: Vec::new(),
             build_script: None,
             deps: Vec::new(),
             build_deps: Vec::new(),
@@ -546,6 +569,55 @@ fn import_package(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("src/bin/{name}.rs")));
             pkg.bins.push(BinTarget { name, path });
+        }
+
+        // Test targets: [[test]] / [[bench]] entries whose source exists
+        // (Cargo drops targets without source files), plus the auto-derived
+        // lib unit test. [[example]] is not in this wave.
+        if !manifest.example.is_empty() {
+            return Err(CargoImportError::Unsupported(
+                "[[example]] targets are not supported yet".to_owned(),
+            ));
+        }
+        for (entry, default_dir, kind) in [
+            (&manifest.test, "tests", "test"),
+            (&manifest.bench, "benches", "bench"),
+        ] {
+            for target in entry {
+                let name = target.name.clone().unwrap_or_else(|| {
+                    target
+                        .path
+                        .as_ref()
+                        .and_then(|p| Path::new(p).file_stem())
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&package.name)
+                        .to_owned()
+                });
+                let path = target
+                    .path
+                    .clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("{default_dir}/{name}.rs")));
+                if !pkg.dir.join(&path).is_file() {
+                    // Cargo silently drops test targets whose source is
+                    // missing.
+                    continue;
+                }
+                pkg.tests.push(TestTarget {
+                    name,
+                    path,
+                    harness: target.harness.unwrap_or(true),
+                });
+                let _ = kind;
+            }
+        }
+        // The package's own library unit test (Cargo: `--test` on the lib).
+        if let Some(lib) = &pkg.lib {
+            pkg.tests.push(TestTarget {
+                name: lib_crate_name(&pkg),
+                path: lib.path.clone(),
+                harness: true,
+            });
         }
 
         // Dependencies (path and workspace-inherited only), with
