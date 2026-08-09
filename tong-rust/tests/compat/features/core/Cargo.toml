@@ -1,0 +1,14 @@
+[package]
+name = "core"
+version = "0.2.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+fast = []
+slow = []
+extra = ["dep:extra"]
+
+[dependencies]
+extra = { path = "../extra", optional = true, default-features = false, features = ["deep"] }

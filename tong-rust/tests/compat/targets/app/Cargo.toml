@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(unix)'.dependencies]
+unixonly = { path = "../unixonly" }
+
+[target.'cfg(windows)'.dependencies]
+winonly = { path = "../winonly" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macosonly = { path = "../macosonly" }

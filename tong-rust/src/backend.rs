@@ -157,6 +157,11 @@ pub struct RustBackend<'a> {
     tests_enabled: bool,
     /// Arguments passed to the test binaries (after `--`).
     test_args: Vec<String>,
+    /// Build-state store, for rerun-if-changed input narrowing (the
+    /// previous run's directives).
+    state: Option<tong_store::StateStore>,
+    /// The workspace's project hash (state lookup key).
+    project_hash: Option<tong_core::digest::Digest>,
 }
 
 impl<'a> RustBackend<'a> {
@@ -167,7 +172,29 @@ impl<'a> RustBackend<'a> {
         toolchain: SystemRust,
         profile_name: &str,
     ) -> Result<Self, PlanError> {
-        Self::with_tests(cas, model, toolchain, profile_name, false, &[])
+        Self::with_state(cas, model, toolchain, profile_name, None, None)
+    }
+
+    /// Creates a backend with build-state access (for `rerun-if-changed`
+    /// input narrowing).
+    pub fn with_state(
+        cas: Cas,
+        model: &'a RustModel,
+        toolchain: SystemRust,
+        profile_name: &str,
+        state: Option<tong_store::StateStore>,
+        project_hash: Option<tong_core::digest::Digest>,
+    ) -> Result<Self, PlanError> {
+        Self::with_tests_state(
+            cas,
+            model,
+            toolchain,
+            profile_name,
+            false,
+            &[],
+            state,
+            project_hash,
+        )
     }
 
     /// Creates a backend; `tests_enabled` plans and runs test targets,
@@ -179,6 +206,30 @@ impl<'a> RustBackend<'a> {
         profile_name: &str,
         tests_enabled: bool,
         test_args: &[String],
+    ) -> Result<Self, PlanError> {
+        Self::with_tests_state(
+            cas,
+            model,
+            toolchain,
+            profile_name,
+            tests_enabled,
+            test_args,
+            None,
+            None,
+        )
+    }
+
+    /// Full constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tests_state(
+        cas: Cas,
+        model: &'a RustModel,
+        toolchain: SystemRust,
+        profile_name: &str,
+        tests_enabled: bool,
+        test_args: &[String],
+        state: Option<tong_store::StateStore>,
+        project_hash: Option<tong_core::digest::Digest>,
     ) -> Result<Self, PlanError> {
         let profile = model
             .profiles
@@ -198,6 +249,8 @@ impl<'a> RustBackend<'a> {
             planned_ids: BTreeMap::new(),
             tests_enabled,
             test_args: test_args.to_vec(),
+            state,
+            project_hash,
         })
     }
 
@@ -411,6 +464,125 @@ impl<'a> RustBackend<'a> {
         Ok(())
     }
 
+    /// The previous successful run's directives for a package's build
+    /// script, read from the build-state manifest (the latest successful
+    /// graph). `None` on the first build.
+    fn previous_directives(&self, pkg: &Package) -> Option<Directives> {
+        let state = self.state.as_ref()?;
+        let project_hash = self.project_hash?;
+        let manifest = state.latest(&project_hash)?;
+        let id = format!("rust:bs-run:{}", pkg.name);
+        let action = manifest
+            .actions
+            .iter()
+            .find(|action| action.logical_id == id)?;
+        let stdout = self.cas.read_blob(action.stdout).ok()?;
+        Some(parse_directives(&String::from_utf8_lossy(&stdout)))
+    }
+
+    /// Builds the build-script run action's source tree according to the
+    /// previous run's `rerun-if-changed` directives: only the declared
+    /// paths (plus the build script itself, which Cargo always tracks) are
+    /// captured; a declared path that no longer exists is an error, like
+    /// Cargo. Without any directives the whole package tree is kept
+    /// (Cargo's "rerun if anything changes" fallback).
+    fn narrowed_script_tree(
+        &self,
+        pkg: &Package,
+        full: TreeDigest,
+        directives: &Directives,
+    ) -> Result<TreeDigest, PlanError> {
+        if directives.rerun_if_changed.is_empty() {
+            return Ok(full);
+        }
+        let pkg_dir = fs::canonicalize(&pkg.dir)?;
+        let mut paths: Vec<PathBuf> = directives
+            .rerun_if_changed
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        // Cargo always reruns when the build script itself changes.
+        if let Some(script) = &pkg.build_script {
+            let script = self.crate_root_for(&pkg.name, script);
+            if !paths.contains(&script) {
+                paths.push(script.clone());
+            }
+        }
+        let excludes: std::collections::BTreeSet<&str> = CAPTURE_EXCLUDES.iter().copied().collect();
+        let mut mounts: Vec<(RelativePath, TreeDigest)> = Vec::new();
+        let mut mounted: std::collections::BTreeSet<PathBuf> = Default::default();
+        for path in paths {
+            let full_path = pkg.dir.join(&path);
+            if !full_path.exists() {
+                return Err(PlanError::Message(format!(
+                    "build script for {} emitted rerun-if-changed={:?} but no such \
+                     file or directory exists",
+                    pkg.name,
+                    path.display()
+                )));
+            }
+            let canonical = fs::canonicalize(&full_path)?;
+            let relative = canonical.strip_prefix(&pkg_dir).map_err(|_| {
+                PlanError::Message(format!(
+                    "build script for {} declares rerun-if-changed={:?} outside the \
+                     package directory; only in-package paths are supported",
+                    pkg.name,
+                    path.display()
+                ))
+            })?;
+            let mount_path = RelativePath::new(&relative.to_string_lossy()).map_err(|err| {
+                PlanError::Message(format!("invalid rerun-if-changed path {:?}: {err}", path))
+            })?;
+            if canonical.is_dir() {
+                if mounted.insert(relative.to_path_buf()) {
+                    let tree = self.cas.capture_dir_filtered(&canonical, &excludes)?;
+                    mounts.push((mount_path, tree));
+                }
+            } else {
+                let parent = relative.parent().unwrap_or(Path::new(""));
+                let name = relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        PlanError::Message("invalid rerun-if-changed path".to_owned())
+                    })?;
+                let blob = self.cas.put_file(&canonical)?;
+                let tree = Tree::new(
+                    [(
+                        name.to_owned(),
+                        TreeEntry::File {
+                            digest: blob,
+                            executable: false,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
+                .map_err(|err| PlanError::Message(format!("invalid tree: {err}")))?;
+                let tree = self.cas.put_tree(&tree)?;
+                let mount_path = if parent.as_os_str().is_empty() {
+                    RelativePath::new(".").unwrap()
+                } else {
+                    RelativePath::new(&parent.to_string_lossy()).map_err(|err| {
+                        PlanError::Message(format!(
+                            "invalid rerun-if-changed path {:?}: {err}",
+                            path
+                        ))
+                    })?
+                };
+                mounts.push((mount_path, tree));
+            }
+        }
+        if mounts.is_empty() {
+            return Err(PlanError::Message(format!(
+                "build script for {} emitted rerun-if-changed paths that could not \
+                 be captured",
+                pkg.name
+            )));
+        }
+        self.cas.assemble(&mounts).map_err(PlanError::Io)
+    }
+
     /// Plans a package's build-script, library, and proc-macro actions.
     fn plan_package_library(
         &mut self,
@@ -420,9 +592,29 @@ impl<'a> RustBackend<'a> {
         let source_tree = self.source_trees[&pkg.name];
         let cc = self.cc_for(&pkg.name);
 
-        // Build script: compile, then run.
+        // Build script: compile, then run. The run's source tree is
+        // narrowed by the previous run's `rerun-if-changed` directives
+        // (whole package tree when none were emitted — Cargo's fallback).
         let mut bs_run: Option<ActionId> = None;
+        let mut run_source_tree = source_tree;
+        let mut run_env: BTreeMap<String, String> = BTreeMap::new();
         if let Some(script) = &pkg.build_script {
+            // The previous run's directives narrow BOTH the script's
+            // compile and run inputs: the run's executable comes from the
+            // compile, so a recompile (e.g. triggered by an undeclared
+            // file) would produce a new binary and rerun the script,
+            // defeating rerun-if-changed.
+            let previous = self.previous_directives(pkg);
+            let mut script_tree = source_tree;
+            if let Some(directives) = &previous {
+                script_tree = self.narrowed_script_tree(pkg, script_tree, directives)?;
+                // rerun-if-env-changed: declared env vars become explicit
+                // run-action inputs (the digest then covers their values).
+                for var in &directives.rerun_if_env_changed {
+                    let value = std::env::var(var).unwrap_or_default();
+                    run_env.insert(var.clone(), value);
+                }
+            }
             let script = self.crate_root_for(&pkg.name, script);
             let binary = format!("{}_build_script", crate_name(&pkg.name));
             let compile_id = self.plan_compile(
@@ -431,7 +623,7 @@ impl<'a> RustBackend<'a> {
                 &format!("rust:bs-compile:{}", pkg.name),
                 "RustBuildScriptCompile",
                 pkg,
-                source_tree,
+                script_tree,
                 cc.clone(),
                 binary.clone(),
                 "bin",
@@ -440,6 +632,10 @@ impl<'a> RustBackend<'a> {
                 None,
                 script.clone(),
             )?;
+
+            if previous.is_some() {
+                run_source_tree = script_tree;
+            }
 
             let run_id = ActionId(format!("rust:bs-run:{}", pkg.name));
             let run_ctx = Ctx {
@@ -454,12 +650,16 @@ impl<'a> RustBackend<'a> {
                     opt_level: self.profile.opt_level.clone(),
                     debug: self.profile.debug,
                 }),
-                source_tree,
+                source_tree: run_source_tree,
                 rustc: self.toolchain.rustc_blob,
                 bundle: Some(self.toolchain.bundle_ref()),
                 properties: self.base_properties(),
                 global_env: self.model.global_env.clone(),
-                pkg_env: pkg.env.clone(),
+                pkg_env: {
+                    let mut env = pkg.env.clone();
+                    env.extend(run_env);
+                    env
+                },
                 cc: Vec::new(),
                 profile_flags: self.profile.rustc_flags(),
             };
@@ -1186,13 +1386,12 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                 args.push("-l".to_owned());
                 args.push(link.clone());
             }
-            let build_out = format!("{EXEC_ROOT_VAR}/in/build_out");
+            let _build_out = format!("{EXEC_ROOT_VAR}/in/build_out");
             // Link directives from transitive dependency build scripts
-            // (the own script is already merged above). Deduplicated so a
-            // library linked by several dependencies is passed once.
-            let mut seen_libs: BTreeSet<String> = BTreeSet::new();
-            let mut seen_searches: BTreeSet<String> = BTreeSet::new();
-            let mut seen_flags: BTreeSet<String> = BTreeSet::new();
+            // (the own script is merged separately below). Libraries,
+            // searches, and raw flags are deduplicated so a library linked
+            // by several dependencies is passed once.
+            let mut seen = SeenDirectives::default();
             for source in &spec.directive_sources {
                 if spec.build_script.as_ref() == Some(source) {
                     continue;
@@ -1202,44 +1401,30 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                 };
                 let bytes = cas.read_blob(stdout)?;
                 let dep_directives = parse_directives(&String::from_utf8_lossy(&bytes));
-                for lib in dep_directives.link_libs {
-                    if seen_libs.insert(lib.clone()) {
-                        args.push("-l".to_owned());
-                        args.push(lib);
-                    }
-                }
-                for search in dep_directives.link_search {
-                    if seen_searches.insert(search.clone()) {
-                        args.push("-L".to_owned());
-                        args.push(link_search_arg(&search, &build_out));
-                    }
-                }
-                for flag in dep_directives.raw_flags {
-                    if seen_flags.insert(flag.clone()) {
-                        args.push(flag);
-                    }
-                }
-                for (key, value) in dep_directives.env {
-                    env.insert(key, value);
-                }
+                apply_directives(
+                    &mut args,
+                    &mut env,
+                    &dep_directives,
+                    &spec.crate_type,
+                    &mut seen,
+                    false,
+                );
             }
-            for flag in &directives.raw_flags {
-                args.push(flag.clone());
-            }
+            apply_directives(
+                &mut args,
+                &mut env,
+                &directives,
+                &spec.crate_type,
+                &mut seen,
+                true,
+            );
             for cfg in &directives.cfgs {
                 args.push("--cfg".to_owned());
                 args.push(cfg.clone());
             }
-            for lib in &directives.link_libs {
-                args.push("-l".to_owned());
-                args.push(lib.clone());
-            }
-            for search in &directives.link_search {
-                args.push("-L".to_owned());
-                args.push(link_search_arg(search, &build_out));
-            }
-            for (key, value) in &directives.env {
-                env.insert(key.clone(), value.clone());
+            let mut extra_metadata = String::new();
+            for value in &seen.extra_metadata {
+                extra_metadata.push_str(value);
             }
 
             args.push("--crate-name".to_owned());
@@ -1262,7 +1447,7 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             args.push("--edition".to_owned());
             args.push(spec.edition.to_rustc().to_owned());
             args.push("-C".to_owned());
-            args.push(format!("metadata={}", spec.meta));
+            args.push(format!("metadata={}{extra_metadata}", spec.meta));
             args.extend(ctx.profile_flags.iter().cloned());
             args.push("-o".to_owned());
             args.push(format!("{EXEC_ROOT_VAR}/out/{}", spec.output));
@@ -1309,15 +1494,102 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
     })
 }
 
-fn link_search_arg(value: &str, build_out: &str) -> String {
+/// Dedup state for directive application across transitive scripts.
+#[derive(Default)]
+struct SeenDirectives {
+    libs: BTreeSet<(Option<String>, String)>,
+    searches: BTreeSet<String>,
+    flags: BTreeSet<String>,
+    extra_metadata: Vec<String>,
+}
+
+/// Applies a build script's directives to a compile action's args and env.
+/// Target-kind-specific link args apply per `crate_type`; the own script's
+/// env pairs win over transitive ones (applied later).
+fn apply_directives(
+    args: &mut Vec<String>,
+    env: &mut BTreeMap<String, String>,
+    directives: &Directives,
+    crate_type: &str,
+    seen: &mut SeenDirectives,
+    _own: bool,
+) {
+    for (kind, lib) in &directives.link_libs {
+        if seen.libs.insert((kind.clone(), lib.clone())) {
+            args.push("-l".to_owned());
+            match kind {
+                Some(kind) => args.push(format!("{kind}={lib}")),
+                None => args.push(lib.clone()),
+            }
+        }
+    }
+    for search in &directives.link_search {
+        if seen.searches.insert(search.clone()) {
+            args.push("-L".to_owned());
+            args.push(link_search_arg(search));
+        }
+    }
+    for flag in &directives.raw_flags {
+        if seen.flags.insert(flag.clone()) {
+            args.push(flag.clone());
+        }
+    }
+    // Link args only apply to targets that actually link (rlibs are
+    // archives; passing linker flags into the rlib compile is an error).
+    let links = matches!(crate_type, "bin" | "test" | "cdylib" | "staticlib");
+    if links {
+        for arg in &directives.link_args {
+            args.push("-C".to_owned());
+            args.push(format!("link-arg={arg}"));
+        }
+    }
+    match crate_type {
+        "bin" => {
+            for arg in &directives.link_arg_bins {
+                args.push("-C".to_owned());
+                args.push(format!("link-arg={arg}"));
+            }
+        }
+        "test" => {
+            for arg in &directives.link_arg_tests {
+                args.push("-C".to_owned());
+                args.push(format!("link-arg={arg}"));
+            }
+        }
+        "cdylib" => {
+            for arg in &directives.cdylib_link_args {
+                args.push("-C".to_owned());
+                args.push(format!("link-arg={arg}"));
+            }
+        }
+        _ => {}
+    }
+    for cfg in &directives.check_cfgs {
+        args.push("--check-cfg".to_owned());
+        args.push(cfg.clone());
+    }
+    for value in &directives.extra_metadata {
+        if !seen.extra_metadata.contains(value) {
+            seen.extra_metadata.push(value.clone());
+        }
+    }
+    for (key, value) in &directives.env {
+        env.insert(key.clone(), value.clone());
+    }
+}
+
+fn link_search_arg(value: &str) -> String {
+    // Relative search paths resolve against the package root (the input
+    // root, where the source tree is mounted at "."); absolute paths pass
+    // verbatim (Cargo semantics).
     if let Some((kind, path)) = value.split_once('=') {
         if path.starts_with('/') {
             return format!("{kind}={path}");
         }
-        return format!("{kind}={build_out}/{path}");
+        return format!("{kind}={EXEC_ROOT_VAR}/in/{path}");
     }
     if value.starts_with('/') {
         return value.to_owned();
     }
-    format!("{build_out}/{value}")
+    format!("{EXEC_ROOT_VAR}/in/{value}")
 }

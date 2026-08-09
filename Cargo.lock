@@ -711,12 +711,16 @@ dependencies = [
 name = "tong-rust"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "semver",
  "serde",
+ "serde_json",
+ "tar",
  "tempfile",
  "toml",
  "tong-core",
  "tong-exec",
+ "tong-fetch",
  "tong-graph",
  "tong-store",
 ]

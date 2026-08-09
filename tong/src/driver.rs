@@ -559,13 +559,17 @@ fn prepare(
     executor.register_bundle_root(toolchain.bundle.digest(), toolchain.root.clone());
 
     // Plan.
-    let mut backend = RustBackend::with_tests(
+    let state = tong_store::StateStore::open(&store)?;
+    let project_hash = tong_store::project_hash(root).ok();
+    let mut backend = RustBackend::with_tests_state(
         cas.clone(),
         &model,
         toolchain,
         &options.profile,
         tests_enabled,
         test_args,
+        Some(state),
+        project_hash,
     )?;
     let planned = backend.plan()?;
     let artifacts = backend.final_artifacts();

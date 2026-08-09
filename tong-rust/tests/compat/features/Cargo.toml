@@ -1,0 +1,5 @@
+[workspace]
+members = ["core", "app"]
+
+[workspace.dependencies]
+core = { path = "core", features = ["fast"] }
