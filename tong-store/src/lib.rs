@@ -6,6 +6,8 @@
 
 pub mod action_cache;
 pub mod cas;
+pub mod state;
 
 pub use action_cache::{ActionCache, CachedResult};
 pub use cas::{CAPTURE_EXCLUDES, Cas};
+pub use state::{BuildManifest, RecordedAction, StateStore};
