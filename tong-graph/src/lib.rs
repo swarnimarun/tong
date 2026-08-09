@@ -11,7 +11,7 @@ pub mod plan;
 
 pub use label::{Label, LabelError};
 pub use manifest::{
-    Lto, Manifest, ManifestError, OptLevel, ProfileConfig, RustToolchain, TargetConfig, Toolchain,
-    Workspace,
+    Lto, Manifest, ManifestError, OptLevel, ProfileConfig, RustToolchain, StoreConfig,
+    TargetConfig, Toolchain, Workspace,
 };
 pub use plan::{Completed, CycleError, PlanError, PlannedAction, topological_order};

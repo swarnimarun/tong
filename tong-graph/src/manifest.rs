@@ -28,6 +28,9 @@ pub struct Manifest {
     /// Named targets (`[target.<name>]`).
     #[serde(default)]
     pub target: BTreeMap<String, TargetConfig>,
+    /// Store policy (`[store]`): shared-store location, retention, budget.
+    #[serde(default)]
+    pub store: Option<StoreConfig>,
 }
 
 impl Manifest {
@@ -125,6 +128,24 @@ pub enum Lto {
     Bool(bool),
     /// `thin` or `fat`.
     Str(String),
+}
+
+/// Store policy configuration (`[store]`).
+///
+/// `dir` relocates the content-addressed store (shared-store mode); it must
+/// be a relative path without `..` components and resolves against the
+/// workspace root. `retention` and `max_size` configure automatic GC
+/// (human formats: `7d`, `10G`); environment overrides `TONG_STORE_DIR`,
+/// `TONG_STORE_RETENTION`, and `TONG_STORE_MAX_SIZE` win over the manifest.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StoreConfig {
+    /// Store directory, relative to the workspace root.
+    pub dir: Option<String>,
+    /// Age floor for deleting unmarked cache objects.
+    pub retention: Option<String>,
+    /// Store size budget; GC deletes unmarked objects below this.
+    pub max_size: Option<String>,
 }
 
 /// A named target.

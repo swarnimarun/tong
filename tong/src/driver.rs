@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use tong_core::action::ActionId;
 use tong_core::artifact::TreeDigest;
+use tong_core::units::{parse_duration, parse_size};
 use tong_exec::{ExecError, LocalExecutor};
 use tong_graph::manifest::Manifest;
 use tong_graph::{Completed, PlanError, topological_order};
@@ -16,6 +17,64 @@ use tong_rust::{RustBackend, capture_system_rust, import_cargo_workspace};
 use tong_store::{ActionCache, CachedResult, Cas};
 
 use crate::manifest_mode::manifest_to_model;
+
+/// Default retention for unmarked cache objects (auto-GC after builds).
+pub const DEFAULT_RETENTION: &str = "7d";
+/// Default store size budget (auto-GC after builds).
+pub const DEFAULT_MAX_SIZE: &str = "10G";
+
+/// Resolves the store directory for a workspace.
+///
+/// Resolution order: env `TONG_STORE_DIR` → `[store] dir` in `Tong.toml`
+/// (relative to the workspace root; native mode only) → `<root>/.tong/store`
+/// (the project-local default). Everything else (exec roots, `out/`) stays
+/// under `<root>/.tong/` in both modes.
+pub fn store_dir(root: &Path, manifest: Option<&Manifest>) -> Result<PathBuf, BuildError> {
+    if let Some(dir) = std::env::var_os("TONG_STORE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(store) = manifest.and_then(|manifest| manifest.store.as_ref()) {
+        if let Some(dir) = &store.dir {
+            let path = Path::new(dir);
+            if path.is_absolute() || path.components().any(|c| c == std::path::Component::ParentDir)
+            {
+                return Err(BuildError::Store(format!(
+                    "[store] dir {dir:?} must be a relative path without `..` components"
+                )));
+            }
+            return Ok(root.join(path));
+        }
+    }
+    Ok(root.join(".tong").join("store"))
+}
+
+/// Resolves the GC retention policy: `TONG_STORE_RETENTION` →
+/// `[store] retention` → default [`DEFAULT_RETENTION`].
+pub fn retention_policy(manifest: Option<&Manifest>) -> Result<std::time::Duration, BuildError> {
+    let text = std::env::var("TONG_STORE_RETENTION")
+        .ok()
+        .or_else(|| {
+            manifest
+                .and_then(|manifest| manifest.store.as_ref())
+                .and_then(|store| store.retention.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_RETENTION.to_owned());
+    parse_duration(&text).map_err(|err| BuildError::Store(err.to_string()))
+}
+
+/// Resolves the store size budget: `TONG_STORE_MAX_SIZE` → `[store]
+/// max_size` → default [`DEFAULT_MAX_SIZE`].
+pub fn max_size_policy(manifest: Option<&Manifest>) -> Result<u64, BuildError> {
+    let text = std::env::var("TONG_STORE_MAX_SIZE")
+        .ok()
+        .or_else(|| {
+            manifest
+                .and_then(|manifest| manifest.store.as_ref())
+                .and_then(|store| store.max_size.clone())
+        })
+        .unwrap_or_else(|| DEFAULT_MAX_SIZE.to_owned());
+    parse_size(&text).map_err(|err| BuildError::Store(err.to_string()))
+}
 
 /// Build driver options.
 #[derive(Clone, Debug)]
@@ -54,6 +113,8 @@ pub enum BuildError {
     Cycle(String),
     /// Execution failed.
     Exec(ExecError),
+    /// Store configuration or GC failure.
+    Store(String),
     /// I/O failure.
     Io(io::Error),
 }
@@ -69,6 +130,7 @@ impl fmt::Display for BuildError {
             Self::Plan(err) => write!(f, "{err}"),
             Self::Cycle(msg) => write!(f, "{msg}"),
             Self::Exec(err) => write!(f, "{err}"),
+            Self::Store(msg) => write!(f, "{msg}"),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -98,14 +160,15 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
     let tong_dir = root.join(".tong");
-    let store = tong_dir.join("store");
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
     let exec = tong_dir.join("exec");
     let cas = Cas::open(&store)?;
     let cache = ActionCache::open(&cas)?;
 
     // Model first: manifest errors fail fast, before the expensive system
     // toolchain capture (rustc import + sysroot fingerprinting).
-    let model = load_model(root)?;
+    let model = load_model(root, manifest.as_ref())?;
 
     // Toolchain: needed by the backend for action identity.
     let toolchain = capture_system_rust(&cas)?;
@@ -228,11 +291,23 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     Ok(outcome)
 }
 
-/// Loads the Rust model: `Tong.toml` if present, else Cargo import.
-pub fn load_model(root: &Path) -> Result<tong_rust::RustModel, BuildError> {
+/// Loads `Tong.toml` when present (`None` in Cargo-import mode).
+fn load_manifest(root: &Path) -> Result<Option<Manifest>, BuildError> {
     if root.join("Tong.toml").exists() {
         let manifest = Manifest::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
-        Ok(manifest_to_model(&manifest, root))
+        Ok(Some(manifest))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Loads the Rust model: `Tong.toml` if present, else Cargo import.
+pub fn load_model(
+    root: &Path,
+    manifest: Option<&Manifest>,
+) -> Result<tong_rust::RustModel, BuildError> {
+    if let Some(manifest) = manifest {
+        Ok(manifest_to_model(manifest, root))
     } else if root.join("Cargo.toml").exists() {
         import_cargo_workspace(root).map_err(|err| BuildError::Manifest(err.to_string()))
     } else {
