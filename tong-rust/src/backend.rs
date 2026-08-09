@@ -109,6 +109,8 @@ struct CompileSpec {
     directive_sources: Vec<ActionId>,
     crate_root: PathBuf,
     extra_flags: Vec<String>,
+    /// `--cfg feature="..."` flags for the package's activated features.
+    feature_cfgs: Vec<String>,
 }
 
 struct BuildScriptRunSpec {
@@ -399,6 +401,9 @@ impl<'a> RustBackend<'a> {
                     Dep {
                         extern_name: lib_crate_name(pkg),
                         package: pkg.name.clone(),
+                        optional: false,
+                        default_features: true,
+                        features: Vec::new(),
                     },
                 );
             }
@@ -490,7 +495,21 @@ impl<'a> RustBackend<'a> {
             };
             format!("lib{crate_name}-{meta}.{ext}")
         };
-        let dep_specs = self.resolve_deps(deps)?;
+        let dep_specs = self.resolve_deps(&pkg.name, deps)?;
+        // Per-crate feature cfgs: `--cfg feature="<name>"` for every
+        // activated feature (sorted), mirroring Cargo.
+        let feature_cfgs: Vec<String> = self
+            .model
+            .feature_map
+            .packages
+            .get(&pkg.name)
+            .map(|features| {
+                features
+                    .iter()
+                    .flat_map(|feature| ["--cfg".to_owned(), format!("feature=\"{feature}\"")])
+                    .collect()
+            })
+            .unwrap_or_default();
         let extra_flags: Vec<String> = self
             .model
             .global_rustflags
@@ -529,6 +548,7 @@ impl<'a> RustBackend<'a> {
                 directive_sources: self.link_directive_sources(pkg),
                 crate_root,
                 extra_flags,
+                feature_cfgs,
             }),
             source_tree,
             rustc: self.toolchain.rustc_blob,
@@ -600,16 +620,32 @@ impl<'a> RustBackend<'a> {
     /// Build-script run ids whose link directives apply to `pkg`'s crates:
     /// the package's own script plus the scripts of every transitive
     /// dependency (Cargo propagates link directives to all dependents).
+    /// Inactive optional dep edges are skipped.
     fn link_directive_sources(&self, pkg: &Package) -> Vec<ActionId> {
+        fn active_deps<'b>(model: &RustModel, pkg: &'b Package) -> Vec<&'b Dep> {
+            pkg.deps
+                .iter()
+                .chain(pkg.build_deps.iter())
+                .filter(|dep| {
+                    if !dep.optional {
+                        return true;
+                    }
+                    model
+                        .feature_map
+                        .active_optional_deps
+                        .get(&pkg.name)
+                        .is_some_and(|active| active.contains(&dep.extern_name))
+                })
+                .collect()
+        }
+
         let mut out = Vec::new();
         if let Some(id) = self.planned_ids.get(&format!("bs-run:{}", pkg.name)) {
             out.push(id.clone());
         }
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut stack: Vec<String> = pkg
-            .deps
+        let mut stack: Vec<String> = active_deps(self.model, pkg)
             .iter()
-            .chain(pkg.build_deps.iter())
             .map(|dep| dep.package.clone())
             .collect();
         while let Some(name) = stack.pop() {
@@ -620,15 +656,32 @@ impl<'a> RustBackend<'a> {
                 out.push(id.clone());
             }
             if let Some(dep) = self.model.packages.iter().find(|p| p.name == name) {
-                stack.extend(dep.deps.iter().map(|d| d.package.clone()));
-                stack.extend(dep.build_deps.iter().map(|d| d.package.clone()));
+                stack.extend(
+                    active_deps(self.model, dep)
+                        .iter()
+                        .map(|d| d.package.clone()),
+                );
             }
         }
         out
     }
 
-    fn resolve_deps(&self, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
-        deps.iter().map(|dep| self.dep_spec(dep)).collect()
+    fn resolve_deps(&self, pkg_name: &str, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
+        deps.iter()
+            .filter(|dep| {
+                if !dep.optional {
+                    return true;
+                }
+                // Optional edges are linked only when activated by the
+                // feature resolution (Cargo semantics).
+                self.model
+                    .feature_map
+                    .active_optional_deps
+                    .get(pkg_name)
+                    .is_some_and(|active| active.contains(&dep.extern_name))
+            })
+            .map(|dep| self.dep_spec(dep))
+            .collect()
     }
 
     /// Resolves a dependency to its producer action or native import.
@@ -707,7 +760,7 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Transitive native closure of a package: every `cc_import` reachable
-    /// through the dependency graph.
+    /// through the dependency graph (inactive optional edges skipped).
     fn collect_cc(&self, pkg_name: &str, pkg_map: &BTreeMap<&str, &Package>) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
@@ -716,7 +769,21 @@ impl<'a> RustBackend<'a> {
             let Some(current) = pkg_map.get(name.as_str()) else {
                 continue;
             };
-            for dep in current.deps.iter().chain(current.build_deps.iter()) {
+            for dep in current
+                .deps
+                .iter()
+                .chain(current.build_deps.iter())
+                .filter(|dep| {
+                    if !dep.optional {
+                        return true;
+                    }
+                    self.model
+                        .feature_map
+                        .active_optional_deps
+                        .get(&current.name)
+                        .is_some_and(|active| active.contains(&dep.extern_name))
+                })
+            {
                 if self.cc.contains_key(&dep.package) {
                     if seen.insert(dep.package.clone()) {
                         out.push(dep.package.clone());
@@ -967,6 +1034,7 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             args.push("-L".to_owned());
             args.push(format!("dependency={EXEC_ROOT_VAR}/in/deps"));
             args.extend(spec.extra_flags.iter().cloned());
+            args.extend(spec.feature_cfgs.iter().cloned());
             args.push(spec.crate_root.to_string_lossy().into_owned());
         }
     }

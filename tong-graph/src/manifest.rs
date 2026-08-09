@@ -174,6 +174,11 @@ pub struct TargetConfig {
     /// Per-target environment variables.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Features to activate on this target.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Whether the target's default feature is enabled.
+    pub default_features: Option<bool>,
     /// Build-script source, relative to the workspace root.
     pub build_script: Option<String>,
     /// Crate types for a library target.

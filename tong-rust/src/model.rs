@@ -12,6 +12,8 @@ use std::path::PathBuf;
 pub struct RustModel {
     /// Workspace packages.
     pub packages: Vec<Package>,
+    /// Names of the workspace-member packages (feature resolution seeds).
+    pub members: Vec<String>,
     /// Named, resolved profiles.
     pub profiles: BTreeMap<String, ProfileSpec>,
     /// Imported prebuilt native libraries.
@@ -20,6 +22,8 @@ pub struct RustModel {
     pub global_rustflags: Vec<String>,
     /// Workspace-wide environment (e.g. `.cargo/config.toml` `[env]`).
     pub global_env: BTreeMap<String, String>,
+    /// Resolved feature activation (set by the driver before planning).
+    pub feature_map: crate::features::FeatureMap,
 }
 
 /// A Rust package (one crate compilation unit).
@@ -43,6 +47,13 @@ pub struct Package {
     pub deps: Vec<Dep>,
     /// Build-script-only dependencies.
     pub build_deps: Vec<Dep>,
+    /// Dev-dependencies (test/example builds only).
+    pub dev_deps: Vec<Dep>,
+    /// Declared features: feature name → list of `feature` / `dep:` /
+    /// `dep/feat` / `dep?/feat` references.
+    pub features: BTreeMap<String, Vec<String>>,
+    /// Whether the package declares a `default` feature.
+    pub has_default_feature: bool,
     /// Extra per-package rustc flags.
     pub rustflags: Vec<String>,
     /// Extra per-package environment.
@@ -104,6 +115,12 @@ pub struct Dep {
     pub extern_name: String,
     /// Name of the dependency package.
     pub package: String,
+    /// Optional dependency (only linked when activated via features).
+    pub optional: bool,
+    /// Whether the dependency's default feature is enabled.
+    pub default_features: bool,
+    /// Features requested on the dependency.
+    pub features: Vec<String>,
 }
 
 /// Rust crate types the backend can compile.

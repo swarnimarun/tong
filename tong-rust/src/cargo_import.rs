@@ -52,6 +52,10 @@ struct CargoManifest {
     dependencies: BTreeMap<String, DepValue>,
     #[serde(default)]
     build_dependencies: BTreeMap<String, DepValue>,
+    #[serde(default)]
+    dev_dependencies: BTreeMap<String, DepValue>,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
     lib: Option<CargoLib>,
     #[serde(default)]
     bin: Vec<CargoBin>,
@@ -132,6 +136,13 @@ enum DepValue {
         workspace: Option<bool>,
         /// Optional `package = "real-name"` rename for path deps.
         package: Option<String>,
+        /// Optional dependency (activated via features).
+        optional: Option<bool>,
+        /// Disable the dependency's default feature.
+        #[serde(rename = "default-features")]
+        default_features: Option<bool>,
+        /// Features requested on the dependency.
+        features: Option<Vec<String>>,
     },
 }
 
@@ -265,7 +276,24 @@ pub fn import_cargo_workspace(workspace_root: &Path) -> Result<RustModel, CargoI
             )));
         }
     }
+
+    // Workspace members (feature seeds and lockfile roots).
+    let mut member_names: Vec<String> = Vec::new();
+    for member in &members {
+        let canonical = fs::canonicalize(member)
+            .map_err(|err| CargoImportError::Io(member.display().to_string(), err))?;
+        if let Some(name) = by_name
+            .iter()
+            .find(|(_, dir)| ***dir == canonical)
+            .map(|(name, _)| *name)
+        {
+            member_names.push(name.to_owned());
+        }
+    }
+    member_names.sort();
+
     model.packages = packages.into_values().collect();
+    model.members = member_names;
 
     // Profiles from the workspace root manifest (Cargo: [profile.*] tables).
     model.profiles = resolve_profiles(&root_manifest.profile)?;
@@ -420,6 +448,9 @@ fn import_package(
             build_script: None,
             deps: Vec::new(),
             build_deps: Vec::new(),
+            dev_deps: Vec::new(),
+            features: manifest.features.clone(),
+            has_default_feature: manifest.features.contains_key("default"),
             rustflags: Vec::new(),
             env: BTreeMap::new(),
         };
@@ -504,11 +535,19 @@ fn import_package(
             workspace_root,
             &inherited.deps,
         )?;
+        let resolved_dev_deps = resolve_deps(
+            &manifest.dev_dependencies,
+            &canonical,
+            workspace_root,
+            &inherited.deps,
+        )?;
         let mut deps = Vec::new();
         let mut build_deps = Vec::new();
+        let mut dev_deps = Vec::new();
         for (resolved, target) in [
             (resolved_deps, &mut deps),
             (resolved_build_deps, &mut build_deps),
+            (resolved_dev_deps, &mut dev_deps),
         ] {
             for dep in resolved {
                 let real_name = match dep.path {
@@ -531,11 +570,15 @@ fn import_package(
                 target.push(Dep {
                     extern_name: dep.extern_name,
                     package: real_name,
+                    optional: dep.optional,
+                    default_features: dep.default_features,
+                    features: dep.features,
                 });
             }
         }
         pkg.deps = deps;
         pkg.build_deps = build_deps;
+        pkg.dev_deps = dev_deps;
 
         let name = pkg.name.clone();
         packages.insert(canonical, pkg);
@@ -588,6 +631,9 @@ struct ResolvedDep {
     extern_name: String,
     package: String,
     path: Option<PathBuf>,
+    optional: bool,
+    default_features: bool,
+    features: Vec<String>,
 }
 
 fn resolve_deps(
@@ -598,7 +644,10 @@ fn resolve_deps(
 ) -> Result<Vec<ResolvedDep>, CargoImportError> {
     let mut out = Vec::new();
     for (name, value) in deps {
-        let resolved = match value {
+        // The effective table: the member's own table merged over the
+        // inherited `[workspace.dependencies]` table (Cargo semantics:
+        // features concatenate, other keys override).
+        let (path, package, optional, default_features, mut features) = match value {
             DepValue::Version(version) => {
                 return Err(CargoImportError::Unsupported(format!(
                     "dependency {name:?} = {version:?} in {} is a registry dependency; \
@@ -611,30 +660,49 @@ fn resolve_deps(
                 version,
                 workspace,
                 package,
+                optional,
+                default_features,
+                features,
             } => {
                 if let Some(path) = path {
                     // Path deps resolve relative to the declaring manifest.
-                    let dir = member.join(path);
-                    Some((
-                        name.clone(),
+                    (
+                        Some(member.join(path)),
                         package.clone().unwrap_or_else(|| name.clone()),
-                        Some(dir),
-                    ))
+                        optional.unwrap_or(false),
+                        default_features.unwrap_or(true),
+                        features.clone().unwrap_or_default(),
+                    )
                 } else if *workspace == Some(true) {
                     match inherited.get(name) {
                         Some(DepValue::Table {
                             path: Some(path),
                             package: inherited_package,
+                            optional: inherited_optional,
+                            default_features: inherited_default_features,
+                            features: inherited_features,
                             ..
                         }) => {
                             // Inherited path deps resolve relative to the
                             // workspace root manifest.
-                            let dir = workspace_root.join(path);
-                            Some((
-                                name.clone(),
+                            let mut merged_features =
+                                inherited_features.clone().unwrap_or_default();
+                            if let Some(features) = features {
+                                for feature in features {
+                                    if !merged_features.contains(feature) {
+                                        merged_features.push(feature.clone());
+                                    }
+                                }
+                            }
+                            (
+                                Some(workspace_root.join(path)),
                                 inherited_package.clone().unwrap_or_else(|| name.clone()),
-                                Some(dir),
-                            ))
+                                optional.or(*inherited_optional).unwrap_or(false),
+                                default_features
+                                    .or(*inherited_default_features)
+                                    .unwrap_or(true),
+                                merged_features,
+                            )
                         }
                         Some(DepValue::Version(version)) => {
                             return Err(CargoImportError::Unsupported(format!(
@@ -680,11 +748,14 @@ fn resolve_deps(
                 }
             }
         };
-        if let Some((extern_name, package, path)) = resolved {
+        if let Some(path) = path {
             out.push(ResolvedDep {
-                extern_name: extern_name.replace('-', "_"),
+                extern_name: name.replace('-', "_"),
                 package,
-                path,
+                path: Some(path),
+                optional,
+                default_features,
+                features: std::mem::take(&mut features),
             });
         }
     }

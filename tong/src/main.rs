@@ -31,6 +31,15 @@ enum Command {
         /// Restrict materialized artifacts to these targets.
         #[arg(long)]
         target: Vec<String>,
+        /// Features to activate on the selected packages.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        /// Disable the selected packages' default feature.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Activate every declared feature of the selected packages.
+        #[arg(long)]
+        all_features: bool,
     },
     /// Build and run a binary target.
     Run {
@@ -42,6 +51,15 @@ enum Command {
         /// Profile name.
         #[arg(long, default_value = "dev")]
         profile: String,
+        /// Features to activate on the selected packages.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        /// Disable the selected packages' default feature.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Activate every declared feature of the selected packages.
+        #[arg(long)]
+        all_features: bool,
     },
     /// Remove the project-local `.tong` directory.
     Clean,
@@ -63,10 +81,21 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match cli.command {
-        Command::Build { profile, target } => {
+        Command::Build {
+            profile,
+            target,
+            features,
+            no_default_features,
+            all_features,
+        } => {
             let options = BuildOptions {
                 profile,
                 targets: target,
+                features: driver::FeatureOptions {
+                    features,
+                    no_default_features,
+                    all_features,
+                },
             };
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
@@ -83,13 +112,27 @@ fn main() -> ExitCode {
             target,
             args,
             profile,
-        } => match driver::run(&workspace, &target, &args, &profile) {
-            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
-            Err(err) => {
-                eprintln!("tong: error: {err}");
-                ExitCode::FAILURE
+            features,
+            no_default_features,
+            all_features,
+        } => {
+            let options = BuildOptions {
+                profile,
+                targets: vec![target.clone()],
+                features: driver::FeatureOptions {
+                    features,
+                    no_default_features,
+                    all_features,
+                },
+            };
+            match driver::run(&workspace, &target, &args, &options) {
+                Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Command::Clean => match driver::clean(&workspace) {
             Ok(()) => {
                 println!("cleaned .tong");

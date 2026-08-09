@@ -83,12 +83,26 @@ pub fn max_size_policy(manifest: Option<&Manifest>) -> Result<u64, BuildError> {
 }
 
 /// Build driver options.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BuildOptions {
     /// Profile name.
     pub profile: String,
     /// Restrict materialized artifacts to these target names.
     pub targets: Vec<String>,
+    /// Feature selection (Cargo-style flags).
+    pub features: FeatureOptions,
+}
+
+/// Feature selection for a build (`--features`, `--no-default-features`,
+/// `--all-features`).
+#[derive(Clone, Debug, Default)]
+pub struct FeatureOptions {
+    /// Features to activate on the selected packages.
+    pub features: Vec<String>,
+    /// Disable the default feature of the selected packages.
+    pub no_default_features: bool,
+    /// Activate every declared feature of the selected packages.
+    pub all_features: bool,
 }
 
 /// Build outcome.
@@ -174,7 +188,15 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
 
     // Model first: manifest errors fail fast, before the expensive system
     // toolchain capture (rustc import + sysroot fingerprinting).
-    let model = load_model(root, manifest.as_ref())?;
+    let mut model = load_model(root, manifest.as_ref())?;
+
+    // Resolve features (Cargo resolver-v2 semantics) before planning so
+    // `--cfg feature=...` flags and optional-dep edges are baked into the
+    // action graph.
+    let requests = feature_requests(&model, options, manifest.as_ref())?;
+    let feature_map = tong_rust::resolve_features(&model, &requests, false)
+        .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    model.feature_map = feature_map;
 
     // Build-start hygiene: prune stale exec roots. Exec content is fully
     // reproducible (everything is in the CAS); failed builds keep their
@@ -398,6 +420,83 @@ fn prune_exec_dir(exec: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Builds the feature requests for a build: CLI flags apply to the
+/// selected workspace packages (selection = `--target` labels or all
+/// members); `Tong.toml` target-level `features`/`default_features` apply
+/// in native mode.
+fn feature_requests(
+    model: &tong_rust::RustModel,
+    options: &BuildOptions,
+    manifest: Option<&Manifest>,
+) -> Result<Vec<tong_rust::FeatureRequest>, BuildError> {
+    let selected = |name: &str| {
+        options.targets.is_empty()
+            || options
+                .targets
+                .iter()
+                .any(|target| artifact_name_matches(target, name))
+    };
+    let mut requests = Vec::new();
+    if let Some(manifest) = manifest {
+        // Native mode: one package per manifest target.
+        for (name, target) in &manifest.target {
+            if !selected(name) {
+                continue;
+            }
+            let mut features = target.features.clone();
+            features.extend(options.features.features.iter().cloned());
+            let default_features = if options.features.all_features {
+                true
+            } else if options.features.no_default_features {
+                false
+            } else {
+                target.default_features.unwrap_or(true)
+            };
+            requests.push(tong_rust::FeatureRequest {
+                package: name.clone(),
+                features,
+                default_features,
+            });
+        }
+    } else {
+        for name in &model.members {
+            if !selected(name) {
+                continue;
+            }
+            let mut features = options.features.features.clone();
+            let default_features = if options.features.all_features {
+                true
+            } else {
+                !options.features.no_default_features
+            };
+            if options.features.all_features
+                && let Some(package) = model.packages.iter().find(|p| &p.name == name)
+            {
+                features.extend(package.features.keys().cloned());
+            }
+            requests.push(tong_rust::FeatureRequest {
+                package: name.clone(),
+                features,
+                default_features,
+            });
+        }
+    }
+    if requests.is_empty() {
+        // No selection matched (or an empty native manifest): fall back to
+        // all members so the feature map still covers the graph.
+        for package in &model.packages {
+            if model.members.contains(&package.name) {
+                requests.push(tong_rust::FeatureRequest {
+                    package: package.name.clone(),
+                    features: Vec::new(),
+                    default_features: true,
+                });
+            }
+        }
+    }
+    Ok(requests)
+}
+
 /// Loads `Tong.toml` when present (`None` in Cargo-import mode).
 fn load_manifest(root: &Path) -> Result<Option<Manifest>, BuildError> {
     if root.join("Tong.toml").exists() {
@@ -423,12 +522,13 @@ pub fn load_model(
 }
 
 /// Runs a built binary target with the given arguments.
-pub fn run(root: &Path, target: &str, args: &[String], profile: &str) -> Result<i32, BuildError> {
-    let options = BuildOptions {
-        profile: profile.to_owned(),
-        targets: vec![target.to_owned()],
-    };
-    let outcome = build(root, &options)?;
+pub fn run(
+    root: &Path,
+    target: &str,
+    args: &[String],
+    options: &BuildOptions,
+) -> Result<i32, BuildError> {
+    let outcome = build(root, options)?;
     let binary = outcome
         .artifacts
         .first()

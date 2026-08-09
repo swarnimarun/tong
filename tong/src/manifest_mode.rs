@@ -4,6 +4,7 @@
 //! targets for the Rust backend. Cargo-style auto-detection (src/lib.rs,
 //! src/main.rs) applies so native manifests stay small.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use tong_graph::manifest::{Lto, Manifest, OptLevel, ProfileConfig};
@@ -42,6 +43,9 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     build_script: target.build_script.as_ref().map(PathBuf::from),
                     deps: parse_deps(&target.deps),
                     build_deps: Vec::new(),
+                    dev_deps: Vec::new(),
+                    features: BTreeMap::new(),
+                    has_default_feature: false,
                     rustflags: target.rustflags.clone(),
                     env: target.env.clone(),
                 });
@@ -65,6 +69,9 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     build_script: target.build_script.as_ref().map(PathBuf::from),
                     deps: parse_deps(&target.deps),
                     build_deps: Vec::new(),
+                    dev_deps: Vec::new(),
+                    features: BTreeMap::new(),
+                    has_default_feature: false,
                     rustflags: target.rustflags.clone(),
                     env: target.env.clone(),
                 };
@@ -102,6 +109,8 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
         }
     }
 
+    model.members = manifest.target.keys().cloned().collect();
+
     model.profiles = manifest
         .profile
         .iter()
@@ -130,6 +139,9 @@ fn parse_deps(deps: &[String]) -> Vec<Dep> {
             Some(Dep {
                 extern_name: name.replace('-', "_"),
                 package: name,
+                optional: false,
+                default_features: true,
+                features: Vec::new(),
             })
         })
         .collect()
