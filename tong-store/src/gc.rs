@@ -298,6 +298,7 @@ fn collect_sharded(
             continue;
         };
         if digests.contains(&digest) {
+            report.store_bytes += fs::metadata(entry.path())?.len();
             if namespace == "results" {
                 report.marked_results += 1;
             } else {

@@ -14,7 +14,9 @@ use tong_exec::{ExecError, LocalExecutor};
 use tong_graph::manifest::Manifest;
 use tong_graph::{Completed, PlanError, topological_order};
 use tong_rust::{RustBackend, capture_system_rust, import_cargo_workspace};
-use tong_store::{ActionCache, CachedResult, Cas};
+use tong_store::{
+    ActionCache, CachedResult, Cas, GcOptions, StateStore, graph_digest, project_hash, sweep,
+};
 
 use crate::manifest_mode::manifest_to_model;
 
@@ -33,17 +35,17 @@ pub fn store_dir(root: &Path, manifest: Option<&Manifest>) -> Result<PathBuf, Bu
     if let Some(dir) = std::env::var_os("TONG_STORE_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    if let Some(store) = manifest.and_then(|manifest| manifest.store.as_ref()) {
-        if let Some(dir) = &store.dir {
-            let path = Path::new(dir);
-            if path.is_absolute() || path.components().any(|c| c == std::path::Component::ParentDir)
-            {
-                return Err(BuildError::Store(format!(
-                    "[store] dir {dir:?} must be a relative path without `..` components"
-                )));
-            }
-            return Ok(root.join(path));
+    if let Some(store) = manifest.and_then(|manifest| manifest.store.as_ref())
+        && let Some(dir) = &store.dir
+    {
+        let path = Path::new(dir);
+        if path.is_absolute() || path.components().any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(BuildError::Store(format!(
+                "[store] dir {dir:?} must be a relative path without `..` components"
+            )));
         }
+        return Ok(root.join(path));
     }
     Ok(root.join(".tong").join("store"))
 }
@@ -170,6 +172,11 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     // toolchain capture (rustc import + sysroot fingerprinting).
     let model = load_model(root, manifest.as_ref())?;
 
+    // Build-start hygiene: prune stale exec roots. Exec content is fully
+    // reproducible (everything is in the CAS); failed builds keep their
+    // roots until the next build, which is the diagnosis window.
+    prune_exec_dir(&exec)?;
+
     // Toolchain: needed by the backend for action identity.
     let toolchain = capture_system_rust(&cas)?;
 
@@ -194,6 +201,10 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
 
     // Schedule: concretize, check cache, execute.
     let mut completed = CompletedMap(BTreeMap::new());
+    let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
+    let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
+    let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
+    let mut toolchains: Vec<tong_core::digest::Digest> = Vec::new();
     let mut outcome = BuildOutcome {
         actions_total: order.len(),
         ..Default::default()
@@ -202,7 +213,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     for (index, action) in order.iter().enumerate() {
         let spec = (action.make)(&completed, &cas)?;
         let digest = spec.digest();
-        if let Some(result) = cache.get(digest)? {
+        let cached = if let Some(result) = cache.get(digest)? {
             outcome.actions_cached += 1;
             println!(
                 "  [{}/{}] {} ({}) [cached]",
@@ -211,43 +222,64 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 spec.logical_id.0,
                 spec.mnemonic
             );
-            completed.0.insert(spec.logical_id.clone(), result);
-            continue;
+            result
+        } else {
+            println!(
+                "  [{}/{}] {} ({})",
+                index + 1,
+                order.len(),
+                spec.logical_id.0,
+                spec.mnemonic
+            );
+            let result = match executor.execute(&spec) {
+                Ok(outcome) => outcome,
+                Err(ExecError::Exit { code, stderr, .. }) => {
+                    let stderr_text = cas
+                        .read_blob(stderr)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    eprintln!("action {} failed with exit code {code}", spec.logical_id.0);
+                    eprintln!("{stderr_text}");
+                    return Err(BuildError::Exec(ExecError::Exit {
+                        code,
+                        stderr,
+                        exec_root: PathBuf::new(),
+                    }));
+                }
+                Err(err) => return Err(BuildError::Exec(err)),
+            };
+            let cached = CachedResult {
+                outputs: result.outputs,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                duration_millis: result.duration.as_millis() as u64,
+            };
+            cache.put(digest, &cached)?;
+            outcome.actions_executed += 1;
+            cached
+        };
+        // Record for the build-state manifest (GC root set).
+        graph_pairs.insert(spec.logical_id.0.clone(), digest);
+        sources.push(spec.input_root.digest());
+        if let Some(reference) = &spec.environment_bundle {
+            toolchains.push(reference.digest());
         }
-
-        println!(
-            "  [{}/{}] {} ({})",
-            index + 1,
-            order.len(),
-            spec.logical_id.0,
-            spec.mnemonic
-        );
-        let result = match executor.execute(&spec) {
-            Ok(outcome) => outcome,
-            Err(ExecError::Exit { code, stderr, .. }) => {
-                let stderr_text = cas
-                    .read_blob(stderr)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .unwrap_or_default();
-                eprintln!("action {} failed with exit code {code}", spec.logical_id.0);
-                eprintln!("{stderr_text}");
-                return Err(BuildError::Exec(ExecError::Exit {
-                    code,
-                    stderr,
-                    exec_root: PathBuf::new(),
-                }));
-            }
-            Err(err) => return Err(BuildError::Exec(err)),
-        };
-        let cached = CachedResult {
-            outputs: result.outputs,
-            stdout: result.stdout,
-            stderr: result.stderr,
-            duration_millis: result.duration.as_millis() as u64,
-        };
-        cache.put(digest, &cached)?;
+        recorded.push(tong_store::RecordedAction {
+            action_digest: digest,
+            logical_id: spec.logical_id.0.clone(),
+            mnemonic: spec.mnemonic.clone(),
+            input_root: spec.input_root,
+            executable: match &spec.executable {
+                tong_core::artifact::ArtifactRef::Blob(blob) => Some(*blob),
+                _ => None,
+            },
+            env_bundle: spec.environment_bundle.as_ref().map(|r| r.digest()),
+            outputs: cached.outputs,
+            stdout: cached.stdout,
+            stderr: cached.stderr,
+            duration_millis: cached.duration_millis,
+        });
         completed.0.insert(spec.logical_id.clone(), cached);
-        outcome.actions_executed += 1;
     }
 
     // Assemble requested final artifacts.
@@ -262,6 +294,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                     .any(|t| artifact_name_matches(t, &artifact.name))
         })
         .collect();
+    let mut artifact_pairs: Vec<(String, TreeDigest)> = Vec::new();
     for artifact in requested {
         let Some(result) = completed.0.get(&artifact.action) else {
             continue;
@@ -285,10 +318,80 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
             }
             fs::copy(&blob_path, &target)?;
         }
+        artifact_pairs.push((artifact.name.clone(), result.outputs));
         outcome.artifacts.push(dest.join(&artifact.name));
     }
 
+    // Record the build-state manifest (the GC root set) and run the
+    // automatic GC. Both are best-effort: cache correctness is unaffected,
+    // and a failed write leaves the previous manifest in place.
+    if let Ok(project_hash) = project_hash(root) {
+        let state = StateStore::open(&store)?;
+        let build_manifest = tong_store::BuildManifest {
+            schema_version: tong_store::BUILD_MANIFEST_SCHEMA_VERSION,
+            project_hash,
+            created_at_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            graph_digest: graph_digest(&graph_pairs),
+            profiles: vec![options.profile.clone()],
+            sources,
+            toolchains,
+            actions: recorded,
+            artifacts: artifact_pairs,
+        };
+        match state.write(&build_manifest) {
+            Ok(()) => {
+                let retention = retention_policy(manifest.as_ref())?;
+                let max_size = max_size_policy(manifest.as_ref())?;
+                let report = sweep(
+                    &cas,
+                    &state,
+                    &GcOptions {
+                        older_than: Some(retention),
+                        max_size: Some(max_size),
+                        dry_run: false,
+                        now: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    },
+                );
+                match report {
+                    Ok(report) => println!("{report}"),
+                    Err(err) => eprintln!("tong: warning: automatic GC failed: {err}"),
+                }
+            }
+            Err(err) => eprintln!(
+                "tong: warning: could not record build state ({}); GC will keep the previous manifest",
+                err
+            ),
+        }
+    }
+
     Ok(outcome)
+}
+
+/// Removes every entry of the exec directory (stale exec roots from failed
+/// or interrupted builds; content is reproducible from the CAS).
+fn prune_exec_dir(exec: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(exec) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Loads `Tong.toml` when present (`None` in Cargo-import mode).
