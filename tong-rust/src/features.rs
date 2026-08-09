@@ -424,6 +424,7 @@ mod tests {
             optional,
             default_features: true,
             features: Vec::new(),
+            target: None,
         }
     }
 
@@ -548,6 +549,7 @@ mod tests {
             optional: true,
             default_features: false,
             features: vec!["feat".to_owned()],
+            target: None,
         });
         let extra = package("extra", &[("default", &[]), ("feat", &[])], true);
         let model = model(vec![app, extra], &["app"]);
@@ -618,6 +620,7 @@ mod tests {
             optional: false,
             default_features: true,
             features: vec!["devfeat".to_owned()],
+            target: None,
         });
         let devdep = package("devdep", &[("default", &[]), ("devfeat", &[])], true);
         let model = model(vec![app, devdep], &["app"]);

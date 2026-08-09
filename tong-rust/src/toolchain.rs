@@ -76,6 +76,23 @@ impl From<std::io::Error> for ToolchainError {
     }
 }
 
+/// Returns the host target triple by querying rustc (`rustc -vV`). Cheap
+/// (one process); used before model import when the full toolchain capture
+/// has not run yet.
+pub fn host_triple() -> Result<String, ToolchainError> {
+    let rustc = std::env::var_os("TONG_RUSTC")
+        .map(PathBuf::from)
+        .or_else(|| find_on_path("rustc"))
+        .ok_or_else(|| ToolchainError::Missing("no rustc on PATH".to_owned()))?;
+    let version_verbose = run(&rustc, &["-vV"])?;
+    version_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::trim)
+        .map(str::to_owned)
+        .ok_or_else(|| ToolchainError::Missing("rustc -vV reported no host triple".to_owned()))
+}
+
 /// Captures the system Rust toolchain into the store.
 pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
     // 1. Locate rustc. TONG_RUSTC overrides PATH for testing.

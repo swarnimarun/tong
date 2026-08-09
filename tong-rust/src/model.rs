@@ -121,6 +121,9 @@ pub struct Dep {
     pub default_features: bool,
     /// Features requested on the dependency.
     pub features: Vec<String>,
+    /// Target-specific dependency: the `cfg(...)` expression (e.g.
+    /// `cfg(unix)`) or literal target triple that must match the host.
+    pub target: Option<String>,
 }
 
 /// Rust crate types the backend can compile.

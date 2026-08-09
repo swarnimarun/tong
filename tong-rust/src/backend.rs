@@ -111,6 +111,8 @@ struct CompileSpec {
     extra_flags: Vec<String>,
     /// `--cfg feature="..."` flags for the package's activated features.
     feature_cfgs: Vec<String>,
+    /// Direct deps plus the transitive closure (all mounted at `deps/`).
+    transitive_deps: Vec<DepSpec>,
 }
 
 struct BuildScriptRunSpec {
@@ -254,6 +256,33 @@ impl<'a> RustBackend<'a> {
                     format!("bs-run:{}", pkg.name),
                     ActionId(format!("rust:bs-run:{}", pkg.name)),
                 );
+            }
+        }
+
+        // 4b. Library action ids are deterministic too; pre-register them
+        //     so a library depending on another library (e.g. core →
+        //     unixonly, alphabetically later) resolves its dependency
+        //     actions regardless of package order.
+        for pkg in &self.model.packages {
+            if let Some(lib) = &pkg.lib {
+                if lib.proc_macro {
+                    self.planned_ids.insert(
+                        format!("lib:{}:proc-macro", pkg.name),
+                        ActionId(format!("rust:proc-macro:{}", pkg.name)),
+                    );
+                } else {
+                    let types: Vec<CrateType> = if lib.crate_types.is_empty() {
+                        vec![CrateType::Rlib]
+                    } else {
+                        lib.crate_types.clone()
+                    };
+                    for crate_type in types {
+                        self.planned_ids.insert(
+                            format!("lib:{}:{}", pkg.name, crate_type.to_rustc()),
+                            ActionId(format!("rust:lib:{}:{}", pkg.name, crate_type.to_rustc())),
+                        );
+                    }
+                }
             }
         }
 
@@ -404,6 +433,7 @@ impl<'a> RustBackend<'a> {
                         optional: false,
                         default_features: true,
                         features: Vec::new(),
+                        target: None,
                     },
                 );
             }
@@ -496,6 +526,11 @@ impl<'a> RustBackend<'a> {
             format!("lib{crate_name}-{meta}.{ext}")
         };
         let dep_specs = self.resolve_deps(&pkg.name, deps)?;
+        // Transitive closure of the direct deps: rustc resolves transitive
+        // rlibs through `-L dependency=...`, so every reachable crate's
+        // output tree must be mounted at `deps/` (Cargo puts all rlibs in
+        // one directory). Scheduling waits for all of them.
+        let transitive_deps = self.transitive_dep_specs(&pkg.name, deps)?;
         // Per-crate feature cfgs: `--cfg feature="<name>"` for every
         // activated feature (sorted), mirroring Cargo.
         let feature_cfgs: Vec<String> = self
@@ -549,6 +584,7 @@ impl<'a> RustBackend<'a> {
                 crate_root,
                 extra_flags,
                 feature_cfgs,
+                transitive_deps,
             }),
             source_tree,
             rustc: self.toolchain.rustc_blob,
@@ -668,20 +704,56 @@ impl<'a> RustBackend<'a> {
 
     fn resolve_deps(&self, pkg_name: &str, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
         deps.iter()
-            .filter(|dep| {
-                if !dep.optional {
-                    return true;
-                }
-                // Optional edges are linked only when activated by the
-                // feature resolution (Cargo semantics).
-                self.model
-                    .feature_map
-                    .active_optional_deps
-                    .get(pkg_name)
-                    .is_some_and(|active| active.contains(&dep.extern_name))
-            })
+            .filter(|dep| self.dep_active(pkg_name, dep))
             .map(|dep| self.dep_spec(dep))
             .collect()
+    }
+
+    /// The transitive closure of a dep list: every Rust crate action
+    /// reachable through the dependency graph (feature-gated; native
+    /// imports are leaves). Deduplicated by action id.
+    fn transitive_dep_specs(
+        &self,
+        pkg_name: &str,
+        deps: &[Dep],
+    ) -> Result<Vec<DepSpec>, PlanError> {
+        let mut out: Vec<DepSpec> = Vec::new();
+        let mut seen: BTreeSet<ActionId> = BTreeSet::new();
+        let mut frontier: Vec<(&str, &Dep)> = deps.iter().map(|dep| (pkg_name, dep)).collect();
+        while let Some((parent, dep)) = frontier.pop() {
+            if !self.dep_active(parent, dep) {
+                continue;
+            }
+            let spec = self.dep_spec(dep)?;
+            if let DepSpec::Rust { action, .. } = &spec {
+                if !seen.insert(action.clone()) {
+                    continue;
+                }
+                if let Some(pkg) = self.model.packages.iter().find(|p| p.name == dep.package) {
+                    frontier.extend(pkg.deps.iter().map(|next| (pkg.name.as_str(), next)));
+                }
+            }
+            out.push(spec);
+        }
+        // Deterministic order (scheduling + mounts): sort by action id.
+        out.sort_by_key(|spec| match spec {
+            DepSpec::Rust { action, .. } => action.clone(),
+            DepSpec::Native => ActionId(String::new()),
+        });
+        Ok(out)
+    }
+
+    /// Whether a dep edge is live: non-optional edges always; optional
+    /// edges only when the feature resolution activated them.
+    fn dep_active(&self, pkg_name: &str, dep: &Dep) -> bool {
+        if !dep.optional {
+            return true;
+        }
+        self.model
+            .feature_map
+            .active_optional_deps
+            .get(pkg_name)
+            .is_some_and(|active| active.contains(&dep.extern_name))
     }
 
     /// Resolves a dependency to its producer action or native import.
@@ -846,6 +918,7 @@ impl Ctx {
             CtxKind::Compile(spec) => spec
                 .deps
                 .iter()
+                .chain(spec.transitive_deps.iter())
                 .filter_map(|dep| match dep {
                     DepSpec::Rust { action, .. } => Some(action.clone()),
                     DepSpec::Native => None,
@@ -947,6 +1020,27 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                         args.push(format!("{extern_name}={EXEC_ROOT_VAR}/in/deps/{file}"));
                     }
                     DepSpec::Native => {}
+                }
+            }
+            // Transitive crate outputs: rustc resolves them through
+            // `-L dependency=...`; direct mounts above are a subset.
+            let direct: BTreeSet<ActionId> = spec
+                .deps
+                .iter()
+                .filter_map(|dep| match dep {
+                    DepSpec::Rust { action, .. } => Some(action.clone()),
+                    DepSpec::Native => None,
+                })
+                .collect();
+            for dep in &spec.transitive_deps {
+                if let DepSpec::Rust { action, .. } = dep {
+                    if direct.contains(action) {
+                        continue;
+                    }
+                    let tree = completed
+                        .output_tree(action)
+                        .ok_or_else(|| PlanError::MissingDependency(action.clone()))?;
+                    mounts.push((RelativePath::new("deps").unwrap(), tree));
                 }
             }
             for (name, tree, link) in &ctx.cc {

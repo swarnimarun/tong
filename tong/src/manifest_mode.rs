@@ -142,6 +142,7 @@ fn parse_deps(deps: &[String]) -> Vec<Dep> {
                 optional: false,
                 default_features: true,
                 features: Vec::new(),
+                target: None,
             })
         })
         .collect()

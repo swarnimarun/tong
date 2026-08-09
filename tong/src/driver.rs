@@ -515,7 +515,11 @@ pub fn load_model(
     if let Some(manifest) = manifest {
         Ok(manifest_to_model(manifest, root))
     } else if root.join("Cargo.toml").exists() {
-        import_cargo_workspace(root).map_err(|err| BuildError::Manifest(err.to_string()))
+        // Target-specific deps need the host triple; a single `rustc -vV`
+        // query is far cheaper than the full toolchain capture.
+        let host_triple = tong_rust::host_triple()?;
+        import_cargo_workspace(root, &host_triple)
+            .map_err(|err| BuildError::Manifest(err.to_string()))
     } else {
         Err(BuildError::NoManifest)
     }

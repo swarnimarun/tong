@@ -19,4 +19,4 @@ pub use model::{
     BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PanicStrategy,
     ProfileSpec, RustModel,
 };
-pub use toolchain::{SystemRust, ToolchainError, capture_system_rust};
+pub use toolchain::{SystemRust, ToolchainError, capture_system_rust, host_triple};
