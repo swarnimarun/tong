@@ -122,7 +122,7 @@ pub struct TestTarget {
     pub harness: bool,
 }
 
-/// A dependency on another package in the workspace.
+/// A dependency edge on another package in the workspace.
 #[derive(Clone, Debug)]
 pub struct Dep {
     /// `--extern` name used by the dependent crate.
@@ -138,6 +138,26 @@ pub struct Dep {
     /// Target-specific dependency: the `cfg(...)` expression (e.g.
     /// `cfg(unix)`) or literal target triple that must match the host.
     pub target: Option<String>,
+}
+
+/// An unresolved registry dependency edge, collected during import
+/// (`Tong.lock` roots for the version resolver).
+#[derive(Clone, Debug)]
+pub struct RegistryEdge {
+    /// The package declaring the dependency.
+    pub parent: String,
+    /// `--extern` name used by the dependent crate.
+    pub extern_name: String,
+    /// Real package name.
+    pub package: String,
+    /// Version requirement, as written in the manifest.
+    pub req: String,
+    /// Optional dependency (feature-activated).
+    pub optional: bool,
+    /// Whether the dependency's default feature is enabled.
+    pub default_features: bool,
+    /// Features requested on the dependency.
+    pub features: Vec<String>,
 }
 
 /// Rust crate types the backend can compile.

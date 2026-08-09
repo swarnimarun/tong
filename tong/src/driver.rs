@@ -135,6 +135,8 @@ pub enum BuildError {
     Exec(ExecError),
     /// Store configuration or GC failure.
     Store(String),
+    /// The build needs a lockfile or fetched sources it does not have.
+    Offline(String),
     /// I/O failure.
     Io(io::Error),
 }
@@ -151,6 +153,7 @@ impl fmt::Display for BuildError {
             Self::Cycle(msg) => write!(f, "{msg}"),
             Self::Exec(err) => write!(f, "{err}"),
             Self::Store(msg) => write!(f, "{msg}"),
+            Self::Offline(msg) => write!(f, "{msg}"),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -530,8 +533,10 @@ fn prepare(
     let cache = ActionCache::open(&cas)?;
 
     // Model first: manifest errors fail fast, before the expensive system
-    // toolchain capture (rustc import + sysroot fingerprinting).
-    let mut model = load_model(root, manifest.as_ref())?;
+    // toolchain capture (rustc import + sysroot fingerprinting). Registry
+    // deps resolve against Tong.lock + the source store.
+    let sources = LockedSource::new(root, &store);
+    let mut model = load_model(root, manifest.as_ref(), &sources)?;
 
     // Resolve features (Cargo resolver-v2 semantics) before planning so
     // `--cfg feature=...` flags and optional-dep edges are baked into the
@@ -769,6 +774,7 @@ fn load_manifest(root: &Path) -> Result<Option<Manifest>, BuildError> {
 pub fn load_model(
     root: &Path,
     manifest: Option<&Manifest>,
+    sources: &dyn tong_rust::LockedSourceProvider,
 ) -> Result<tong_rust::RustModel, BuildError> {
     if let Some(manifest) = manifest {
         Ok(manifest_to_model(manifest, root))
@@ -776,7 +782,7 @@ pub fn load_model(
         // Target-specific deps need the host triple; a single `rustc -vV`
         // query is far cheaper than the full toolchain capture.
         let host_triple = tong_rust::host_triple()?;
-        import_cargo_workspace(root, &host_triple)
+        import_cargo_workspace(root, &host_triple, sources)
             .map_err(|err| BuildError::Manifest(err.to_string()))
     } else {
         Err(BuildError::NoManifest)
@@ -930,6 +936,324 @@ impl Completed for CompletedMap {
 /// Completed actions keyed by logical id (newtype to satisfy the orphan
 /// rule for the [`Completed`] trait).
 struct CompletedMap(BTreeMap<ActionId, CachedResult>);
+
+/// The lockfile-backed source provider used by builds and `tong fetch`:
+/// resolves registry deps against `Tong.lock` and materializes checkouts
+/// from the source store (never the network).
+struct LockedSource {
+    lock: Option<tong_fetch::TongLock>,
+    store: PathBuf,
+}
+
+impl LockedSource {
+    fn new(root: &Path, store: &Path) -> Self {
+        let lock = tong_fetch::TongLock::load(root).ok();
+        Self {
+            lock,
+            store: store.to_path_buf(),
+        }
+    }
+
+    fn locked_package(&self, name: &str) -> Result<&tong_fetch::LockedPackage, BuildError> {
+        let lock = self.lock.as_ref().ok_or_else(|| {
+            BuildError::Offline(format!(
+                "registry dependency `{name}` requires Tong.lock; run `tong lock`"
+            ))
+        })?;
+        lock.package(name).ok_or_else(|| {
+            BuildError::Offline(format!(
+                "registry dependency `{name}` is not in Tong.lock; run `tong lock`"
+            ))
+        })
+    }
+}
+
+impl tong_rust::LockedSourceProvider for LockedSource {
+    fn locked_version(
+        &self,
+        edge: &tong_rust::RegistryEdge,
+    ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
+        let package = self
+            .locked_package(&edge.package)
+            .map_err(|err| tong_rust::CargoImportError::Unsupported(err.to_string()))?;
+        let req = semver::VersionReq::parse(&edge.req).map_err(|err| {
+            tong_rust::CargoImportError::Unsupported(format!(
+                "invalid version requirement {:?} for `{}`: {err}",
+                edge.req, edge.package
+            ))
+        })?;
+        if !req.matches(&package.version) {
+            return Err(tong_rust::CargoImportError::Unsupported(format!(
+                "lockfile out of date: `{}` requires {} but Tong.lock has {}; \
+                 run `tong lock`",
+                edge.package, edge.req, package.version
+            )));
+        }
+        Ok(Some(package.version.clone()))
+    }
+
+    fn source_dir(
+        &self,
+        name: &str,
+        version: &semver::Version,
+    ) -> Result<PathBuf, tong_rust::CargoImportError> {
+        let package = self
+            .locked_package(name)
+            .map_err(|err| tong_rust::CargoImportError::Unsupported(err.to_string()))?;
+        if package.version != *version {
+            return Err(tong_rust::CargoImportError::Unsupported(format!(
+                "lockfile out of date: `{name}` locked at {} but {version} requested; \
+                 run `tong lock`",
+                package.version
+            )));
+        }
+        let checksum = package.checksum.as_deref().ok_or_else(|| {
+            tong_rust::CargoImportError::Unsupported(format!(
+                "`{name} {version}` is not a registry package"
+            ))
+        })?;
+        tong_fetch::materialize_source(&self.store, name, version, checksum).map_err(|err| {
+            tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
+        })
+    }
+}
+
+/// Collecting provider used by `tong lock`: records registry edges for the
+/// version resolver instead of resolving them.
+#[derive(Default)]
+struct CollectProvider {
+    edges: std::cell::RefCell<Vec<tong_rust::RegistryEdge>>,
+}
+
+impl CollectProvider {
+    fn take_edges(&self) -> Vec<tong_rust::RegistryEdge> {
+        std::mem::take(&mut *self.edges.borrow_mut())
+    }
+}
+
+impl tong_rust::LockedSourceProvider for CollectProvider {
+    fn locked_version(
+        &self,
+        edge: &tong_rust::RegistryEdge,
+    ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
+        // Validate the requirement syntax so `tong lock` fails early.
+        semver::VersionReq::parse(&edge.req).map_err(|err| {
+            tong_rust::CargoImportError::Unsupported(format!(
+                "invalid version requirement {:?} for `{}`: {err}",
+                edge.req, edge.package
+            ))
+        })?;
+        self.edges.borrow_mut().push(edge.clone());
+        Ok(None)
+    }
+
+    fn source_dir(
+        &self,
+        _name: &str,
+        _version: &semver::Version,
+    ) -> Result<PathBuf, tong_rust::CargoImportError> {
+        Err(tong_rust::CargoImportError::Unsupported(
+            "registry packages are not imported during `tong lock`".to_owned(),
+        ))
+    }
+}
+
+/// The registry configuration: env `TONG_REGISTRY_INDEX` → `[registry]
+/// index` → crates.io.
+fn registry_config(manifest: Option<&Manifest>) -> Result<tong_fetch::RegistryConfig, BuildError> {
+    let index = std::env::var("TONG_REGISTRY_INDEX")
+        .ok()
+        .or_else(|| {
+            manifest
+                .and_then(|manifest| manifest.registry.as_ref())
+                .and_then(|registry| registry.index.clone())
+        })
+        .unwrap_or_else(|| "sparse+https://index.crates.io/".to_owned());
+    tong_fetch::RegistryConfig::from_url(&index).map_err(|err| BuildError::Store(err.to_string()))
+}
+
+/// Writes `Tong.lock`: imports the manifests (collecting registry edges),
+/// resolves versions against the index (using the existing lock as
+/// preference + yanked allowance), and records registry and path packages.
+pub fn lock(root: &Path, offline: bool) -> Result<(), BuildError> {
+    lock_with(root, offline, None)
+}
+
+/// Re-resolves `Tong.lock`; `package` drops only that package's lockfile
+/// preference (Cargo `update -p` semantics).
+pub fn update(root: &Path, package: Option<&str>) -> Result<(), BuildError> {
+    lock_with(root, false, package)
+}
+
+fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Result<(), BuildError> {
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let _cas = Cas::open(&store)?;
+
+    // Collect registry edges via a collecting provider.
+    let provider = CollectProvider::default();
+    let model = load_model(root, manifest.as_ref(), &provider)?;
+    let edges = provider.take_edges();
+
+    // Feature resolution decides which optional edges are live.
+    let requests = feature_requests(&model, &BuildOptions::default(), manifest.as_ref())?;
+    let feature_map = tong_rust::resolve_features(&model, &requests, true)
+        .map_err(|err| BuildError::Manifest(err.to_string()))?;
+
+    // Index client (cached under <store>/index/).
+    let registry = registry_config(manifest.as_ref())?;
+    let mut index = tong_fetch::IndexClient::new(store.join("index"), registry.clone());
+    index.set_offline(offline);
+    let mut preferences = tong_fetch::TongLock::load(root).unwrap_or_default();
+    if let Some(package) = drop_preference {
+        preferences.packages.retain(|p| p.name != package);
+    }
+
+    let mut roots: Vec<tong_fetch::ResolvedDep> = Vec::new();
+    for edge in &edges {
+        let active = !edge.optional
+            || feature_map
+                .active_optional_deps
+                .get(&edge.parent)
+                .is_some_and(|active| active.contains(&edge.extern_name));
+        if !active {
+            continue;
+        }
+        let req = semver::VersionReq::parse(&edge.req)
+            .map_err(|err| BuildError::Manifest(err.to_string()))?;
+        roots.push(tong_fetch::ResolvedDep {
+            name: edge.package.clone(),
+            req,
+            features: edge.features.clone(),
+            optional: edge.optional,
+            default_features: edge.default_features,
+            kind: tong_fetch::DepKind::Normal,
+            registry: None,
+        });
+    }
+    let resolved = tong_fetch::resolve(&index, &roots, &preferences)
+        .map_err(|err| BuildError::Manifest(err.to_string()))?;
+
+    // Assemble the lock: registry packages plus workspace/path packages.
+    let mut locked = tong_fetch::TongLock {
+        version: tong_fetch::LOCKFILE_VERSION,
+        packages: Vec::new(),
+    };
+    let registry_source = format!("registry+{}", registry.index_url);
+    for package in &resolved {
+        let mut deps: Vec<String> = package
+            .dependencies
+            .iter()
+            .map(|dep| {
+                let version = resolved
+                    .iter()
+                    .find(|p| p.name == dep.name)
+                    .map(|p| p.version.to_string())
+                    .unwrap_or_else(|| dep.req.to_string());
+                format!("{} {version} {registry_source}", dep.name)
+            })
+            .collect();
+        deps.sort();
+        deps.dedup();
+        locked.packages.push(tong_fetch::LockedPackage {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            source: registry_source.clone(),
+            checksum: Some(package.checksum.clone()),
+            manifest_checksum: None,
+            yanked: package.yanked,
+            publish_time: None,
+            dependencies: deps,
+        });
+    }
+    let path_packages: Vec<&tong_rust::Package> = model
+        .packages
+        .iter()
+        .filter(|pkg| !resolved.iter().any(|p| p.name == pkg.name))
+        .collect();
+    for pkg in &path_packages {
+        let relative = pkg.dir.strip_prefix(root).unwrap_or(&pkg.dir).to_path_buf();
+        let manifest_checksum = fs::read(pkg.dir.join("Cargo.toml"))
+            .ok()
+            .map(|bytes| tong_core::digest::Hasher::digest(&bytes).to_hex());
+        let mut deps: Vec<String> = pkg
+            .deps
+            .iter()
+            .chain(pkg.build_deps.iter())
+            .chain(pkg.dev_deps.iter())
+            .filter_map(|dep| {
+                let version =
+                    if let Some(other) = path_packages.iter().find(|p| p.name == dep.package) {
+                        other.version.clone()
+                    } else {
+                        resolved
+                            .iter()
+                            .find(|p| p.name == dep.package)?
+                            .version
+                            .to_string()
+                    };
+                let source = if path_packages.iter().any(|p| p.name == dep.package) {
+                    format!("path+{}", relative.display())
+                } else {
+                    registry_source.clone()
+                };
+                Some(format!("{} {version} {source}", dep.package))
+            })
+            .collect();
+        deps.sort();
+        deps.dedup();
+        locked.packages.push(tong_fetch::LockedPackage {
+            name: pkg.name.clone(),
+            version: semver::Version::parse(&pkg.version)
+                .unwrap_or_else(|_| semver::Version::new(0, 0, 0)),
+            source: format!("path+{}", relative.display()),
+            checksum: None,
+            manifest_checksum,
+            yanked: false,
+            publish_time: None,
+            dependencies: deps,
+        });
+    }
+    locked
+        .save(root)
+        .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    println!("wrote Tong.lock ({} packages)", locked.packages.len());
+    Ok(())
+}
+
+/// Downloads every locked registry package into the source store; a no-op
+/// when everything is already stored.
+pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let cas = Cas::open(&store)?;
+    let lock =
+        tong_fetch::TongLock::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
+    let registry = registry_config(manifest.as_ref())?;
+    let _ = offline;
+    let mut fetched = 0;
+    for package in &lock.packages {
+        if !package.source.starts_with("registry+") {
+            continue;
+        }
+        let Some(checksum) = &package.checksum else {
+            continue;
+        };
+        let resolved = tong_fetch::ResolvedPackage {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            checksum: checksum.clone(),
+            dependencies: Vec::new(),
+            features: Default::default(),
+            yanked: package.yanked,
+        };
+        tong_fetch::fetch_crate(&cas, &registry, &resolved)
+            .map_err(|err| BuildError::Manifest(err.to_string()))?;
+        fetched += 1;
+    }
+    println!("fetched {fetched} crates");
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

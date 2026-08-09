@@ -94,12 +94,32 @@ pub enum IndexDepKind {
 #[derive(Clone, Debug)]
 pub struct IndexClient {
     cache_dir: PathBuf,
+    /// The registry this client serves.
+    config: RegistryConfig,
+    /// Never touch the network (`tong lock --offline`); a missing cache
+    /// entry is an error.
+    offline: bool,
 }
 
 impl IndexClient {
-    /// Creates a client using `cache_dir` (e.g. `<store>/index/`).
-    pub fn new(cache_dir: PathBuf) -> Self {
-        Self { cache_dir }
+    /// Creates a client for `config` using `cache_dir` (e.g.
+    /// `<store>/index/`).
+    pub fn new(cache_dir: PathBuf, config: RegistryConfig) -> Self {
+        Self {
+            cache_dir,
+            config,
+            offline: false,
+        }
+    }
+
+    /// The registry config.
+    pub fn config(&self) -> &RegistryConfig {
+        &self.config
+    }
+
+    /// Sets offline mode: index entries come from the cache only.
+    pub fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
     }
 
     /// The index cache directory.
@@ -108,13 +128,9 @@ impl IndexClient {
     }
 
     /// Fetches (or serves from cache) every version entry of `name`.
-    pub fn versions(
-        &self,
-        config: &RegistryConfig,
-        name: &str,
-    ) -> Result<Vec<IndexVersion>, FetchError> {
-        let path = index_path(config, name);
-        let url = format!("{}/{}", config.index_url.trim_end_matches('/'), path);
+    pub fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, FetchError> {
+        let path = index_path_for_name(name);
+        let url = format!("{}/{}", self.config.index_url.trim_end_matches('/'), path);
         let cache_file = self.cache_file(name);
         let etag_file = cache_file.with_extension("etag");
 
@@ -131,6 +147,16 @@ impl IndexClient {
 
         let etag = fs::read_to_string(&etag_file).ok();
         let cached = fs::read_to_string(&cache_file).ok();
+
+        // Offline mode: the cache is the only source.
+        if self.offline {
+            return match cached {
+                Some(cached) => parse(&cached, "index cache"),
+                None => Err(FetchError::NotFound(format!(
+                    "cached index entry for `{name}` (run `tong lock` online once)"
+                ))),
+            };
+        }
 
         // Revalidate when a cache exists.
         if cached.is_some() {
@@ -203,6 +229,12 @@ impl IndexClient {
     }
 }
 
+impl crate::resolve::CrateSource for IndexClient {
+    fn versions(&self, name: &str) -> Result<Vec<IndexVersion>, FetchError> {
+        IndexClient::versions(self, name)
+    }
+}
+
 /// The index path for a crate name (Cargo book rules).
 fn index_path_for_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
@@ -254,7 +286,12 @@ mod tests {
 
     fn index_client() -> (tempfile::TempDir, IndexClient) {
         let dir = tempfile::tempdir().unwrap();
-        let client = IndexClient::new(dir.path().join("index"));
+        let config = RegistryConfig {
+            index_url: "file:///nonexistent".to_owned(),
+            dl: String::new(),
+            api: None,
+        };
+        let client = IndexClient::new(dir.path().join("index"), config);
         (dir, client)
     }
 
@@ -270,7 +307,7 @@ mod tests {
 
     #[test]
     fn parses_index_entries_and_skips_new_schema() {
-        let (dir, client) = index_client();
+        let (dir, _client) = index_client();
         let url = write_index_file(
             dir.path(),
             "foo",
@@ -283,7 +320,8 @@ mod tests {
             dl: String::new(),
             api: None,
         };
-        let versions = client.versions(&config, "foo").unwrap();
+        let client = IndexClient::new(dir.path().join("index"), config);
+        let versions = client.versions("foo").unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].vers, Version::new(1, 0, 0));
         assert_eq!(versions[0].deps[0].name, "bar");
@@ -293,7 +331,7 @@ mod tests {
 
     #[test]
     fn merges_features2_into_features() {
-        let (dir, client) = index_client();
+        let (dir, _client) = index_client();
         let line = r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"x","features":{"a":["b"]},"features2":{"a":["c"]},"yanked":false,"v":2}"#;
         let url = write_index_file(dir.path(), "foo", line);
         let config = RegistryConfig {
@@ -301,7 +339,8 @@ mod tests {
             dl: String::new(),
             api: None,
         };
-        let versions = client.versions(&config, "foo").unwrap();
+        let client = IndexClient::new(dir.path().join("index"), config);
+        let versions = client.versions("foo").unwrap();
         let merged = versions[0].features["a"].clone();
         assert!(merged.contains(&"b".to_owned()));
         assert!(merged.contains(&"c".to_owned()));
@@ -309,7 +348,7 @@ mod tests {
 
     #[test]
     fn flags_yanked_versions() {
-        let (dir, client) = index_client();
+        let (dir, _client) = index_client();
         let line = r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"x","features":{},"yanked":true,"v":1}"#;
         let url = write_index_file(dir.path(), "foo", line);
         let config = RegistryConfig {
@@ -317,7 +356,8 @@ mod tests {
             dl: String::new(),
             api: None,
         };
-        let versions = client.versions(&config, "foo").unwrap();
+        let client = IndexClient::new(dir.path().join("index"), config);
+        let versions = client.versions("foo").unwrap();
         assert!(versions[0].yanked);
     }
 

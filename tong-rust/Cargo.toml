@@ -12,6 +12,7 @@ tong-graph = { path = "../tong-graph" }
 tong-store = { path = "../tong-store" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
+semver = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

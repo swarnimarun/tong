@@ -651,8 +651,13 @@ name = "tong"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "flate2",
+ "semver",
+ "tar",
+ "tempfile",
  "tong-core",
  "tong-exec",
+ "tong-fetch",
  "tong-graph",
  "tong-rust",
  "tong-store",
@@ -706,6 +711,7 @@ dependencies = [
 name = "tong-rust"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "serde",
  "tempfile",
  "toml",

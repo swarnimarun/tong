@@ -83,6 +83,23 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Resolve versions and write `Tong.lock`.
+    Lock {
+        /// Use the cached index only; fail when an entry is missing.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Download locked crate sources into the store.
+    Fetch {
+        /// Never touch the network; fail when a source is missing.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Re-resolve `Tong.lock` (optionally for one package).
+    Update {
+        /// Only drop this package's lockfile preference.
+        package: Option<String>,
+    },
     /// Garbage-collect the store: delete unreferenced cache objects.
     Gc {
         /// Delete unmarked objects older than this duration (`0` = all).
@@ -188,6 +205,27 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Lock { offline } => match driver::lock(&workspace, offline) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("tong: error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Fetch { offline } => match driver::fetch(&workspace, offline) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("tong: error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Update { package } => match driver::update(&workspace, package.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("tong: error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Gc {
             older_than,
             max_size,

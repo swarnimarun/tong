@@ -49,6 +49,10 @@ pub fn fetch_crate(
         verify_crate_bytes(&bytes, &pkg.checksum, &pkg.name)?;
         fs::create_dir_all(blob_path.parent().expect("sources dir"))?;
         fs::write(&blob_path, bytes)?;
+    } else {
+        // Content-addressing is only sound if the stored blob really has
+        // the expected checksum; verify instead of trusting the path.
+        verify_crate_bytes(&fs::read(&blob_path)?, &pkg.checksum, &pkg.name)?;
     }
 
     let checkout = checkout_dir(cas.root(), &pkg.name, &pkg.version, &pkg.checksum);
@@ -69,6 +73,28 @@ pub fn verify_crate_bytes(bytes: &[u8], expected: &str, package: &str) -> Result
         });
     }
     Ok(())
+}
+
+/// Materializes a locked package's checkout from the stored `.crate` blob
+/// (no network). Errors when the blob is missing (call `tong fetch`).
+pub fn materialize_source(
+    store: &Path,
+    name: &str,
+    version: &Version,
+    checksum: &str,
+) -> Result<PathBuf, FetchError> {
+    let blob_path = crate_blob_path(store, checksum);
+    if !blob_path.is_file() {
+        return Err(FetchError::NotFound(format!(
+            "source archive for `{name} {version}` ({checksum}.crate)"
+        )));
+    }
+    verify_crate_bytes(&fs::read(&blob_path)?, checksum, name)?;
+    let checkout = checkout_dir(store, name, version, checksum);
+    if !checkout.is_dir() {
+        extract_crate(&blob_path, &checkout)?;
+    }
+    Ok(checkout)
 }
 
 /// Extracts a gzipped tar `.crate` into `dest` (created if missing).

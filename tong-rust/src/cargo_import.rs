@@ -12,11 +12,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use semver::Version;
 use serde::Deserialize;
 
 use crate::model::{
-    BinTarget, Dep, Edition, LibTarget, Lto, Package, PanicStrategy, ProfileSpec, RustModel,
-    TestTarget, lib_crate_name,
+    BinTarget, Dep, Edition, LibTarget, Lto, Package, PanicStrategy, ProfileSpec, RegistryEdge,
+    RustModel, TestTarget, lib_crate_name,
 };
 
 /// Cargo import failure.
@@ -260,15 +261,33 @@ enum EnvValue {
     Table { value: String },
 }
 
+/// A source of locked registry packages: version lookup and extracted
+/// source directories.
+///
+/// Implemented by the driver over `Tong.lock` + the source store; `tong
+/// lock` uses a collecting provider that records edges instead of
+/// resolving them.
+pub trait LockedSourceProvider {
+    /// The locked version of a registry dep edge. `Ok(None)` means the
+    /// edge is not resolved (collecting mode — used by `tong lock`); an
+    /// `Err` is a targeted diagnostic (missing lock, missing entry, or a
+    /// lockfile out of date).
+    fn locked_version(&self, edge: &RegistryEdge) -> Result<Option<Version>, CargoImportError>;
+    /// The extracted source directory of a locked package.
+    fn source_dir(&self, name: &str, version: &Version) -> Result<PathBuf, CargoImportError>;
+}
+
 /// Imports a Cargo workspace into a [`RustModel`].
 ///
 /// `host_triple` is the rustc host triple (`rustc -vV`); it is used to
 /// evaluate target-specific dependencies (`[target.'cfg(...)'.dependencies]`
 /// and the dep-table `target` key). Cross-compilation is out of scope, so
-/// the host triple is the only evaluation context.
+/// the host triple is the only evaluation context. Registry dependencies
+/// resolve through `sources` (`Tong.lock` + the source store).
 pub fn import_cargo_workspace(
     workspace_root: &Path,
     host_triple: &str,
+    sources: &dyn LockedSourceProvider,
 ) -> Result<RustModel, CargoImportError> {
     let root_manifest = read_manifest(workspace_root)?;
 
@@ -308,6 +327,7 @@ pub fn import_cargo_workspace(
             &inherited,
             workspace_root,
             host_triple,
+            sources,
         )?;
     }
 
@@ -438,6 +458,7 @@ fn import_package(
     inherited: &Inherited,
     workspace_root: &Path,
     host_triple: &str,
+    sources: &dyn LockedSourceProvider,
 ) -> Result<String, CargoImportError> {
     let canonical = fs::canonicalize(dir)
         .map_err(|err| CargoImportError::Io(dir.display().to_string(), err))?;
@@ -628,24 +649,30 @@ fn import_package(
             merge_target_tables(&manifest, host_triple)?;
         let resolved_deps = resolve_deps(
             &dependencies,
+            &pkg.name,
             &canonical,
             workspace_root,
             &inherited.deps,
             host_triple,
+            sources,
         )?;
         let resolved_build_deps = resolve_deps(
             &build_dependencies,
+            &pkg.name,
             &canonical,
             workspace_root,
             &inherited.deps,
             host_triple,
+            sources,
         )?;
         let resolved_dev_deps = resolve_deps(
             &dev_dependencies,
+            &pkg.name,
             &canonical,
             workspace_root,
             &inherited.deps,
             host_triple,
+            sources,
         )?;
         let mut deps = Vec::new();
         let mut build_deps = Vec::new();
@@ -665,6 +692,7 @@ fn import_package(
                             &inherited,
                             workspace_root,
                             host_triple,
+                            sources,
                         )?;
                         if imported != dep.package {
                             return Err(CargoImportError::Unsupported(format!(
@@ -677,7 +705,36 @@ fn import_package(
                         }
                         imported
                     }
-                    None => dep.package,
+                    None => {
+                        // Registry dependency: resolved through the
+                        // lockfile-backed source provider. The provider
+                        // already validated the version requirement.
+                        let Some(version) = dep.locked_version else {
+                            // Collecting mode (`tong lock`): the edge was
+                            // recorded; no package is imported.
+                            continue;
+                        };
+                        let dir = sources.source_dir(&dep.package, &version)?;
+                        let imported = import_package(
+                            &dir,
+                            packages,
+                            visiting,
+                            &inherited,
+                            workspace_root,
+                            host_triple,
+                            sources,
+                        )?;
+                        if imported != dep.package {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "locked dependency {} = {{ version = {:?} }} resolves to \
+                                 package {imported:?}, not {:?}",
+                                dep.extern_name.replace('_', "-"),
+                                version,
+                                dep.package
+                            )));
+                        }
+                        imported
+                    }
                 };
                 target.push(Dep {
                     extern_name: dep.extern_name,
@@ -739,7 +796,8 @@ fn resolve_field(
 }
 
 /// A resolved dependency: the crate name used at the use site, the package
-/// name it refers to, and — for path dependencies — the package directory.
+/// name it refers to, and — for path dependencies — the package directory;
+/// registry dependencies carry their locked version.
 struct ResolvedDep {
     extern_name: String,
     package: String,
@@ -747,28 +805,44 @@ struct ResolvedDep {
     optional: bool,
     default_features: bool,
     features: Vec<String>,
-    _target: Option<String>,
+    locked_version: Option<semver::Version>,
 }
 
 fn resolve_deps(
     deps: &BTreeMap<String, DepValue>,
+    parent_name: &str,
     member: &Path,
     workspace_root: &Path,
     inherited: &BTreeMap<String, DepValue>,
     host_triple: &str,
+    sources: &dyn LockedSourceProvider,
 ) -> Result<Vec<ResolvedDep>, CargoImportError> {
     let mut out = Vec::new();
     for (name, value) in deps {
         // The effective table: the member's own table merged over the
         // inherited `[workspace.dependencies]` table (Cargo semantics:
         // features concatenate, other keys override).
-        let (path, package, optional, default_features, mut features, target) = match value {
+        let (path, package, optional, default_features, features, req) = match value {
             DepValue::Version(version) => {
-                return Err(CargoImportError::Unsupported(format!(
-                    "dependency {name:?} = {version:?} in {} is a registry dependency; \
-                     Tong offline mode requires path or workspace dependencies",
-                    member.display()
-                )));
+                // Registry dependency: resolved through the lockfile.
+                let edge = RegistryEdge {
+                    parent: parent_name.to_owned(),
+                    extern_name: name.replace('-', "_"),
+                    package: name.clone(),
+                    req: version.clone(),
+                    optional: false,
+                    default_features: true,
+                    features: Vec::new(),
+                };
+                let locked = sources.locked_version(&edge)?;
+                (
+                    None,
+                    name.clone(),
+                    false,
+                    true,
+                    Vec::new(),
+                    Some((edge, locked)),
+                )
             }
             DepValue::Table {
                 path,
@@ -787,15 +861,18 @@ fn resolve_deps(
                         continue;
                     }
                 }
+                let optional = optional.unwrap_or(false);
+                let default_features = default_features.unwrap_or(true);
+                let features = features.clone().unwrap_or_default();
                 if let Some(path) = path {
                     // Path deps resolve relative to the declaring manifest.
                     (
                         Some(member.join(path)),
                         package.clone().unwrap_or_else(|| name.clone()),
-                        optional.unwrap_or(false),
-                        default_features.unwrap_or(true),
-                        features.clone().unwrap_or_default(),
-                        target.clone(),
+                        optional,
+                        default_features,
+                        features,
+                        None,
                     )
                 } else if *workspace == Some(true) {
                     match inherited.get(name) {
@@ -811,44 +888,63 @@ fn resolve_deps(
                             // workspace root manifest.
                             let mut merged_features =
                                 inherited_features.clone().unwrap_or_default();
-                            if let Some(features) = features {
-                                for feature in features {
-                                    if !merged_features.contains(feature) {
-                                        merged_features.push(feature.clone());
-                                    }
+                            for feature in &features {
+                                if !merged_features.contains(feature) {
+                                    merged_features.push(feature.clone());
                                 }
                             }
                             (
                                 Some(workspace_root.join(path)),
                                 inherited_package.clone().unwrap_or_else(|| name.clone()),
-                                optional.or(*inherited_optional).unwrap_or(false),
-                                default_features
-                                    .or(*inherited_default_features)
-                                    .unwrap_or(true),
+                                optional || inherited_optional.unwrap_or(false),
+                                default_features && inherited_default_features.unwrap_or(true),
                                 merged_features,
-                                target.clone(),
+                                None,
                             )
                         }
                         Some(DepValue::Version(version)) => {
-                            return Err(CargoImportError::Unsupported(format!(
-                                "dependency {name:?} = {version:?} in {} is inherited \
-                                 from [workspace.dependencies] and is a registry \
-                                 dependency; Tong offline mode requires path or \
-                                 workspace dependencies",
-                                member.display()
-                            )));
+                            // Inherited registry dependency.
+                            let edge = RegistryEdge {
+                                parent: parent_name.to_owned(),
+                                extern_name: name.replace('-', "_"),
+                                package: name.clone(),
+                                req: version.clone(),
+                                optional,
+                                default_features,
+                                features: features.clone(),
+                            };
+                            let locked = sources.locked_version(&edge)?;
+                            (
+                                None,
+                                name.clone(),
+                                optional,
+                                default_features,
+                                features,
+                                Some((edge, locked)),
+                            )
                         }
                         Some(DepValue::Table {
                             version: Some(version),
                             ..
                         }) => {
-                            return Err(CargoImportError::Unsupported(format!(
-                                "dependency {name:?} = {version:?} in {} is inherited \
-                                 from [workspace.dependencies] and is a registry \
-                                 dependency; Tong offline mode requires path or \
-                                 workspace dependencies",
-                                member.display()
-                            )));
+                            let edge = RegistryEdge {
+                                parent: parent_name.to_owned(),
+                                extern_name: name.replace('-', "_"),
+                                package: package.clone().unwrap_or_else(|| name.clone()),
+                                req: version.clone(),
+                                optional,
+                                default_features,
+                                features: features.clone(),
+                            };
+                            let locked = sources.locked_version(&edge)?;
+                            (
+                                None,
+                                package.clone().unwrap_or_else(|| name.clone()),
+                                optional,
+                                default_features,
+                                features,
+                                Some((edge, locked)),
+                            )
                         }
                         _ => {
                             return Err(CargoImportError::Unsupported(format!(
@@ -858,12 +954,25 @@ fn resolve_deps(
                         }
                     }
                 } else if let Some(version) = version {
-                    return Err(CargoImportError::Unsupported(format!(
-                        "dependency {name:?} = {version:?} in {} is a registry \
-                         dependency; Tong offline mode requires path or workspace \
-                         dependencies",
-                        member.display()
-                    )));
+                    // Registry dependency in a table form.
+                    let edge = RegistryEdge {
+                        parent: parent_name.to_owned(),
+                        extern_name: name.replace('-', "_"),
+                        package: package.clone().unwrap_or_else(|| name.clone()),
+                        req: version.clone(),
+                        optional,
+                        default_features,
+                        features: features.clone(),
+                    };
+                    let locked = sources.locked_version(&edge)?;
+                    (
+                        None,
+                        package.clone().unwrap_or_else(|| name.clone()),
+                        optional,
+                        default_features,
+                        features,
+                        Some((edge, locked)),
+                    )
                 } else {
                     return Err(CargoImportError::Unsupported(format!(
                         "dependency {name:?} in {} is neither a path nor workspace \
@@ -880,10 +989,24 @@ fn resolve_deps(
                 path: Some(path),
                 optional,
                 default_features,
-                features: std::mem::take(&mut features),
-                _target: target,
+                features,
+                locked_version: None,
+            });
+        } else if let Some((_edge, locked)) = req
+            && locked.is_some()
+        {
+            out.push(ResolvedDep {
+                extern_name: name.replace('-', "_"),
+                package,
+                path: None,
+                optional,
+                default_features,
+                features,
+                locked_version: locked,
             });
         }
+        // Collecting mode (`tong lock`): `locked` is None — the edge
+        // was recorded by the provider; nothing is imported.
     }
     Ok(out)
 }
@@ -1060,6 +1183,27 @@ fn load_config(workspace_root: &Path) -> CargoConfig {
 mod tests {
     use super::*;
 
+    /// Provider for provider-free tests: registry deps are rejected with
+    /// the targeted "requires Tong.lock" diagnostic.
+    struct NoLock;
+
+    impl LockedSourceProvider for NoLock {
+        fn locked_version(&self, edge: &RegistryEdge) -> Result<Option<Version>, CargoImportError> {
+            Err(CargoImportError::Unsupported(format!(
+                "registry dependency `{}` requires Tong.lock; run `tong lock`",
+                edge.package
+            )))
+        }
+
+        fn source_dir(&self, _name: &str, _version: &Version) -> Result<PathBuf, CargoImportError> {
+            Err(CargoImportError::Unsupported(
+                "no locked source provider".to_owned(),
+            ))
+        }
+    }
+
+    const NO_LOCK: NoLock = NoLock;
+
     fn write_tree(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (path, content) in files {
@@ -1107,7 +1251,7 @@ calc-core = { path = "../calc-core" }
             ),
             ("crates/calc-cli/src/main.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         assert_eq!(model.packages.len(), 2);
         let cli = model
             .packages
@@ -1146,7 +1290,7 @@ serde = "1"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap_err();
+        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
         assert!(err.to_string().contains("registry dependency"), "{err}");
     }
 
@@ -1174,7 +1318,7 @@ APP_GREETING = "hello"
 "#,
             ),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         assert_eq!(model.global_rustflags, vec!["--cfg", "advanced_mode"]);
         assert_eq!(model.global_env.get("APP_GREETING").unwrap(), "hello");
     }
@@ -1204,7 +1348,7 @@ sdl3-sys = { path = "../../shared/sdl3-sys" }
             ),
             ("shared/sdl3-sys/src/lib.rs", "pub fn init() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         assert_eq!(model.packages.len(), 2);
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 1);
@@ -1253,7 +1397,7 @@ a = { path = "../a" }
             ),
             ("b/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap_err();
+        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
         assert!(err.to_string().contains("cyclic"), "{err}");
     }
 
@@ -1282,7 +1426,7 @@ edition.workspace = true
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.version, "1.2.3");
         assert_eq!(app.edition, Edition::E2021);
@@ -1302,7 +1446,7 @@ version.workspace = true
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap_err();
+        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
         assert!(err.to_string().contains("inherits version"), "{err}");
     }
 
@@ -1330,7 +1474,7 @@ name = "app_core"
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.lib.as_ref().unwrap().name.as_deref(), Some("app_core"));
     }
@@ -1352,7 +1496,7 @@ members = ["app"]
             ("app/src/lib.rs", ""),
             ("app/build.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(
             app.build_script.as_deref(),
@@ -1378,7 +1522,7 @@ members = ["app"]
             // A build.rs exists, but the manifest opts out (Cargo semantics).
             ("app/build.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert!(app.build_script.is_none());
     }
@@ -1399,7 +1543,7 @@ members = ["app"]
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap_err();
+        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
         assert!(err.to_string().contains("build = true"), "{err}");
     }
 
@@ -1424,7 +1568,7 @@ overflow-checks = false
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let release = model.profiles.get("release").unwrap();
         assert_eq!(release.opt_level, "2");
         assert_eq!(release.lto, Lto::Thin);
@@ -1474,7 +1618,7 @@ win-only = { path = "../win-only" }
             ),
             ("../win-only/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         let names: Vec<&str> = app.deps.iter().map(|d| d.package.as_str()).collect();
         assert!(names.contains(&"common"));
@@ -1483,7 +1627,7 @@ win-only = { path = "../win-only" }
         assert!(!model.packages.iter().any(|p| p.name == "win-only"));
 
         // The same workspace imported for Windows keeps the other branch.
-        let model = import_cargo_workspace(dir.path(), "x86_64-pc-windows-msvc").unwrap();
+        let model = import_cargo_workspace(dir.path(), "x86_64-pc-windows-msvc", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         let names: Vec<&str> = app.deps.iter().map(|d| d.package.as_str()).collect();
         assert!(!names.contains(&"unix-only"));
@@ -1518,7 +1662,7 @@ win-only = { path = "../win-only", target = "cfg(windows)" }
             ),
             ("../win-only/src/lib.rs", ""),
         ]);
-        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap();
+        let model = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 1);
         assert_eq!(app.deps[0].package, "unix-only");
@@ -1546,7 +1690,7 @@ foo = { path = "../foo" }
             ),
             ("../foo/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap_err();
+        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
         assert!(err.to_string().contains("unsupported cfg"), "{err}");
     }
 
@@ -1567,7 +1711,7 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin").unwrap_err();
+        let err = import_cargo_workspace(dir.path(), "aarch64-apple-darwin", &NO_LOCK).unwrap_err();
         assert!(err.to_string().contains("strip"), "{err}");
     }
 }

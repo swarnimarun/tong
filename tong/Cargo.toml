@@ -8,7 +8,14 @@ license.workspace = true
 [dependencies]
 tong-core = { path = "../tong-core" }
 tong-exec = { path = "../tong-exec" }
+tong-fetch = { path = "../tong-fetch" }
 tong-graph = { path = "../tong-graph" }
 tong-rust = { path = "../tong-rust" }
 tong-store = { path = "../tong-store" }
+semver = "1"
 clap = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+flate2 = "1"
+tar = "0.4"

@@ -31,6 +31,21 @@ pub struct Manifest {
     /// Store policy (`[store]`): shared-store location, retention, budget.
     #[serde(default)]
     pub store: Option<StoreConfig>,
+    /// Registry configuration (`[registry]`): the index URL.
+    #[serde(default)]
+    pub registry: Option<RegistryConfig>,
+}
+
+/// Registry configuration (`[registry]`).
+///
+/// `index` selects the crate registry index (default crates.io's sparse
+/// index); the environment variable `TONG_REGISTRY_INDEX` wins over the
+/// manifest.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConfig {
+    /// Index URL: `sparse+https://…`, `https://…`, or `file://…`.
+    pub index: Option<String>,
 }
 
 impl Manifest {
