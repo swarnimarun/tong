@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use crate::action::CanonicalValue;
 use crate::artifact::TreeDigest;
-use crate::canonical::{CanonicalEncode, Encoder};
+use crate::canonical::{CanonicalDecode, CanonicalEncode, Decoder, Encoder};
 use crate::digest::Digest;
 use crate::platform::PlatformKey;
 
@@ -62,6 +62,19 @@ impl CanonicalEncode for EnvironmentBundle {
         self.variables.encode(enc);
         self.files.encode(enc);
         self.metadata.encode(enc);
+    }
+}
+
+impl CanonicalDecode for EnvironmentBundle {
+    fn decode(dec: &mut Decoder<'_>) -> Result<Self, crate::canonical::DecodeError> {
+        Ok(Self {
+            name: String::decode(dec)?,
+            provider: String::decode(dec)?,
+            platform: PlatformKey::new(BTreeMap::decode(dec)?),
+            variables: BTreeMap::decode(dec)?,
+            files: TreeDigest::new(Digest::decode(dec)?),
+            metadata: BTreeMap::<String, CanonicalValue>::decode(dec)?,
+        })
     }
 }
 

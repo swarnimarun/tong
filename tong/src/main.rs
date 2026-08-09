@@ -135,6 +135,18 @@ enum ToolchainCommand {
 }
 
 fn main() -> ExitCode {
+    // Perf and metrics events go through tracing (target `tong::perf`,
+    // controlled by `RUST_LOG`, written to stderr) so they can be forwarded
+    // to a file or pipeline separately from the default stdout output.
+    // Default level `warn`: nothing is emitted unless RUST_LOG opts in.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let cli = Cli::parse();
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match cli.command {

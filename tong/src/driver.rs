@@ -13,7 +13,9 @@ use tong_core::units::{parse_duration, parse_size};
 use tong_exec::{ExecError, LocalExecutor};
 use tong_graph::manifest::Manifest;
 use tong_graph::{Completed, PlanError, topological_order};
-use tong_rust::{RustBackend, capture_system_rust, import_cargo_workspace};
+use tong_rust::{
+    RustBackend, SystemRust, ToolchainError, capture_system_rust, import_cargo_workspace,
+};
 use tong_store::{
     ActionCache, CachedResult, Cas, GcOptions, GcReport, StateStore, graph_digest, project_hash,
     sweep,
@@ -184,6 +186,7 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// Builds the workspace at `root` and materializes artifacts under
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
+    let t_build = std::time::Instant::now();
     let prepared = prepare(root, options, false, false, &[])?;
     let tong_dir = &prepared.tong_dir;
     let cas = &prepared.cas;
@@ -241,6 +244,12 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 }
                 Err(err) => return Err(BuildError::Exec(err)),
             };
+            tracing::debug!(
+                target: "tong::perf",
+                phase = "action.execute",
+                action = %spec.logical_id.0,
+                duration_ms = result.duration.as_millis() as u64,
+            );
             let cached = CachedResult {
                 outputs: result.outputs,
                 stdout: result.stdout,
@@ -277,6 +286,15 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
 
     // Assemble requested final artifacts.
     let out_dir = tong_dir.join("out").join(&options.profile);
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "schedule",
+        actions = order.len(),
+        cached = outcome.actions_cached,
+        executed = outcome.actions_executed,
+        duration_ms = t_build.elapsed().as_millis() as u64,
+    );
+    let t_assemble = std::time::Instant::now();
     let requested: Vec<&tong_rust::FinalArtifact> = prepared
         .artifacts
         .iter()
@@ -315,6 +333,12 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         artifact_pairs.push((artifact.name.clone(), result.outputs));
         outcome.artifacts.push(dest.join(&artifact.name));
     }
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "assemble",
+        duration_ms = t_assemble.elapsed().as_millis() as u64,
+    );
+    let t_record = std::time::Instant::now();
 
     record_state(
         root,
@@ -326,6 +350,16 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         &artifact_pairs,
         &options.profile,
     )?;
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "record_state",
+        duration_ms = t_record.elapsed().as_millis() as u64,
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "build.total",
+        duration_ms = t_build.elapsed().as_millis() as u64,
+    );
 
     Ok(outcome)
 }
@@ -527,51 +561,81 @@ fn prepare(
     tests_enabled: bool,
     test_args: &[String],
 ) -> Result<Prepared, BuildError> {
+    let t_prep = std::time::Instant::now();
     let tong_dir = root.join(".tong");
     let manifest = load_manifest(root)?;
     let store = store_dir(root, manifest.as_ref())?;
     let exec = tong_dir.join("exec");
     let cas = Cas::open(&store)?;
     let cache = ActionCache::open(&cas)?;
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "prepare.open",
+        duration_ms = t_prep.elapsed().as_millis() as u64,
+    );
 
     // Model first: manifest errors fail fast, before the expensive system
-    // toolchain capture (rustc import + sysroot fingerprinting). Registry
-    // deps resolve against Tong.lock + the source store.
-    let sources = LockedSource::new(root, &store);
-    let mut model = load_model(root, manifest.as_ref(), &sources)?;
-
-    // Resolve features (Cargo resolver-v2 semantics) before planning so
-    // `--cfg feature=...` flags and optional-dep edges are baked into the
-    // action graph. Test builds additionally activate dev-dep edges.
-    let requests = feature_requests(&model, options, manifest.as_ref())?;
-    let feature_map = tong_rust::resolve_features(&model, &requests, include_dev_deps)
-        .map_err(|err| BuildError::Manifest(err.to_string()))?;
-    model.feature_map = feature_map;
-
-    // Build-start hygiene: prune stale exec roots. Exec content is fully
-    // reproducible (everything is in the CAS); failed builds keep their
-    // roots until the next build, which is the diagnosis window.
-    prune_exec_dir(&exec)?;
-
-    // Toolchain: needed by the backend for action identity. A pinned
-    // `[toolchain.rust] version` uses the downloaded dist bundle instead
-    // of the system capture (portable; PLAN.md section 5).
-    let toolchain = match manifest
+    // toolchain capture (rustc query + sysroot fingerprinting). Registry
+    // deps resolve against Tong.lock + the source store. The system
+    // capture runs concurrently with model loading: both are read-only,
+    // and CAS writes are atomic. A pinned dist version skips the capture
+    // and is loaded after (store-only, fast).
+    let dist_version = manifest
         .as_ref()
-        .and_then(|manifest| manifest.toolchain.rust.version.as_deref())
-    {
-        Some(version) => {
-            let host_triple = tong_rust::host_triple()?;
-            match tong_rust::load_dist_rust(&cas, &store, version, &host_triple) {
-                Ok(toolchain) => toolchain,
-                Err(tong_rust::ToolchainError::Dist(msg)) => {
-                    return Err(BuildError::Toolchain(tong_rust::ToolchainError::Dist(msg)));
+        .and_then(|manifest| manifest.toolchain.rust.version.as_deref());
+    let (mut model, feature_map, toolchain) = std::thread::scope(
+        |scope| -> Result<(tong_rust::RustModel, tong_rust::FeatureMap, SystemRust), BuildError> {
+            let capture = dist_version.is_none().then(|| {
+                let cas_clone = cas.clone();
+                scope.spawn(move || capture_system_rust(&cas_clone))
+            });
+
+            let sources = LockedSource::new(root, &store);
+            let model = load_model(root, manifest.as_ref(), &sources)?;
+            tracing::debug!(
+                target: "tong::perf",
+                phase = "prepare.model",
+                duration_ms = t_prep.elapsed().as_millis() as u64,
+            );
+
+            // Resolve features (Cargo resolver-v2 semantics) before
+            // planning so `--cfg feature=...` flags and optional-dep edges
+            // are baked into the action graph. Test builds additionally
+            // activate dev-dep edges.
+            let requests = feature_requests(&model, options, manifest.as_ref())?;
+            let feature_map = tong_rust::resolve_features(&model, &requests, include_dev_deps)
+                .map_err(|err| BuildError::Manifest(err.to_string()))?;
+
+            // Build-start hygiene: prune stale exec roots. Exec content is
+            // fully reproducible (everything is in the CAS); failed builds
+            // keep their roots until the next build, which is the diagnosis
+            // window.
+            prune_exec_dir(&exec)?;
+
+            let toolchain = match capture {
+                Some(handle) => handle
+                    .join()
+                    .map_err(|_| {
+                        BuildError::Toolchain(ToolchainError::Missing(
+                            "system toolchain capture thread panicked".to_owned(),
+                        ))
+                    })?
+                    .map_err(BuildError::Toolchain),
+                None => {
+                    let host_triple = tong_rust::host_triple()?;
+                    tong_rust::load_dist_rust(&cas, &store, dist_version.unwrap(), &host_triple)
+                        .map_err(BuildError::Toolchain)
                 }
-                Err(err) => return Err(BuildError::Toolchain(err)),
-            }
-        }
-        None => capture_system_rust(&cas)?,
-    };
+            }?;
+            Ok((model, feature_map, toolchain))
+        },
+    )?;
+    model.feature_map = feature_map;
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "prepare.toolchain",
+        duration_ms = t_prep.elapsed().as_millis() as u64,
+    );
 
     // Sandbox level: `BuildOptions.sandbox` wins, then `[policy] sandbox`
     // (default l1 — opt-in).
@@ -624,6 +688,12 @@ fn prepare(
                 .expect("topological order references planned actions")
         })
         .collect();
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "prepare.plan",
+        actions = planned.len(),
+        duration_ms = t_prep.elapsed().as_millis() as u64,
+    );
 
     Ok(Prepared {
         tong_dir,

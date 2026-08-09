@@ -13,9 +13,12 @@
 //! are digest-verified, then atomically renamed into place (section 10.1);
 //! duplicate writers are tolerated because the final rename is idempotent.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tong_core::artifact::{BlobDigest, TreeDigest};
 use tong_core::canonical::{self, CanonicalDecode, CanonicalEncode};
@@ -303,7 +306,28 @@ impl Cas {
     fn walk_dir(
         &self,
         path: &Path,
-        excludes: &std::collections::BTreeSet<&str>,
+        excludes: &BTreeSet<&str>,
+        import_blobs: bool,
+    ) -> io::Result<TreeDigest> {
+        if import_blobs {
+            self.walk_dir_serial(path, excludes, true)
+        } else {
+            // Fingerprint mode: hash every file under `path` concurrently,
+            // then rebuild the tree from the digests. The tree structure
+            // and digests are identical to the serial walk — only the
+            // hashing is parallel (large toolchain sysroots dominate the
+            // system toolchain capture otherwise).
+            let mut files: Vec<PathBuf> = Vec::new();
+            collect_files(path, excludes, &mut files)?;
+            let digests = hash_files_parallel(&files)?;
+            self.build_fingerprint_tree(path, excludes, &digests)
+        }
+    }
+
+    fn walk_dir_serial(
+        &self,
+        path: &Path,
+        excludes: &BTreeSet<&str>,
         import_blobs: bool,
     ) -> io::Result<TreeDigest> {
         let mut entries = std::collections::BTreeMap::new();
@@ -320,7 +344,7 @@ impl Cas {
             }
             let file_type = entry.file_type()?;
             let tree_entry = if file_type.is_dir() {
-                TreeEntry::Directory(self.walk_dir(&entry.path(), excludes, import_blobs)?)
+                TreeEntry::Directory(self.walk_dir_serial(&entry.path(), excludes, import_blobs)?)
             } else if file_type.is_symlink() {
                 let target = fs::read_link(entry.path())?;
                 TreeEntry::Symlink {
@@ -334,6 +358,63 @@ impl Cas {
                 };
                 TreeEntry::File {
                     digest,
+                    executable: is_executable(&entry.path())?,
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported file type: {}", entry.path().display()),
+                ));
+            };
+            entries.insert(name, tree_entry);
+        }
+        let tree = Tree::new(entries)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        self.put_tree(&tree)
+    }
+
+    /// Recursively collects the regular-file paths under `path` for
+    /// parallel fingerprinting (symlinks need no hashing; their targets
+    /// are recorded when the tree is rebuilt).
+    fn build_fingerprint_tree(
+        &self,
+        path: &Path,
+        excludes: &BTreeSet<&str>,
+        digests: &HashMap<PathBuf, BlobDigest>,
+    ) -> io::Result<TreeDigest> {
+        let mut entries = BTreeMap::new();
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().into_string().map_err(|name| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-UTF-8 file name {name:?} in {}", path.display()),
+                )
+            })?;
+            if excludes.contains(name.as_str()) {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let tree_entry = if file_type.is_dir() {
+                TreeEntry::Directory(self.build_fingerprint_tree(
+                    &entry.path(),
+                    excludes,
+                    digests,
+                )?)
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(entry.path())?;
+                TreeEntry::Symlink {
+                    target: target.to_string_lossy().into_owned(),
+                }
+            } else if file_type.is_file() {
+                let digest = digests.get(&entry.path()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("fingerprint missing for {}", entry.path().display()),
+                    )
+                })?;
+                TreeEntry::File {
+                    digest: *digest,
                     executable: is_executable(&entry.path())?,
                 }
             } else {
@@ -503,6 +584,69 @@ fn hash_file(path: &Path) -> io::Result<Digest> {
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finish())
+}
+
+/// Recursively collects the regular-file paths under `path` for parallel
+/// fingerprinting. Symlinks and unsupported file types are skipped here;
+/// the tree rebuild records them.
+fn collect_files(
+    path: &Path,
+    excludes: &BTreeSet<&str>,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|name| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-UTF-8 file name {name:?} in {}", path.display()),
+            )
+        })?;
+        if excludes.contains(name.as_str()) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_files(&entry.path(), excludes, files)?;
+        } else if file_type.is_file() {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Hashes every file concurrently, returning a path → digest map. Digests
+/// are identical to a serial pass; only the throughput changes.
+fn hash_files_parallel(files: &[PathBuf]) -> io::Result<HashMap<PathBuf, BlobDigest>> {
+    let n = files.len();
+    if n == 0 {
+        return Ok(HashMap::new());
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(n);
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, io::Result<BlobDigest>)>> = Mutex::new(Vec::with_capacity(n));
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let digest = hash_file(&files[i]).map(BlobDigest::new);
+                    results.lock().unwrap().push((i, digest));
+                }
+            });
+        }
+    });
+    let mut digests = HashMap::with_capacity(n);
+    for (i, result) in results.into_inner().unwrap() {
+        digests.insert(files[i].clone(), result?);
+    }
+    Ok(digests)
 }
 
 fn is_executable(path: &Path) -> io::Result<bool> {
