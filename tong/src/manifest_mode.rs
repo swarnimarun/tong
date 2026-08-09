@@ -188,7 +188,22 @@ fn profile_from_config(config: &ProfileConfig) -> ProfileSpec {
         spec.codegen_units = Some(units);
     }
     if let Some(checks) = config.overflow_checks {
-        spec.overflow_checks = checks;
+        spec.overflow_checks = Some(checks);
+    }
+    if let Some(assertions) = config.debug_assertions {
+        spec.debug_assertions = Some(assertions);
+    }
+    if let Some(strip) = &config.strip {
+        match strip.as_str() {
+            "none" | "debuginfo" | "symbols" => spec.strip = Some(strip.clone()),
+            other => eprintln!(
+                "tong: warning: ignoring invalid strip value {other:?} \
+                 (expected \"none\", \"debuginfo\", or \"symbols\")"
+            ),
+        }
+    }
+    if let Some(rpath) = config.rpath {
+        spec.rpath = Some(rpath);
     }
     spec
 }

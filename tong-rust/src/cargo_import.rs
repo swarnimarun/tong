@@ -162,6 +162,9 @@ struct CargoProfile {
     panic: Option<String>,
     codegen_units: Option<u32>,
     overflow_checks: Option<bool>,
+    debug_assertions: Option<bool>,
+    strip: Option<String>,
+    rpath: Option<bool>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -265,7 +268,7 @@ pub fn import_cargo_workspace(workspace_root: &Path) -> Result<RustModel, CargoI
     model.packages = packages.into_values().collect();
 
     // Profiles from the workspace root manifest (Cargo: [profile.*] tables).
-    model.profiles = resolve_profiles(&root_manifest.profile);
+    model.profiles = resolve_profiles(&root_manifest.profile)?;
     model
         .profiles
         .entry("dev".to_owned())
@@ -718,7 +721,9 @@ fn parse_edition(text: &str) -> Result<Edition, CargoImportError> {
     }
 }
 
-fn resolve_profiles(tables: &BTreeMap<String, CargoProfile>) -> BTreeMap<String, ProfileSpec> {
+fn resolve_profiles(
+    tables: &BTreeMap<String, CargoProfile>,
+) -> Result<BTreeMap<String, ProfileSpec>, CargoImportError> {
     let mut out = BTreeMap::new();
     for (name, table) in tables {
         if name == "package" {
@@ -770,11 +775,28 @@ fn resolve_profiles(tables: &BTreeMap<String, CargoProfile>) -> BTreeMap<String,
             spec.codegen_units = Some(units);
         }
         if let Some(checks) = table.overflow_checks {
-            spec.overflow_checks = checks;
+            spec.overflow_checks = Some(checks);
+        }
+        if let Some(assertions) = table.debug_assertions {
+            spec.debug_assertions = Some(assertions);
+        }
+        if let Some(strip) = &table.strip {
+            match strip.as_str() {
+                "none" | "debuginfo" | "symbols" => spec.strip = Some(strip.clone()),
+                other => {
+                    return Err(CargoImportError::Unsupported(format!(
+                        "profile {name:?} strip = {other:?}; expected \"none\", \
+                         \"debuginfo\", or \"symbols\""
+                    )));
+                }
+            }
+        }
+        if let Some(rpath) = table.rpath {
+            spec.rpath = Some(rpath);
         }
         out.insert(name.clone(), spec);
     }
-    out
+    Ok(out)
 }
 
 fn load_config(workspace_root: &Path) -> CargoConfig {
@@ -1160,6 +1182,30 @@ overflow-checks = false
         assert_eq!(release.lto, Lto::Thin);
         assert_eq!(release.panic, PanicStrategy::Abort);
         assert_eq!(release.codegen_units, Some(4));
-        assert!(!release.overflow_checks);
+        assert_eq!(release.overflow_checks, Some(false));
+        // New parity keys map through.
+        assert_eq!(release.debug_assertions, Some(false));
+        assert_eq!(release.rpath, None);
+    }
+
+    #[test]
+    fn rejects_invalid_strip_values() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+strip = "everything"
+"#,
+            ),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let err = import_cargo_workspace(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("strip"), "{err}");
     }
 }

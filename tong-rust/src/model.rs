@@ -155,8 +155,15 @@ pub struct ProfileSpec {
     pub panic: PanicStrategy,
     /// Codegen units (None = rustc default).
     pub codegen_units: Option<u32>,
-    /// Overflow checks.
-    pub overflow_checks: bool,
+    /// Overflow checks (None = rustc default).
+    pub overflow_checks: Option<bool>,
+    /// Debug assertions (None = rustc default).
+    pub debug_assertions: Option<bool>,
+    /// Strip setting: `none`, `debuginfo`, or `symbols` (None = rustc
+    /// default).
+    pub strip: Option<String>,
+    /// Whether rpath is passed to the linker (None = rustc default).
+    pub rpath: Option<bool>,
 }
 
 /// LTO mode.
@@ -194,7 +201,10 @@ impl ProfileSpec {
             lto: Lto::Off,
             panic: PanicStrategy::Unwind,
             codegen_units: None,
-            overflow_checks: true,
+            overflow_checks: Some(true),
+            debug_assertions: Some(true),
+            strip: None,
+            rpath: None,
         }
     }
 
@@ -206,7 +216,10 @@ impl ProfileSpec {
             lto: Lto::Off,
             panic: PanicStrategy::Unwind,
             codegen_units: None,
-            overflow_checks: false,
+            overflow_checks: Some(false),
+            debug_assertions: Some(false),
+            strip: None,
+            rpath: None,
         }
     }
 
@@ -235,11 +248,28 @@ impl ProfileSpec {
                 PanicStrategy::Abort => "abort",
             }
         ));
-        flags.push("-C".to_owned());
-        flags.push(format!(
-            "overflow-checks={}",
-            if self.overflow_checks { "on" } else { "off" }
-        ));
+        if let Some(checks) = self.overflow_checks {
+            flags.push("-C".to_owned());
+            flags.push(format!(
+                "overflow-checks={}",
+                if checks { "on" } else { "off" }
+            ));
+        }
+        if let Some(assertions) = self.debug_assertions {
+            flags.push("-C".to_owned());
+            flags.push(format!(
+                "debug-assertions={}",
+                if assertions { "on" } else { "off" }
+            ));
+        }
+        if let Some(strip) = &self.strip {
+            flags.push("-C".to_owned());
+            flags.push(format!("strip={strip}"));
+        }
+        if let Some(rpath) = self.rpath {
+            flags.push("-C".to_owned());
+            flags.push(format!("rpath={}", if rpath { "yes" } else { "no" }));
+        }
         if let Some(units) = self.codegen_units {
             flags.push("-C".to_owned());
             flags.push(format!("codegen-units={units}"));

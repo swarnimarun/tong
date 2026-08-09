@@ -98,6 +98,12 @@ pub struct ProfileConfig {
     pub codegen_units: Option<u32>,
     /// Overflow checks.
     pub overflow_checks: Option<bool>,
+    /// Debug assertions.
+    pub debug_assertions: Option<bool>,
+    /// Strip setting: `none`, `debuginfo`, or `symbols`.
+    pub strip: Option<String>,
+    /// Pass rpath to the linker.
+    pub rpath: Option<bool>,
 }
 
 /// Optimization level value.
