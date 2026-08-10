@@ -211,6 +211,7 @@ mod tests {
         let pkg = ResolvedPackage {
             name: "foo".to_owned(),
             version: Version::new(1, 0, 0),
+            source: None,
             checksum: Some(checksum.to_owned()),
             yanked: false,
             local: false,

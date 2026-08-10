@@ -14,11 +14,13 @@ pub mod toolchain;
 pub mod toolchain_dist;
 
 pub use backend::{FinalArtifact, RustBackend};
-pub use cargo_import::{CargoImportError, LockedSourceProvider, import_cargo_workspace};
+pub use cargo_import::{
+    CargoImportError, LockedSource, LockedSourceProvider, import_cargo_workspace,
+};
 pub use features::{FeatureError, FeatureMap, FeatureRequest, resolve_features};
 pub use model::{
-    BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PanicStrategy,
-    ProfileSpec, RegistryEdge, RustModel, TestTarget,
+    BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PackageId,
+    PanicStrategy, ProfileSpec, RegistryEdge, ResolverVersion, RustModel, SourceId, TestTarget,
 };
 pub use toolchain::{SystemRust, ToolchainError, capture_system_rust, host_triple};
 pub use toolchain_dist::{dist_available, fetch_dist_rust, load_dist_rust};

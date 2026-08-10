@@ -12,12 +12,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use semver::Version;
 use serde::Deserialize;
 
 use crate::model::{
-    BinTarget, Dep, Edition, LibTarget, Lto, Package, PanicStrategy, ProfileSpec, RegistryEdge,
-    RustModel, TestTarget, lib_crate_name,
+    BinTarget, Dep, Edition, LibTarget, Lto, Package, PackageId, PanicStrategy, ProfileSpec,
+    RegistryEdge, ResolverVersion, RustModel, SourceId, TestTarget, lib_crate_name,
+    source_rel_path,
 };
 
 /// Cargo import failure.
@@ -97,6 +97,9 @@ struct CargoPackage {
     #[serde(default)]
     edition: Option<Field>,
     build: Option<BuildKey>,
+    /// Cargo resolver version: `"1"`, `"2"`, or `"3"`.
+    #[serde(default)]
+    resolver: Option<String>,
 }
 
 /// `build = "build.rs"` or `build = false` (Cargo's opt-out from build.rs
@@ -127,6 +130,9 @@ struct CargoWorkspace {
     /// `[workspace.package]` — defaults inherited by members.
     #[serde(default)]
     package: Option<CargoWorkspacePackage>,
+    /// Cargo resolver version: `"1"`, `"2"`, or `"3"`.
+    #[serde(default)]
+    resolver: Option<String>,
 }
 
 /// `[workspace.package]` subset: version and edition.
@@ -281,20 +287,30 @@ enum EnvValue {
     Table { value: String },
 }
 
-/// A source of locked registry packages: version lookup and extracted
-/// source directories.
+/// A locked package resolved for one registry edge: its exact identity and
+/// the extracted source directory it imports from.
+#[derive(Clone, Debug)]
+pub struct LockedSource {
+    /// Exact locked identity (name + version + source).
+    pub id: crate::model::PackageId,
+    /// Extracted source directory (materialized from the store).
+    pub source_dir: PathBuf,
+}
+
+/// A source of locked registry packages: exact edge resolution and
+/// extracted source directories.
 ///
 /// Implemented by the driver over `Tong.lock` + the source store; `tong
 /// lock` uses a collecting provider that records edges instead of
 /// resolving them.
 pub trait LockedSourceProvider {
-    /// The locked version of a registry dep edge. `Ok(None)` means the
-    /// edge is not resolved (collecting mode — used by `tong lock`); an
-    /// `Err` is a targeted diagnostic (missing lock, missing entry, or a
-    /// lockfile out of date).
-    fn locked_version(&self, edge: &RegistryEdge) -> Result<Option<Version>, CargoImportError>;
-    /// The extracted source directory of a locked package.
-    fn source_dir(&self, name: &str, version: &Version) -> Result<PathBuf, CargoImportError>;
+    /// Resolves one registry dep edge to its locked package. `Ok(None)`
+    /// means the edge is not resolved: collecting mode (`tong lock`) —
+    /// the edge is recorded instead — or an inactive optional edge absent
+    /// from the locked graph. An `Err` is a targeted diagnostic (missing
+    /// lock, missing entry, or a lockfile out of date).
+    fn locked_package(&self, edge: &RegistryEdge)
+    -> Result<Option<LockedSource>, CargoImportError>;
 }
 
 /// Imports a Cargo workspace into a [`RustModel`].
@@ -318,6 +334,33 @@ pub fn import_cargo_workspace(
         inherited.package = workspace.package.clone();
     }
 
+    // Resolver selection (Cargo semantics): an explicit `resolver` on the
+    // root package or workspace wins; otherwise the root package's
+    // effective edition picks the default (2021+ → 2, 2024 → 3, older → 1).
+    let root_edition = match &root_manifest.package {
+        Some(package) => resolve_field(
+            &package.edition,
+            inherited.package.as_ref(),
+            &package.name,
+            "edition",
+            workspace_root,
+            "2015",
+        )?,
+        None => "2015".to_owned(),
+    };
+    let resolver_text = root_manifest
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.resolver.as_deref())
+        .or_else(|| {
+            root_manifest
+                .package
+                .as_ref()
+                .and_then(|package| package.resolver.as_deref())
+        });
+    let resolver = ResolverVersion::from_manifest(resolver_text, parse_edition(&root_edition)?)
+        .map_err(CargoImportError::Unsupported)?;
+
     let members: Vec<PathBuf> = match &root_manifest.workspace {
         Some(workspace) if !workspace.members.is_empty() => {
             expand_members(workspace_root, &workspace.members, &root_manifest.package)?
@@ -333,16 +376,21 @@ pub fn import_cargo_workspace(
         }
     };
 
-    let mut model = RustModel::default();
+    let mut model = RustModel {
+        resolver,
+        ..Default::default()
+    };
     // Canonical package dir → imported package. Path dependencies outside
     // the workspace are imported recursively (Cargo semantics), so the
     // graph is closed over every path dep, not just the members.
     let mut packages: BTreeMap<PathBuf, Package> = BTreeMap::new();
     let mut visiting: Vec<PathBuf> = Vec::new();
+    let mut member_ids: Vec<PackageId> = Vec::new();
     for member in &members {
-        import_package(
+        let id = import_package(
             member,
             true,
+            None,
             &mut packages,
             &mut visiting,
             &inherited,
@@ -350,40 +398,12 @@ pub fn import_cargo_workspace(
             host_triple,
             sources,
         )?;
+        member_ids.push(id);
     }
-
-    // The model resolves deps by package name (no version-aware resolution
-    // yet): two imported packages with the same name are ambiguous.
-    let mut by_name: BTreeMap<&str, &PathBuf> = BTreeMap::new();
-    for pkg in packages.values() {
-        if let Some(previous) = by_name.insert(pkg.name.as_str(), &pkg.dir) {
-            return Err(CargoImportError::Unsupported(format!(
-                "two packages named {} ({} and {}); Tong cannot distinguish \
-                 same-name packages yet",
-                pkg.name,
-                previous.display(),
-                pkg.dir.display()
-            )));
-        }
-    }
-
-    // Workspace members (feature seeds and lockfile roots).
-    let mut member_names: Vec<String> = Vec::new();
-    for member in &members {
-        let canonical = fs::canonicalize(member)
-            .map_err(|err| CargoImportError::Io(member.display().to_string(), err))?;
-        if let Some(name) = by_name
-            .iter()
-            .find(|(_, dir)| ***dir == canonical)
-            .map(|(name, _)| *name)
-        {
-            member_names.push(name.to_owned());
-        }
-    }
-    member_names.sort();
+    member_ids.sort();
 
     model.packages = packages.into_values().collect();
-    model.members = member_names;
+    model.members = member_ids;
 
     // Profiles from the workspace root manifest (Cargo: [profile.*] tables).
     model.profiles = resolve_profiles(&root_manifest.profile)?;
@@ -471,22 +491,27 @@ fn expand_members(
 
 /// Imports the package at `dir` (a workspace member or a path dependency)
 /// into `packages`, recursing into its path dependencies. Returns the
-/// package's declared name. Cycles are rejected, matching Cargo.
+/// package's exact identity. Cycles are rejected, matching Cargo.
+///
+/// `forced_id` overrides the derived identity: registry and git checkouts
+/// imported from the lock keep the lock's exact `(name, version, source)`
+/// instead of a path-derived source.
 #[allow(clippy::too_many_arguments)]
 fn import_package(
     dir: &Path,
     is_member: bool,
+    forced_id: Option<PackageId>,
     packages: &mut BTreeMap<PathBuf, Package>,
     visiting: &mut Vec<PathBuf>,
     inherited: &Inherited,
     workspace_root: &Path,
     host_triple: &str,
     sources: &dyn LockedSourceProvider,
-) -> Result<String, CargoImportError> {
+) -> Result<PackageId, CargoImportError> {
     let canonical = fs::canonicalize(dir)
         .map_err(|err| CargoImportError::Io(dir.display().to_string(), err))?;
     if let Some(pkg) = packages.get(&canonical) {
-        return Ok(pkg.name.clone());
+        return Ok(pkg.id.clone());
     }
     if visiting.contains(&canonical) {
         return Err(CargoImportError::Unsupported(format!(
@@ -532,7 +557,54 @@ fn import_package(
             "2015",
         )?;
 
+        // Exact identity: registry/git checkouts take the locked identity;
+        // workspace members and path deps derive it from the lexical path
+        // relative to the workspace root (never the canonical absolute
+        // path, so digests are host-independent).
+        let id = match forced_id {
+            Some(locked) => {
+                let parsed = semver::Version::parse(&version).ok();
+                if locked.name != package.name || parsed.as_ref() != Some(&locked.version) {
+                    return Err(CargoImportError::Unsupported(format!(
+                        "locked dependency {} v{} resolves to package {} v{} in {}, \
+                         but the manifest declares {} v{version}; run `tong lock`",
+                        locked.name,
+                        locked.version,
+                        package.name,
+                        parsed
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "?".to_owned()),
+                        canonical.display(),
+                        package.name,
+                    )));
+                }
+                locked
+            }
+            None => {
+                let version = semver::Version::parse(&version).map_err(|err| {
+                    CargoImportError::Unsupported(format!(
+                        "package {} in {} has invalid version {:?}: {err}",
+                        package.name,
+                        canonical.display(),
+                        version
+                    ))
+                })?;
+                let rel = source_rel_path(dir, workspace_root);
+                let source = if is_member {
+                    SourceId::Workspace(rel)
+                } else {
+                    SourceId::Path(rel)
+                };
+                PackageId {
+                    name: package.name.clone(),
+                    version,
+                    source,
+                }
+            }
+        };
+
         let mut pkg = Package {
+            id: id.clone(),
             name: package.name.clone(),
             dir: canonical.clone(),
             version,
@@ -668,7 +740,7 @@ fn import_package(
             merge_target_tables(&manifest, host_triple)?;
         let resolved_deps = resolve_deps(
             &dependencies,
-            &pkg.name,
+            &pkg,
             &canonical,
             workspace_root,
             &inherited.deps,
@@ -677,7 +749,7 @@ fn import_package(
         )?;
         let resolved_build_deps = resolve_deps(
             &build_dependencies,
-            &pkg.name,
+            &pkg,
             &canonical,
             workspace_root,
             &inherited.deps,
@@ -687,7 +759,7 @@ fn import_package(
         let resolved_dev_deps = if is_member {
             resolve_deps(
                 &dev_dependencies,
-                &pkg.name,
+                &pkg,
                 &canonical,
                 workspace_root,
                 &inherited.deps,
@@ -706,11 +778,12 @@ fn import_package(
             (resolved_dev_deps, &mut dev_deps),
         ] {
             for dep in resolved {
-                let real_name = match dep.path {
+                let package_id = match dep.path {
                     Some(path) => {
                         let imported = import_package(
                             &path,
                             false,
+                            None,
                             packages,
                             visiting,
                             &inherited,
@@ -718,12 +791,13 @@ fn import_package(
                             host_triple,
                             sources,
                         )?;
-                        if imported != dep.package {
+                        if imported.name != dep.package {
                             return Err(CargoImportError::Unsupported(format!(
                                 "path dependency {} = {{ path = {:?} }} resolves to package \
-                                 {imported:?}, not {:?}",
+                                 {:?}, not {:?}",
                                 dep.extern_name.replace('_', "-"),
                                 path.display(),
+                                imported.name,
                                 dep.package
                             )));
                         }
@@ -731,39 +805,28 @@ fn import_package(
                     }
                     None => {
                         // Registry dependency: resolved through the
-                        // lockfile-backed source provider. The provider
-                        // already validated the version requirement.
-                        let Some(version) = dep.locked_version else {
-                            // Collecting mode (`tong lock`): the edge was
-                            // recorded; no package is imported.
+                        // lockfile-backed source provider (which validated
+                        // the requirement); in collecting mode the edge was
+                        // recorded and nothing is imported.
+                        let Some(locked) = dep.locked else {
                             continue;
                         };
-                        let dir = sources.source_dir(&dep.package, &version)?;
-                        let imported = import_package(
-                            &dir,
+                        import_package(
+                            &locked.source_dir,
                             false,
+                            Some(locked.id),
                             packages,
                             visiting,
                             &inherited,
                             workspace_root,
                             host_triple,
                             sources,
-                        )?;
-                        if imported != dep.package {
-                            return Err(CargoImportError::Unsupported(format!(
-                                "locked dependency {} = {{ version = {:?} }} resolves to \
-                                 package {imported:?}, not {:?}",
-                                dep.extern_name.replace('_', "-"),
-                                version,
-                                dep.package
-                            )));
-                        }
-                        imported
+                        )?
                     }
                 };
                 target.push(Dep {
                     extern_name: dep.extern_name,
-                    package: real_name,
+                    package: package_id,
                     optional: dep.optional,
                     default_features: dep.default_features,
                     features: dep.features,
@@ -775,9 +838,9 @@ fn import_package(
         pkg.build_deps = build_deps;
         pkg.dev_deps = dev_deps;
 
-        let name = pkg.name.clone();
+        let id = pkg.id.clone();
         packages.insert(canonical, pkg);
-        Ok(name)
+        Ok(id)
     })();
 
     visiting.pop();
@@ -820,9 +883,10 @@ fn resolve_field(
     }
 }
 
-/// A resolved dependency: the crate name used at the use site, the package
-/// name it refers to, and — for path dependencies — the package directory;
-/// registry dependencies carry their locked version.
+/// A resolved dependency: the crate name used at the use site, the
+/// declared package name it refers to, and — for path dependencies — the
+/// package directory; registry dependencies carry their resolved locked
+/// identity.
 struct ResolvedDep {
     extern_name: String,
     package: String,
@@ -831,12 +895,12 @@ struct ResolvedDep {
     default_features: bool,
     features: Vec<String>,
     target: Option<String>,
-    locked_version: Option<semver::Version>,
+    locked: Option<LockedSource>,
 }
 
 fn resolve_deps(
     deps: &BTreeMap<String, DepValue>,
-    parent_name: &str,
+    parent: &Package,
     member: &Path,
     workspace_root: &Path,
     inherited: &BTreeMap<String, DepValue>,
@@ -848,11 +912,11 @@ fn resolve_deps(
         // The effective table: the member's own table merged over the
         // inherited `[workspace.dependencies]` table (Cargo semantics:
         // features concatenate, other keys override).
-        let (path, package, optional, default_features, features, target, req) = match value {
+        let (path, package, optional, default_features, features, target, locked) = match value {
             DepValue::Version(version) => {
                 // Registry dependency: resolved through the lockfile.
                 let edge = RegistryEdge {
-                    parent: parent_name.to_owned(),
+                    parent: parent.id.clone(),
                     extern_name: name.replace('-', "_"),
                     package: name.clone(),
                     req: version.clone(),
@@ -860,16 +924,8 @@ fn resolve_deps(
                     default_features: true,
                     features: Vec::new(),
                 };
-                let locked = sources.locked_version(&edge)?;
-                (
-                    None,
-                    name.clone(),
-                    false,
-                    true,
-                    Vec::new(),
-                    None,
-                    Some((edge, locked)),
-                )
+                let locked = sources.locked_package(&edge)?;
+                (None, name.clone(), false, true, Vec::new(), None, locked)
             }
             DepValue::Table {
                 path,
@@ -931,7 +987,7 @@ fn resolve_deps(
                         Some(DepValue::Version(version)) => {
                             // Inherited registry dependency.
                             let edge = RegistryEdge {
-                                parent: parent_name.to_owned(),
+                                parent: parent.id.clone(),
                                 extern_name: name.replace('-', "_"),
                                 package: name.clone(),
                                 req: version.clone(),
@@ -939,7 +995,7 @@ fn resolve_deps(
                                 default_features,
                                 features: features.clone(),
                             };
-                            let locked = sources.locked_version(&edge)?;
+                            let locked = sources.locked_package(&edge)?;
                             (
                                 None,
                                 name.clone(),
@@ -947,7 +1003,7 @@ fn resolve_deps(
                                 default_features,
                                 features,
                                 target.clone(),
-                                Some((edge, locked)),
+                                locked,
                             )
                         }
                         Some(DepValue::Table {
@@ -955,7 +1011,7 @@ fn resolve_deps(
                             ..
                         }) => {
                             let edge = RegistryEdge {
-                                parent: parent_name.to_owned(),
+                                parent: parent.id.clone(),
                                 extern_name: name.replace('-', "_"),
                                 package: package.clone().unwrap_or_else(|| name.clone()),
                                 req: version.clone(),
@@ -963,7 +1019,7 @@ fn resolve_deps(
                                 default_features,
                                 features: features.clone(),
                             };
-                            let locked = sources.locked_version(&edge)?;
+                            let locked = sources.locked_package(&edge)?;
                             (
                                 None,
                                 package.clone().unwrap_or_else(|| name.clone()),
@@ -971,7 +1027,7 @@ fn resolve_deps(
                                 default_features,
                                 features,
                                 target.clone(),
-                                Some((edge, locked)),
+                                locked,
                             )
                         }
                         _ => {
@@ -984,7 +1040,7 @@ fn resolve_deps(
                 } else if let Some(version) = version {
                     // Registry dependency in a table form.
                     let edge = RegistryEdge {
-                        parent: parent_name.to_owned(),
+                        parent: parent.id.clone(),
                         extern_name: name.replace('-', "_"),
                         package: package.clone().unwrap_or_else(|| name.clone()),
                         req: version.clone(),
@@ -992,7 +1048,7 @@ fn resolve_deps(
                         default_features,
                         features: features.clone(),
                     };
-                    let locked = sources.locked_version(&edge)?;
+                    let locked = sources.locked_package(&edge)?;
                     (
                         None,
                         package.clone().unwrap_or_else(|| name.clone()),
@@ -1000,7 +1056,7 @@ fn resolve_deps(
                         default_features,
                         features,
                         target.clone(),
-                        Some((edge, locked)),
+                        locked,
                     )
                 } else {
                     return Err(CargoImportError::Unsupported(format!(
@@ -1020,11 +1076,9 @@ fn resolve_deps(
                 default_features,
                 features,
                 target,
-                locked_version: None,
+                locked: None,
             });
-        } else if let Some((_edge, locked)) = req
-            && locked.is_some()
-        {
+        } else if let Some(locked) = locked {
             out.push(ResolvedDep {
                 extern_name: name.replace('-', "_"),
                 package,
@@ -1033,11 +1087,12 @@ fn resolve_deps(
                 default_features,
                 features,
                 target,
-                locked_version: locked,
+                locked: Some(locked),
             });
         }
-        // Collecting mode (`tong lock`): `locked` is None — the edge
-        // was recorded by the provider; nothing is imported.
+        // Collecting mode (`tong lock`) or an inactive optional edge:
+        // `locked` is None — the edge was recorded by the provider (or is
+        // absent from the locked feature graph); nothing is imported.
     }
     Ok(out)
 }
@@ -1250,17 +1305,14 @@ mod tests {
     struct NoLock;
 
     impl LockedSourceProvider for NoLock {
-        fn locked_version(&self, edge: &RegistryEdge) -> Result<Option<Version>, CargoImportError> {
+        fn locked_package(
+            &self,
+            edge: &RegistryEdge,
+        ) -> Result<Option<LockedSource>, CargoImportError> {
             Err(CargoImportError::Unsupported(format!(
                 "registry dependency `{}` requires Tong.lock; run `tong lock`",
                 edge.package
             )))
-        }
-
-        fn source_dir(&self, _name: &str, _version: &Version) -> Result<PathBuf, CargoImportError> {
-            Err(CargoImportError::Unsupported(
-                "no locked source provider".to_owned(),
-            ))
         }
     }
 
@@ -1331,7 +1383,7 @@ calc-core = { path = "../calc-core" }
             .unwrap();
         assert_eq!(cli.deps.len(), 1);
         assert_eq!(cli.deps[0].extern_name, "calc_core");
-        assert_eq!(cli.deps[0].package, "calc-core");
+        assert_eq!(cli.deps[0].package.name, "calc-core");
         let core = model
             .packages
             .iter()
@@ -1429,7 +1481,7 @@ sdl3-sys = { path = "../../shared/sdl3-sys" }
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 1);
         assert_eq!(app.deps[0].extern_name, "sdl3_sys");
-        assert_eq!(app.deps[0].package, "sdl3-sys");
+        assert_eq!(app.deps[0].package.name, "sdl3-sys");
         let sys = model
             .packages
             .iter()
@@ -1714,16 +1766,20 @@ win-only = { path = "../win-only" }
         // recorded (cargo locks all targets); the backend filters them at
         // plan time.
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
-        let names: Vec<&str> = app.deps.iter().map(|d| d.package.as_str()).collect();
+        let names: Vec<&str> = app.deps.iter().map(|d| d.package.name.as_str()).collect();
         assert!(names.contains(&"common"));
         assert!(names.contains(&"unix-only"));
         assert!(names.contains(&"win-only"));
-        let win = app.deps.iter().find(|d| d.package == "win-only").unwrap();
+        let win = app
+            .deps
+            .iter()
+            .find(|d| d.package.name == "win-only")
+            .unwrap();
         assert_eq!(win.target.as_deref(), Some("cfg(windows)"));
         assert_eq!(
             app.deps
                 .iter()
-                .find(|d| d.package == "unix-only")
+                .find(|d| d.package.name == "unix-only")
                 .unwrap()
                 .target
                 .as_deref(),
@@ -1735,7 +1791,7 @@ win-only = { path = "../win-only" }
             import_cargo_workspace(&dir.path().join("ws"), "x86_64-pc-windows-msvc", &NO_LOCK)
                 .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
-        let names: Vec<&str> = app.deps.iter().map(|d| d.package.as_str()).collect();
+        let names: Vec<&str> = app.deps.iter().map(|d| d.package.name.as_str()).collect();
         assert!(names.contains(&"unix-only"));
         assert!(names.contains(&"win-only"));
     }
@@ -1775,8 +1831,8 @@ win-only = { path = "../win-only", target = "cfg(windows)" }
         // backend filters at plan time.
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 2);
-        assert_eq!(app.deps[0].package, "unix-only");
-        assert_eq!(app.deps[1].package, "win-only");
+        assert_eq!(app.deps[0].package.name, "unix-only");
+        assert_eq!(app.deps[1].package.name, "win-only");
         assert_eq!(app.deps[1].target.as_deref(), Some("cfg(windows)"));
     }
 
@@ -1836,5 +1892,74 @@ strip = "everything"
         let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
             .unwrap_err();
         assert!(err.to_string().contains("strip"), "{err}");
+    }
+
+    #[test]
+    fn selects_resolver_from_workspace_and_package() {
+        // Explicit workspace resolver.
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+            ),
+            (
+                "app/Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("app/src/lib.rs", ""),
+        ]);
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        assert_eq!(model.resolver, ResolverVersion::V3);
+
+        // A package-level resolver wins over the edition default.
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\nresolver = \"1\"\n",
+            ),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        assert_eq!(model.resolver, ResolverVersion::V1);
+
+        // Edition 2024 defaults to resolver 3; 2021 to 2.
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        assert_eq!(model.resolver, ResolverVersion::V3);
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let model =
+            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+                .unwrap();
+        assert_eq!(model.resolver, ResolverVersion::V2);
+
+        // Unsupported resolver values are targeted errors.
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nresolver = \"4\"\n",
+            ),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
+            .unwrap_err();
+        assert!(err.to_string().contains("resolver"), "{err}");
     }
 }

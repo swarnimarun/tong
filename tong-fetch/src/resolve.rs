@@ -58,6 +58,10 @@ pub struct ResolvedDep {
 pub struct LocalPackage {
     pub name: String,
     pub version: Version,
+    /// Lockfile source string (`path+<rel>`) of the local package. Carried
+    /// through resolution so a local `foo` and a registry `foo` never
+    /// alias in lock assembly.
+    pub source: Option<String>,
     /// Dependencies: `None` req = local/path edge, `Some` = registry edge.
     pub deps: Vec<ResolvedDep>,
 }
@@ -67,13 +71,18 @@ pub struct LocalPackage {
 pub struct ResolvedPackage {
     pub name: String,
     pub version: Version,
+    /// Lockfile source string: `Some("path+…")` for workspace/path
+    /// packages, `None` for registry packages (the caller knows the index
+    /// URL).
+    pub source: Option<String>,
     /// Registry checksum (`None` for local packages).
     pub checksum: Option<String>,
     pub yanked: bool,
     /// Whether this is a workspace/path package (no registry source).
     pub local: bool,
-    /// Resolved dependency edges: exact locked versions (deduplicated).
-    pub dependencies: Vec<(String, Version)>,
+    /// Resolved dependency edges: exact locked versions (deduplicated),
+    /// with the target's source string when it is a local package.
+    pub dependencies: Vec<(String, Version, Option<String>)>,
 }
 
 /// A source of index data (implemented by [`crate::IndexClient`]; tests use
@@ -121,18 +130,36 @@ impl From<crate::FetchError> for ResolveError {
 // Ported types (cargo src/resolver/{types,conflict_cache,context}.rs)
 // ---------------------------------------------------------------------------
 
-/// A package identity in the graph: name + exact version.
+/// A package's activation key: name + semver-compatibility group + source
+/// (a local `foo` and a registry `foo` never conflict).
+type ActivationKey = (String, SemverCompat, Option<String>);
+
+fn activation_key(id: &PackageId) -> ActivationKey {
+    (
+        id.name.clone(),
+        SemverCompat::from(&id.version),
+        id.source.clone(),
+    )
+}
+
+/// A package identity in the graph: name + exact version + source.
+///
+/// The source (`path+…` for local packages, `None` for registry) is part
+/// of the identity so a local `foo` and a registry `foo` never alias in
+/// activations, conflicts, or edges.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PackageId {
     name: String,
     version: Version,
+    source: Option<String>,
 }
 
 impl PackageId {
-    fn new(name: &str, version: &Version) -> Self {
+    fn new(name: &str, version: &Version, source: Option<String>) -> Self {
         Self {
             name: name.to_owned(),
             version: version.clone(),
+            source,
         }
     }
 }
@@ -172,6 +199,8 @@ struct Summary {
     yanked: bool,
     /// Workspace/path package: fixed version, dev-deps locked.
     local: bool,
+    /// Lockfile source string (`path+<rel>`) for local packages.
+    source: Option<String>,
 }
 
 /// Why a candidate was rejected.
@@ -329,20 +358,14 @@ impl RemainingCandidates {
     fn next(
         &mut self,
         conflicting_prev_active: &mut ConflictMap,
-        activations: &BTreeMap<(String, SemverCompat), (Summary, usize)>,
+        activations: &BTreeMap<ActivationKey, (Summary, usize)>,
     ) -> Option<(Summary, bool)> {
-        let valid = |candidate: &Summary| {
-            let key = (
-                candidate.id.name.clone(),
-                SemverCompat::from(&candidate.id.version),
-            );
-            match activations.get(&key) {
-                Some((a, _)) => a.id == candidate.id,
-                None => true,
-            }
+        let valid = |candidate: &Summary| match activations.get(&activation_key(&candidate.id)) {
+            Some((a, _)) => a.id == candidate.id,
+            None => true,
         };
         while let Some(b) = self.remaining.next() {
-            let key = (b.id.name.clone(), SemverCompat::from(&b.id.version));
+            let key = activation_key(&b.id);
             if let Some((a, _)) = activations.get(&key)
                 && a.id != b.id
             {
@@ -386,8 +409,8 @@ struct RequestedFeatures {
 struct ResolverContext {
     /// Number of decisions made (backjump target ages).
     age: usize,
-    /// Semver-compat group → activated summary + age.
-    activations: BTreeMap<(String, SemverCompat), (Summary, usize)>,
+    /// Activation key (name, semver-compat group, source) → summary + age.
+    activations: BTreeMap<ActivationKey, (Summary, usize)>,
     /// Every resolved edge: (parent, dep, child).
     edges: Vec<(PackageId, ResolvedDep, PackageId)>,
     /// Requested features per activated package (feature-aware optional
@@ -405,9 +428,8 @@ impl ResolverContext {
         }
     }
     fn is_active(&self, id: &PackageId) -> Option<usize> {
-        let key = (id.name.clone(), SemverCompat::from(&id.version));
         self.activations
-            .get(&key)
+            .get(&activation_key(id))
             .and_then(|(s, age)| (s.id == *id).then_some(*age))
     }
     /// The newest age among `parent` and the conflict set, if all still
@@ -431,7 +453,7 @@ impl ResolverContext {
     fn flag_activated(&mut self, summary: &Summary) -> Result<bool, (PackageId, ConflictReason)> {
         let id = summary.id.clone();
         let age = self.age;
-        let key = (id.name.clone(), SemverCompat::from(&id.version));
+        let key = activation_key(&id);
         match self.activations.get(&key) {
             Some((a, _)) => {
                 if a.id != id {
@@ -809,17 +831,24 @@ pub fn resolve(
         .activations
         .values()
         .map(|(summary, _)| {
-            let mut dependencies: Vec<(String, Version)> = ctx
+            let mut dependencies: Vec<(String, Version, Option<String>)> = ctx
                 .edges
                 .iter()
                 .filter(|(parent, _, _)| *parent == summary.id)
-                .map(|(_, dep, child)| (dep.name.clone(), child.version.clone()))
+                .map(|(_, dep, child)| {
+                    let source = ctx
+                        .activations
+                        .get(&activation_key(child))
+                        .and_then(|(child_summary, _)| child_summary.source.clone());
+                    (dep.name.clone(), child.version.clone(), source)
+                })
                 .collect();
             dependencies.sort();
             dependencies.dedup();
             ResolvedPackage {
                 name: summary.id.name.clone(),
                 version: summary.id.version.clone(),
+                source: summary.source.clone(),
                 checksum: summary.checksum.clone(),
                 yanked: summary.yanked,
                 local: summary.local,
@@ -986,23 +1015,31 @@ struct Queryer<'a> {
     crates: &'a dyn CrateSource,
     locked: &'a TongLock,
     locals: &'a BTreeMap<String, Summary>,
-    deps_cache: BTreeMap<(String, String), Rc<Vec<Summary>>>,
+    deps_cache: BTreeMap<(String, String, String), Rc<Vec<Summary>>>,
 }
 
 impl Queryer<'_> {
     /// Candidate summaries for `dep` of `parent`: the local package for
     /// local edges, else versions matching the requirement — highest
     /// first, the locked version preferred, yanked only when locked.
-    /// Cached per (parent, dep-name).
+    /// Cached per (parent, dep-name, requirement): two edges of one
+    /// parent that ask for the same crate with different requirements
+    /// (e.g. renames `alpha1`/`alpha2` at `=1.0.0`/`=2.0.0`) must see
+    /// different candidate sets.
     fn query(
         &mut self,
         parent: &Summary,
         dep: &ResolvedDep,
     ) -> Result<Rc<Vec<Summary>>, ResolveError> {
-        if let Some(cached) = self
-            .deps_cache
-            .get(&(parent.id.name.clone(), dep.name.clone()))
-        {
+        let cache_key = (
+            parent.id.name.clone(),
+            dep.name.clone(),
+            dep.req
+                .as_ref()
+                .map(|req| req.to_string())
+                .unwrap_or_default(),
+        );
+        if let Some(cached) = self.deps_cache.get(&cache_key) {
             return Ok(Rc::clone(cached));
         }
         let summaries: Vec<Summary> = match &dep.req {
@@ -1019,7 +1056,16 @@ impl Queryer<'_> {
                 vec![summary.clone()]
             }
             Some(req) => {
-                let locked_version = self.locked.package(&dep.name).map(|p| p.version.clone());
+                // The lock preference: any locked version that satisfies
+                // the requirement — with several locked versions the
+                // highest is preferred. Name-only lookups are gone: two
+                // locked versions of one crate must not alias.
+                let locked_version = self
+                    .locked
+                    .candidates(&dep.name)
+                    .filter(|p| req.matches(&p.version))
+                    .map(|p| p.version.clone())
+                    .max();
                 let mut versions: Vec<Summary> = self
                     .crates
                     .versions(&dep.name)?
@@ -1042,17 +1088,14 @@ impl Queryer<'_> {
             }
         };
         let summaries = Rc::new(summaries);
-        self.deps_cache.insert(
-            (parent.id.name.clone(), dep.name.clone()),
-            Rc::clone(&summaries),
-        );
+        self.deps_cache.insert(cache_key, Rc::clone(&summaries));
         Ok(summaries)
     }
 }
 
 fn summary_from_index(entry: &IndexVersion) -> Summary {
     Summary {
-        id: PackageId::new(&entry.name, &entry.vers),
+        id: PackageId::new(&entry.name, &entry.vers, None),
         deps: Rc::new(
             entry
                 .deps
@@ -1071,17 +1114,19 @@ fn summary_from_index(entry: &IndexVersion) -> Summary {
         checksum: Some(entry.cksum.clone()),
         yanked: entry.yanked,
         local: false,
+        source: None,
     }
 }
 
 fn local_summary(local: &LocalPackage) -> Summary {
     Summary {
-        id: PackageId::new(&local.name, &local.version),
+        id: PackageId::new(&local.name, &local.version, local.source.clone()),
         deps: Rc::new(local.deps.clone()),
         features: BTreeMap::new(),
         checksum: None,
         yanked: false,
         local: true,
+        source: local.source.clone(),
     }
 }
 
@@ -1156,29 +1201,30 @@ fn activation_error(
 }
 
 /// Cycle check over the resolved edges (ported cargo `check_cycles`).
+///
+/// Package identity here is `(name, version, source)`: a local `foo` and a
+/// registry `foo` are different nodes, so edges can never attach to the
+/// wrong one.
+type NodeId = (String, Version, Option<String>);
+
 fn check_cycles(packages: &[ResolvedPackage]) -> Result<(), ResolveError> {
-    let mut checked: BTreeSet<(String, Version)> = BTreeSet::new();
-    let mut path: Vec<(String, Version)> = Vec::new();
-    let mut visited: BTreeSet<(String, Version)> = BTreeSet::new();
+    let mut checked: BTreeSet<NodeId> = BTreeSet::new();
+    let mut path: Vec<NodeId> = Vec::new();
+    let mut visited: BTreeSet<NodeId> = BTreeSet::new();
     for pkg in packages {
-        if !checked.contains(&(pkg.name.clone(), pkg.version.clone())) {
-            visit(
-                packages,
-                &(pkg.name.clone(), pkg.version.clone()),
-                &mut visited,
-                &mut path,
-                &mut checked,
-            )?;
+        let id: NodeId = (pkg.name.clone(), pkg.version.clone(), pkg.source.clone());
+        if !checked.contains(&id) {
+            visit(packages, &id, &mut visited, &mut path, &mut checked)?;
         }
     }
     return Ok(());
 
     fn visit(
         packages: &[ResolvedPackage],
-        id: &(String, Version),
-        visited: &mut BTreeSet<(String, Version)>,
-        path: &mut Vec<(String, Version)>,
-        checked: &mut BTreeSet<(String, Version)>,
+        id: &NodeId,
+        visited: &mut BTreeSet<NodeId>,
+        path: &mut Vec<NodeId>,
+        checked: &mut BTreeSet<NodeId>,
     ) -> Result<(), ResolveError> {
         if !visited.insert(id.clone()) {
             let cycle: Vec<String> = path
@@ -1198,8 +1244,8 @@ fn check_cycles(packages: &[ResolvedPackage]) -> Result<(), ResolveError> {
         }
         if checked.insert(id.clone()) {
             path.push(id.clone());
-            for (dep, version) in package_by_id(packages, id).dependencies.clone() {
-                visit(packages, &(dep, version), visited, path, checked)?;
+            for (dep, version, source) in package_by_id(packages, id).dependencies.clone() {
+                visit(packages, &(dep, version, source), visited, path, checked)?;
             }
             path.pop();
         }
@@ -1208,13 +1254,10 @@ fn check_cycles(packages: &[ResolvedPackage]) -> Result<(), ResolveError> {
     }
 }
 
-fn package_by_id<'a>(
-    packages: &'a [ResolvedPackage],
-    id: &(String, Version),
-) -> &'a ResolvedPackage {
+fn package_by_id<'a>(packages: &'a [ResolvedPackage], id: &NodeId) -> &'a ResolvedPackage {
     packages
         .iter()
-        .find(|p| p.name == id.0 && p.version == id.1)
+        .find(|p| p.name == id.0 && p.version == id.1 && p.source == id.2)
         .expect("edge target is a resolved package")
 }
 
@@ -1276,6 +1319,7 @@ mod tests {
         LocalPackage {
             name: "root".to_owned(),
             version: Version::new(0, 1, 0),
+            source: Some("path+.".to_owned()),
             deps,
         }
     }
@@ -1328,12 +1372,12 @@ mod tests {
         let macros = packages.iter().find(|p| p.name == "tokio-macros").unwrap();
         assert_eq!(
             macros.dependencies,
-            vec![("syn".to_owned(), Version::new(3, 0, 3))]
+            vec![("syn".to_owned(), Version::new(3, 0, 3), None)]
         );
         let matchers = packages.iter().find(|p| p.name == "matchers").unwrap();
         assert_eq!(
             matchers.dependencies,
-            vec![("syn".to_owned(), Version::new(2, 0, 0))]
+            vec![("syn".to_owned(), Version::new(2, 0, 0), None)]
         );
     }
 
@@ -1581,7 +1625,7 @@ mod tests {
         let core = packages.iter().find(|p| p.name == "serde_core").unwrap();
         assert_eq!(
             core.dependencies,
-            vec![("serde_derive".to_owned(), Version::new(1, 0, 229))]
+            vec![("serde_derive".to_owned(), Version::new(1, 0, 229), None)]
         );
     }
 
@@ -1675,7 +1719,7 @@ mod tests {
         let pkg = packages.iter().find(|p| p.name == "pkg").unwrap();
         assert_eq!(
             pkg.dependencies,
-            vec![("base".to_owned(), Version::new(1, 0, 0))]
+            vec![("base".to_owned(), Version::new(1, 0, 0), None)]
         );
 
         // The `extra` feature requested on the edge: `extra` is locked.
@@ -1686,8 +1730,8 @@ mod tests {
         assert_eq!(
             pkg.dependencies,
             vec![
-                ("base".to_owned(), Version::new(1, 0, 0)),
-                ("extra".to_owned(), Version::new(1, 0, 0)),
+                ("base".to_owned(), Version::new(1, 0, 0), None),
+                ("extra".to_owned(), Version::new(1, 0, 0), None),
             ]
         );
     }
@@ -1703,6 +1747,7 @@ mod tests {
                 LocalPackage {
                     name: "app".to_owned(),
                     version: Version::new(0, 1, 0),
+                    source: Some("path+crates/app".to_owned()),
                     deps: vec![ResolvedDep {
                         name: "core".to_owned(),
                         req: None,
@@ -1715,6 +1760,7 @@ mod tests {
                 LocalPackage {
                     name: "core".to_owned(),
                     version: Version::new(0, 2, 0),
+                    source: Some("path+crates/core".to_owned()),
                     deps: Vec::new(),
                 },
             ],
@@ -1724,9 +1770,14 @@ mod tests {
         let app = packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(
             app.dependencies,
-            vec![("core".to_owned(), Version::new(0, 2, 0))]
+            vec![(
+                "core".to_owned(),
+                Version::new(0, 2, 0),
+                Some("path+crates/core".to_owned())
+            )]
         );
         assert!(app.local);
+        assert_eq!(app.source.as_deref(), Some("path+crates/app"));
     }
 
     /// The output is deterministic.

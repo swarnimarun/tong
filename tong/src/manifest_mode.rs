@@ -9,8 +9,19 @@ use std::path::{Path, PathBuf};
 
 use tong_graph::manifest::{Lto, Manifest, OptLevel, ProfileConfig};
 use tong_rust::model::{
-    BinTarget, CcImport, Dep, Edition, LibTarget, Package, ProfileSpec, RustModel,
+    BinTarget, CcImport, Dep, Edition, LibTarget, Package, PackageId, ProfileSpec, RustModel,
+    SourceId,
 };
+
+/// The package identity of every native `Tong.toml` target (this wave:
+/// one package per target at the workspace root, version 0.0.0).
+fn native_id(name: &str) -> PackageId {
+    PackageId {
+        name: name.to_owned(),
+        version: semver::Version::new(0, 0, 0),
+        source: SourceId::Workspace(".".to_owned()),
+    }
+}
 
 /// Converts a native `Tong.toml` manifest into the Rust model.
 pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustModel {
@@ -29,6 +40,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
                 let crate_types = parse_crate_types(&target.crate_types);
                 model.packages.push(Package {
+                    id: native_id(name),
                     name: name.clone(),
                     dir: root.to_path_buf(),
                     version: "0.0.0".to_owned(),
@@ -58,6 +70,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("src/main.rs"));
                 let mut pkg = Package {
+                    id: native_id(name),
                     name: name.clone(),
                     dir: root.to_path_buf(),
                     version: "0.0.0".to_owned(),
@@ -98,6 +111,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(format!("tests/{name}.rs")));
                 model.packages.push(Package {
+                    id: native_id(name),
                     name: name.clone(),
                     dir: root.to_path_buf(),
                     version: "0.0.0".to_owned(),
@@ -142,7 +156,7 @@ pub fn manifest_to_model(manifest: &Manifest, root: &std::path::Path) -> RustMod
         }
     }
 
-    model.members = manifest.target.keys().cloned().collect();
+    model.members = manifest.target.keys().map(|name| native_id(name)).collect();
 
     model.profiles = manifest
         .profile
@@ -171,7 +185,7 @@ fn parse_deps(deps: &[String]) -> Vec<Dep> {
             };
             Some(Dep {
                 extern_name: name.replace('-', "_"),
-                package: name,
+                package: native_id(&name),
                 optional: false,
                 default_features: true,
                 features: Vec::new(),

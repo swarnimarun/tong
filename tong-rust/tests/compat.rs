@@ -77,29 +77,20 @@ const FIXTURES: &[Fixture] = &[
 struct NoLock;
 
 impl tong_rust::LockedSourceProvider for NoLock {
-    fn locked_version(
+    fn locked_package(
         &self,
         edge: &tong_rust::RegistryEdge,
-    ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
+    ) -> Result<Option<tong_rust::LockedSource>, tong_rust::CargoImportError> {
         Err(tong_rust::CargoImportError::Unsupported(format!(
             "registry dependency `{}` requires Tong.lock; run `tong lock`",
             edge.package
         )))
     }
-
-    fn source_dir(
-        &self,
-        _name: &str,
-        _version: &semver::Version,
-    ) -> Result<PathBuf, tong_rust::CargoImportError> {
-        Err(tong_rust::CargoImportError::Unsupported(
-            "no locked source provider".to_owned(),
-        ))
-    }
 }
 
 /// The lockfile-backed provider (registry fixture): mirrors the driver's
-/// `LockedSource`.
+/// `LockfileSource` (single-candidate locks in the fixture are resolved by
+/// requirement matching).
 struct LockedSource {
     lock: tong_fetch::TongLock,
     store: PathBuf,
@@ -112,45 +103,62 @@ impl LockedSource {
 }
 
 impl tong_rust::LockedSourceProvider for LockedSource {
-    fn locked_version(
+    fn locked_package(
         &self,
         edge: &tong_rust::RegistryEdge,
-    ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
-        let package = self.lock.package(&edge.package).ok_or_else(|| {
-            tong_rust::CargoImportError::Unsupported(format!(
-                "registry dependency `{}` is not in Tong.lock; run `tong lock`",
-                edge.package
-            ))
-        })?;
+    ) -> Result<Option<tong_rust::LockedSource>, tong_rust::CargoImportError> {
         let req = semver::VersionReq::parse(&edge.req).map_err(|err| {
             tong_rust::CargoImportError::Unsupported(format!(
                 "invalid version requirement {:?} for `{}`: {err}",
                 edge.req, edge.package
             ))
         })?;
-        if !req.matches(&package.version) {
-            return Err(tong_rust::CargoImportError::Unsupported(format!(
-                "lockfile out of date: `{}` requires {} but Tong.lock has {}",
-                edge.package, edge.req, package.version
-            )));
-        }
-        Ok(Some(package.version.clone()))
-    }
-
-    fn source_dir(
-        &self,
-        name: &str,
-        version: &semver::Version,
-    ) -> Result<PathBuf, tong_rust::CargoImportError> {
-        let package = self.lock.package(name).ok_or_else(|| {
-            tong_rust::CargoImportError::Unsupported(format!("`{name}` is not in Tong.lock"))
-        })?;
+        let candidates: Vec<&tong_fetch::LockedPackage> = self
+            .lock
+            .candidates(&edge.package)
+            .filter(|package| req.matches(&package.version))
+            .collect();
+        let package = match candidates.len() {
+            0 => {
+                if edge.optional {
+                    return Ok(None);
+                }
+                return Err(tong_rust::CargoImportError::Unsupported(format!(
+                    "registry dependency `{}` is not in Tong.lock; run `tong lock`",
+                    edge.package
+                )));
+            }
+            1 => candidates[0].clone(),
+            _ => {
+                return Err(tong_rust::CargoImportError::Unsupported(format!(
+                    "Tong.lock is ambiguous for package `{}` ({} candidates); \
+                     run `tong lock`",
+                    edge.package,
+                    candidates.len()
+                )));
+            }
+        };
         let checksum = package.checksum.as_deref().ok_or_else(|| {
-            tong_rust::CargoImportError::Unsupported(format!("`{name}` has no checksum"))
+            tong_rust::CargoImportError::Unsupported(format!(
+                "`{} {}` is not a registry package",
+                package.name, package.version
+            ))
         })?;
-        tong_fetch::materialize_source(&self.store, name, version, checksum).map_err(|err| {
-            tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
-        })
+        let source_dir =
+            tong_fetch::materialize_source(&self.store, &package.name, &package.version, checksum)
+                .map_err(|err| {
+                    tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
+                })?;
+        let source = tong_rust::SourceId::parse_lock_source(&package.source)
+            .map_err(tong_rust::CargoImportError::Unsupported)?;
+        Ok(Some(tong_rust::LockedSource {
+            id: tong_rust::PackageId {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source,
+            },
+            source_dir,
+        }))
     }
 }
 
@@ -217,8 +225,8 @@ fn tong_view(model: &RustModel, include_dev: bool) -> TongView {
     let requests: Vec<FeatureRequest> = model
         .members
         .iter()
-        .map(|name| FeatureRequest {
-            package: name.clone(),
+        .map(|id| FeatureRequest {
+            package: id.clone(),
             features: Vec::new(),
             default_features: true,
         })
@@ -233,7 +241,7 @@ fn tong_view(model: &RustModel, include_dev: bool) -> TongView {
         features.insert(
             pkg.name.clone(),
             map.packages
-                .get(&pkg.name)
+                .get(&pkg.id)
                 .map(|set| set.iter().cloned().collect())
                 .unwrap_or_default(),
         );
@@ -246,14 +254,8 @@ fn tong_view(model: &RustModel, include_dev: bool) -> TongView {
             } else {
                 [].iter()
             })
-            .filter(|dep| {
-                !dep.optional
-                    || map
-                        .active_optional_deps
-                        .get(&pkg.name)
-                        .is_some_and(|active| active.contains(&dep.extern_name))
-            })
-            .map(|dep| dep.package.clone())
+            .filter(|dep| !dep.optional || map.edge_active(&pkg.id, &dep.extern_name))
+            .map(|dep| dep.package.name.clone())
             .collect();
         for dep in active {
             edges.push((pkg.name.clone(), dep));
@@ -457,6 +459,7 @@ fn check_pass(fixture: &Fixture) {
             let locals = [tong_fetch::LocalPackage {
                 name: "root".to_owned(),
                 version: semver::Version::new(0, 1, 0),
+                source: Some("path+.".to_owned()),
                 deps: vec![
                     tong_fetch::ResolvedDep {
                         name: "alpha".to_owned(),
@@ -483,11 +486,12 @@ fn check_pass(fixture: &Fixture) {
                 packages: Vec::new(),
             };
             for package in &packages {
-                // `package.dependencies` carries exact (name, version) edges.
+                // `package.dependencies` carries exact (name, version,
+                // source) edges.
                 let deps: Vec<String> = package
                     .dependencies
                     .iter()
-                    .map(|(name, version)| format!("{name} {version} registry+file"))
+                    .map(|(name, version, _source)| format!("{name} {version} registry+file"))
                     .collect();
                 lock.packages.push(tong_fetch::LockedPackage {
                     name: package.name.clone(),

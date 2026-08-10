@@ -70,7 +70,7 @@ pub fn generate(root: &Path, options: &Options) -> Result<Generated, BuildError>
         },
     };
 
-    let members: BTreeSet<&str> = model.members.iter().map(String::as_str).collect();
+    let members: BTreeSet<&str> = model.members.iter().map(|id| id.name.as_str()).collect();
 
     // Member-relative paths (for manifest staging) and path-dependency
     // directories (copied in full). Registry/git checkouts live under the

@@ -21,7 +21,7 @@ use tong_core::action::{
 };
 use tong_core::artifact::{ArtifactRef, BlobDigest, TreeDigest};
 use tong_core::bundle::BundleRef;
-use tong_core::canonical::Encoder;
+use tong_core::canonical::{CanonicalEncode, Encoder};
 use tong_core::paths::{OutputPath, RelativePath};
 use tong_core::tree::{Tree, TreeEntry};
 use tong_exec::EXEC_ROOT_VAR;
@@ -30,7 +30,7 @@ use tong_store::{CAPTURE_EXCLUDES, Cas};
 
 use crate::build_directives::{Directives, parse_directives};
 use crate::model::{
-    CrateType, Dep, Edition, Package, ProfileSpec, RustModel, crate_name, lib_crate_name,
+    CrateType, Dep, Edition, Package, PackageId, ProfileSpec, RustModel, crate_name, lib_crate_name,
 };
 use crate::toolchain::{SystemRust, dll_extension, host_platform};
 
@@ -156,13 +156,13 @@ pub struct RustBackend<'a> {
     toolchain: SystemRust,
     profile_name: String,
     profile: ProfileSpec,
-    source_trees: BTreeMap<String, TreeDigest>,
+    source_trees: BTreeMap<PackageId, TreeDigest>,
     /// Original crate path (relative to the package dir) → rewritten path
     /// inside the source tree, for crate roots mounted outside the package
     /// dir.
-    crate_roots: BTreeMap<(String, PathBuf), PathBuf>,
+    crate_roots: BTreeMap<(PackageId, PathBuf), PathBuf>,
     cc: BTreeMap<String, CcInfo>,
-    cc_closure: BTreeMap<String, Vec<String>>,
+    cc_closure: BTreeMap<PackageId, Vec<String>>,
     planned_ids: BTreeMap<String, ActionId>,
     /// Whether test targets are planned and run (`tong test`).
     tests_enabled: bool,
@@ -317,11 +317,11 @@ impl<'a> RustBackend<'a> {
                     ))
                 })?;
                 let rewritten = PathBuf::from(format!("ext/{index}")).join(relative);
-                self.crate_roots.insert((pkg.name.clone(), path), rewritten);
+                self.crate_roots.insert((pkg.id.clone(), path), rewritten);
                 index += 1;
             }
 
-            self.source_trees.insert(pkg.name.clone(), tree);
+            self.source_trees.insert(pkg.id.clone(), tree);
         }
 
         // 2. Import prebuilt native libraries.
@@ -330,15 +330,15 @@ impl<'a> RustBackend<'a> {
         }
 
         // 3. Compute transitive native closures per package.
-        let pkg_map: BTreeMap<&str, &Package> = self
+        let pkg_map: BTreeMap<PackageId, &Package> = self
             .model
             .packages
             .iter()
-            .map(|pkg| (pkg.name.as_str(), pkg))
+            .map(|pkg| (pkg.id.clone(), pkg))
             .collect();
         for pkg in &self.model.packages {
-            let closure = self.collect_cc(&pkg.name, &pkg_map);
-            self.cc_closure.insert(pkg.name.clone(), closure);
+            let closure = self.collect_cc(pkg, &pkg_map);
+            self.cc_closure.insert(pkg.id.clone(), closure);
         }
 
         // 4. Build-script action ids are deterministic
@@ -349,8 +349,8 @@ impl<'a> RustBackend<'a> {
         for pkg in &self.model.packages {
             if pkg.build_script.is_some() {
                 self.planned_ids.insert(
-                    format!("bs-run:{}", pkg.name),
-                    ActionId(format!("rust:bs-run:{}", pkg.name)),
+                    format!("bs-run:{}", self.pkg_key(pkg)),
+                    ActionId(format!("rust:bs-run:{}", self.pkg_label(pkg))),
                 );
             }
         }
@@ -363,8 +363,8 @@ impl<'a> RustBackend<'a> {
             if let Some(lib) = &pkg.lib {
                 if lib.proc_macro {
                     self.planned_ids.insert(
-                        format!("lib:{}:proc-macro", pkg.name),
-                        ActionId(format!("rust:proc-macro:{}", pkg.name)),
+                        format!("lib:{}:proc-macro", self.pkg_key(pkg)),
+                        ActionId(format!("rust:proc-macro:{}", self.pkg_label(pkg))),
                     );
                 } else {
                     let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -374,8 +374,12 @@ impl<'a> RustBackend<'a> {
                     };
                     for crate_type in types {
                         self.planned_ids.insert(
-                            format!("lib:{}:{}", pkg.name, crate_type.to_rustc()),
-                            ActionId(format!("rust:lib:{}:{}", pkg.name, crate_type.to_rustc())),
+                            format!("lib:{}:{}", self.pkg_key(pkg), crate_type.to_rustc()),
+                            ActionId(format!(
+                                "rust:lib:{}:{}",
+                                self.pkg_label(pkg),
+                                crate_type.to_rustc()
+                            )),
                         );
                     }
                 }
@@ -409,11 +413,11 @@ impl<'a> RustBackend<'a> {
         actions: &mut Vec<PlannedAction>,
         pkg: &Package,
     ) -> Result<(), PlanError> {
-        let source_tree = self.source_trees[&pkg.name];
-        let cc = self.cc_for(&pkg.name);
+        let source_tree = self.source_trees[&pkg.id];
+        let cc = self.cc_for(&pkg.id);
         let bs_run: Option<ActionId> = self
             .planned_ids
-            .get(&format!("bs-run:{}", pkg.name))
+            .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
 
         for target in &pkg.tests {
@@ -425,7 +429,7 @@ impl<'a> RustBackend<'a> {
                     0,
                     Dep {
                         extern_name: lib_crate_name(pkg),
-                        package: pkg.name.clone(),
+                        package: pkg.id.clone(),
                         optional: false,
                         default_features: true,
                         features: Vec::new(),
@@ -436,8 +440,8 @@ impl<'a> RustBackend<'a> {
             let crate_name = crate_name(&target.name);
             let compile_id = self.plan_compile(
                 actions,
-                &format!("test-compile:{}:{}", pkg.name, target.name),
-                &format!("rust:test-compile:{}:{}", pkg.name, target.name),
+                &format!("test-compile:{}:{}", self.pkg_key(pkg), target.name),
+                &format!("rust:test-compile:{}:{}", self.pkg_label(pkg), target.name),
                 "RustTestCompile",
                 pkg,
                 source_tree,
@@ -447,10 +451,14 @@ impl<'a> RustBackend<'a> {
                 Some(target.name.clone()),
                 &deps,
                 bs_run.clone(),
-                self.crate_root_for(&pkg.name, &target.path),
+                self.crate_root_for(&pkg.id, &target.path),
             )?;
 
-            let run_id = ActionId(format!("rust:test-run:{}:{}", pkg.name, target.name));
+            let run_id = ActionId(format!(
+                "rust:test-run:{}:{}",
+                self.pkg_label(pkg),
+                target.name
+            ));
             let run_ctx = Ctx {
                 logical_id: run_id.clone(),
                 mnemonic: "RustTestRun".to_owned(),
@@ -483,7 +491,7 @@ impl<'a> RustBackend<'a> {
         let state = self.state.as_ref()?;
         let project_hash = self.project_hash?;
         let manifest = state.latest(&project_hash)?;
-        let id = format!("rust:bs-run:{}", pkg.name);
+        let id = format!("rust:bs-run:{}", self.pkg_label(pkg));
         let action = manifest
             .actions
             .iter()
@@ -515,7 +523,7 @@ impl<'a> RustBackend<'a> {
             .collect();
         // Cargo always reruns when the build script itself changes.
         if let Some(script) = &pkg.build_script {
-            let script = self.crate_root_for(&pkg.name, script);
+            let script = self.crate_root_for(&pkg.id, script);
             if !paths.contains(&script) {
                 paths.push(script.clone());
             }
@@ -601,8 +609,8 @@ impl<'a> RustBackend<'a> {
         actions: &mut Vec<PlannedAction>,
         pkg: &Package,
     ) -> Result<Option<ActionId>, PlanError> {
-        let source_tree = self.source_trees[&pkg.name];
-        let cc = self.cc_for(&pkg.name);
+        let source_tree = self.source_trees[&pkg.id];
+        let cc = self.cc_for(&pkg.id);
 
         // Build script: compile, then run. The run's source tree is
         // narrowed by the previous run's `rerun-if-changed` directives
@@ -631,12 +639,12 @@ impl<'a> RustBackend<'a> {
                     }
                 }
             }
-            let script = self.crate_root_for(&pkg.name, script);
+            let script = self.crate_root_for(&pkg.id, script);
             let binary = format!("{}_build_script", crate_name(&pkg.name));
             let compile_id = self.plan_compile(
                 actions,
-                &format!("bs-compile:{}", pkg.name),
-                &format!("rust:bs-compile:{}", pkg.name),
+                &format!("bs-compile:{}", self.pkg_key(pkg)),
+                &format!("rust:bs-compile:{}", self.pkg_label(pkg)),
                 "RustBuildScriptCompile",
                 pkg,
                 script_tree,
@@ -653,7 +661,7 @@ impl<'a> RustBackend<'a> {
                 run_source_tree = script_tree;
             }
 
-            let run_id = ActionId(format!("rust:bs-run:{}", pkg.name));
+            let run_id = ActionId(format!("rust:bs-run:{}", self.pkg_label(pkg)));
             let run_ctx = Ctx {
                 logical_id: run_id.clone(),
                 mnemonic: "RustBuildScriptRun".to_owned(),
@@ -673,7 +681,7 @@ impl<'a> RustBackend<'a> {
                         .model
                         .feature_map
                         .packages
-                        .get(&pkg.name)
+                        .get(&pkg.id)
                         .map(|features| features.iter().cloned().collect())
                         .unwrap_or_default(),
                 }),
@@ -692,7 +700,7 @@ impl<'a> RustBackend<'a> {
                 profile_flags: self.profile.rustc_flags(),
             };
             self.planned_ids
-                .insert(format!("bs-run:{}", pkg.name), run_id.clone());
+                .insert(format!("bs-run:{}", self.pkg_key(pkg)), run_id.clone());
             actions.push(self.boxed(run_ctx));
 
             bs_run = Some(run_id);
@@ -704,8 +712,8 @@ impl<'a> RustBackend<'a> {
             if lib.proc_macro {
                 self.plan_compile(
                     actions,
-                    &format!("lib:{}:proc-macro", pkg.name),
-                    &format!("rust:proc-macro:{}", pkg.name),
+                    &format!("lib:{}:proc-macro", self.pkg_key(pkg)),
+                    &format!("rust:proc-macro:{}", self.pkg_label(pkg)),
                     "RustProcMacro",
                     pkg,
                     source_tree,
@@ -715,7 +723,7 @@ impl<'a> RustBackend<'a> {
                     None,
                     &pkg.deps,
                     bs_run.clone(),
-                    self.crate_root_for(&pkg.name, &lib.path),
+                    self.crate_root_for(&pkg.id, &lib.path),
                 )?;
             } else {
                 let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -723,12 +731,12 @@ impl<'a> RustBackend<'a> {
                 } else {
                     lib.crate_types.clone()
                 };
-                let lib_root = self.crate_root_for(&pkg.name, &lib.path);
+                let lib_root = self.crate_root_for(&pkg.id, &lib.path);
                 for crate_type in types {
                     self.plan_compile(
                         actions,
-                        &format!("lib:{}:{}", pkg.name, crate_type.to_rustc()),
-                        &format!("rust:lib:{}:{}", pkg.name, crate_type.to_rustc()),
+                        &format!("lib:{}:{}", self.pkg_key(pkg), crate_type.to_rustc()),
+                        &format!("rust:lib:{}:{}", self.pkg_label(pkg), crate_type.to_rustc()),
                         "RustLibrary",
                         pkg,
                         source_tree,
@@ -754,11 +762,11 @@ impl<'a> RustBackend<'a> {
         actions: &mut Vec<PlannedAction>,
         pkg: &Package,
     ) -> Result<(), PlanError> {
-        let source_tree = self.source_trees[&pkg.name];
-        let cc = self.cc_for(&pkg.name);
+        let source_tree = self.source_trees[&pkg.id];
+        let cc = self.cc_for(&pkg.id);
         let bs_run: Option<ActionId> = self
             .planned_ids
-            .get(&format!("bs-run:{}", pkg.name))
+            .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
 
         for bin in &pkg.bins {
@@ -768,7 +776,7 @@ impl<'a> RustBackend<'a> {
                     0,
                     Dep {
                         extern_name: lib_crate_name(pkg),
-                        package: pkg.name.clone(),
+                        package: pkg.id.clone(),
                         optional: false,
                         default_features: true,
                         features: Vec::new(),
@@ -778,8 +786,8 @@ impl<'a> RustBackend<'a> {
             }
             self.plan_compile(
                 actions,
-                &format!("bin:{}:{}", pkg.name, bin.name),
-                &format!("rust:bin:{}:{}", pkg.name, bin.name),
+                &format!("bin:{}:{}", self.pkg_key(pkg), bin.name),
+                &format!("rust:bin:{}:{}", self.pkg_label(pkg), bin.name),
                 "RustBinary",
                 pkg,
                 source_tree,
@@ -789,7 +797,7 @@ impl<'a> RustBackend<'a> {
                 Some(bin.name.clone()),
                 &deps,
                 bs_run.clone(),
-                self.crate_root_for(&pkg.name, &bin.path),
+                self.crate_root_for(&pkg.id, &bin.path),
             )?;
         }
         Ok(())
@@ -813,7 +821,7 @@ impl<'a> RustBackend<'a> {
         for pkg in &self.model.packages {
             let runtime: Vec<(BlobDigest, String)> = self
                 .cc_closure
-                .get(&pkg.name)
+                .get(&pkg.id)
                 .unwrap()
                 .iter()
                 .map(|name| {
@@ -822,9 +830,9 @@ impl<'a> RustBackend<'a> {
                 })
                 .collect();
             for bin in &pkg.bins {
-                let Some(action) = self
-                    .planned_ids
-                    .get(&format!("bin:{}:{}", pkg.name, bin.name))
+                let Some(action) =
+                    self.planned_ids
+                        .get(&format!("bin:{}:{}", self.pkg_key(pkg), bin.name))
                 else {
                     continue;
                 };
@@ -859,7 +867,7 @@ impl<'a> RustBackend<'a> {
         build_script: Option<ActionId>,
         crate_root: PathBuf,
     ) -> Result<ActionId, PlanError> {
-        let meta = self.metadata(&crate_name, crate_type);
+        let meta = self.metadata(pkg, &crate_name, crate_type);
         let output = if let Some(name) = output_name {
             name
         } else if crate_type == "bin" {
@@ -876,19 +884,19 @@ impl<'a> RustBackend<'a> {
             };
             format!("lib{crate_name}-{meta}.{ext}")
         };
-        let dep_specs = self.resolve_deps(&pkg.name, deps)?;
+        let dep_specs = self.resolve_deps(&pkg.id, deps)?;
         // Transitive closure of the direct deps: rustc resolves transitive
         // rlibs through `-L dependency=...`, so every reachable crate's
         // output tree must be mounted at `deps/` (Cargo puts all rlibs in
         // one directory). Scheduling waits for all of them.
-        let transitive_deps = self.transitive_dep_specs(&pkg.name, deps)?;
+        let transitive_deps = self.transitive_dep_specs(&pkg.id, deps)?;
         // Per-crate feature cfgs: `--cfg feature="<name>"` for every
         // activated feature (sorted), mirroring Cargo.
         let feature_cfgs: Vec<String> = self
             .model
             .feature_map
             .packages
-            .get(&pkg.name)
+            .get(&pkg.id)
             .map(|features| {
                 features
                     .iter()
@@ -971,7 +979,30 @@ impl<'a> RustBackend<'a> {
     /// dependencies — is external. `tong build --deps-only` executes only
     /// external actions.
     fn pkg_external(&self, pkg: &Package) -> bool {
-        !self.model.members.contains(&pkg.name)
+        !self.model.members.contains(&pkg.id)
+    }
+
+    /// Internal disambiguated key for a package's planned actions:
+    /// name@version@source. Never surfaces in digests or output.
+    fn pkg_key(&self, pkg: &Package) -> String {
+        format!("{}@{}@{}", pkg.name, pkg.version, pkg.id.lock_source())
+    }
+
+    /// Human label for a package in logical ids: the bare name when the
+    /// workspace has one package with that name, else `name@version` (two
+    /// versions of one crate must produce distinct action ids).
+    fn pkg_label(&self, pkg: &Package) -> String {
+        let same_name = self
+            .model
+            .packages
+            .iter()
+            .filter(|other| other.name == pkg.name)
+            .count();
+        if same_name > 1 {
+            format!("{}@{}", pkg.name, pkg.version)
+        } else {
+            pkg.name.clone()
+        }
     }
 
     /// `CARGO_PKG_VERSION_*` env vars (crates use `env!` at compile time).
@@ -1031,9 +1062,11 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Deterministic per-crate metadata id; producers and consumers of an
-    /// artifact derive the same value.
-    fn metadata(&self, crate_name: &str, kind: &str) -> String {
+    /// artifact derive the same value. The package identity is part of the
+    /// hash: two versions of one crate must not collide on rlib filenames.
+    fn metadata(&self, pkg: &Package, crate_name: &str, kind: &str) -> String {
         let mut enc = Encoder::new();
+        pkg.id.encode(&mut enc);
         enc.write_str(crate_name);
         enc.write_str(&self.profile_name);
         enc.write_str(kind);
@@ -1043,9 +1076,9 @@ impl<'a> RustBackend<'a> {
 
     /// The compile-time crate root for a package-relative path, rewritten
     /// when the file lives outside the package dir (mounted at `ext/<n>`).
-    fn crate_root_for(&self, pkg: &str, original: &Path) -> PathBuf {
+    fn crate_root_for(&self, pkg: &PackageId, original: &Path) -> PathBuf {
         self.crate_roots
-            .get(&(pkg.to_owned(), original.to_path_buf()))
+            .get(&(pkg.clone(), original.to_path_buf()))
             .cloned()
             .unwrap_or_else(|| original.to_path_buf())
     }
@@ -1063,32 +1096,34 @@ impl<'a> RustBackend<'a> {
                     if !dep.optional {
                         return true;
                     }
-                    model
-                        .feature_map
-                        .active_optional_deps
-                        .get(&pkg.name)
-                        .is_some_and(|active| active.contains(&dep.extern_name))
+                    model.feature_map.edge_active(&pkg.id, &dep.extern_name)
                 })
                 .collect()
         }
 
         let mut out = Vec::new();
-        if let Some(id) = self.planned_ids.get(&format!("bs-run:{}", pkg.name)) {
+        if let Some(id) = self
+            .planned_ids
+            .get(&format!("bs-run:{}", self.pkg_key(pkg)))
+        {
             out.push(id.clone());
         }
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut stack: Vec<String> = active_deps(self.model, pkg)
+        let mut seen: BTreeSet<PackageId> = BTreeSet::new();
+        let mut stack: Vec<PackageId> = active_deps(self.model, pkg)
             .iter()
             .map(|dep| dep.package.clone())
             .collect();
-        while let Some(name) = stack.pop() {
-            if !seen.insert(name.clone()) {
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
                 continue;
             }
-            if let Some(id) = self.planned_ids.get(&format!("bs-run:{name}")) {
-                out.push(id.clone());
-            }
-            if let Some(dep) = self.model.packages.iter().find(|p| p.name == name) {
+            if let Some(dep) = self.model.packages.iter().find(|p| p.id == id) {
+                if let Some(bs) = self
+                    .planned_ids
+                    .get(&format!("bs-run:{}", self.pkg_key(dep)))
+                {
+                    out.push(bs.clone());
+                }
                 stack.extend(
                     active_deps(self.model, dep)
                         .iter()
@@ -1099,9 +1134,9 @@ impl<'a> RustBackend<'a> {
         out
     }
 
-    fn resolve_deps(&self, pkg_name: &str, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
+    fn resolve_deps(&self, pkg: &PackageId, deps: &[Dep]) -> Result<Vec<DepSpec>, PlanError> {
         deps.iter()
-            .filter(|dep| self.dep_active(pkg_name, dep))
+            .filter(|dep| self.dep_active(pkg, dep))
             .map(|dep| self.dep_spec(dep))
             .collect()
     }
@@ -1111,12 +1146,12 @@ impl<'a> RustBackend<'a> {
     /// imports are leaves). Deduplicated by action id.
     fn transitive_dep_specs(
         &self,
-        pkg_name: &str,
+        pkg: &PackageId,
         deps: &[Dep],
     ) -> Result<Vec<DepSpec>, PlanError> {
         let mut out: Vec<DepSpec> = Vec::new();
         let mut seen: BTreeSet<ActionId> = BTreeSet::new();
-        let mut frontier: Vec<(&str, &Dep)> = deps.iter().map(|dep| (pkg_name, dep)).collect();
+        let mut frontier: Vec<(&PackageId, &Dep)> = deps.iter().map(|dep| (pkg, dep)).collect();
         while let Some((parent, dep)) = frontier.pop() {
             if !self.dep_active(parent, dep) {
                 continue;
@@ -1126,8 +1161,8 @@ impl<'a> RustBackend<'a> {
                 if !seen.insert(action.clone()) {
                     continue;
                 }
-                if let Some(pkg) = self.model.packages.iter().find(|p| p.name == dep.package) {
-                    frontier.extend(pkg.deps.iter().map(|next| (pkg.name.as_str(), next)));
+                if let Some(pkg) = self.model.packages.iter().find(|p| p.id == dep.package) {
+                    frontier.extend(pkg.deps.iter().map(|next| (&pkg.id, next)));
                 }
             }
             out.push(spec);
@@ -1145,7 +1180,7 @@ impl<'a> RustBackend<'a> {
     /// specific edges only when the target matches the host (the import
     /// keeps every target's deps in the model — cargo locks all targets —
     /// so the plan filters here).
-    fn dep_active(&self, pkg_name: &str, dep: &Dep) -> bool {
+    fn dep_active(&self, pkg: &PackageId, dep: &Dep) -> bool {
         if let Some(target) = &dep.target {
             let host = self.toolchain.host_triple.clone();
             if !crate::cargo_import::target_matches(target, &host, "dependency").unwrap_or(false) {
@@ -1155,31 +1190,27 @@ impl<'a> RustBackend<'a> {
         if !dep.optional {
             return true;
         }
-        self.model
-            .feature_map
-            .active_optional_deps
-            .get(pkg_name)
-            .is_some_and(|active| active.contains(&dep.extern_name))
+        self.model.feature_map.edge_active(pkg, &dep.extern_name)
     }
 
     /// Resolves a dependency to its producer action or native import.
     /// An unresolvable dependency is a plan error — silently dropping it
     /// would link against a missing crate and fail deep inside rustc.
     fn dep_spec(&self, dep: &Dep) -> Result<DepSpec, PlanError> {
-        if self.cc.contains_key(&dep.package) {
+        if self.cc.contains_key(&dep.package.name) {
             return Ok(DepSpec::Native);
         }
         let pkg = self
             .model
             .packages
             .iter()
-            .find(|p| p.name == dep.package)
+            .find(|p| p.id == dep.package)
             .ok_or_else(|| {
                 PlanError::Message(format!(
                     "dependency {:?} of {:?} names no imported package or cc_import; \
                      if it is a registry dependency missing from Tong.lock, run \
                      `tong lock` (the lockfile may be stale for the requested features)",
-                    dep.extern_name, dep.package
+                    dep.extern_name, dep.package.name
                 ))
             })?;
         let (kind, ext, key) = if let Some(lib) = &pkg.lib {
@@ -1187,7 +1218,7 @@ impl<'a> RustBackend<'a> {
                 (
                     "proc-macro",
                     dll_extension(),
-                    format!("lib:{}:proc-macro", pkg.name),
+                    format!("lib:{}:proc-macro", self.pkg_key(pkg)),
                 )
             } else {
                 let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -1215,13 +1246,13 @@ impl<'a> RustBackend<'a> {
                 (
                     chosen.to_rustc(),
                     ext,
-                    format!("lib:{}:{}", pkg.name, chosen.to_rustc()),
+                    format!("lib:{}:{}", self.pkg_key(pkg), chosen.to_rustc()),
                 )
             }
         } else {
             return Err(PlanError::Message(format!(
                 "dependency {:?} names package {:?}, which has no library target",
-                dep.extern_name, dep.package
+                dep.extern_name, dep.package.name
             )));
         };
         let action = self
@@ -1230,7 +1261,7 @@ impl<'a> RustBackend<'a> {
             .cloned()
             .ok_or_else(|| PlanError::Message(format!("no planned action for {key}")))?;
         let lib_name = lib_crate_name(pkg);
-        let meta = self.metadata(&lib_name, kind);
+        let meta = self.metadata(pkg, &lib_name, kind);
         Ok(DepSpec::Rust {
             extern_name: dep.extern_name.clone(),
             action,
@@ -1240,12 +1271,12 @@ impl<'a> RustBackend<'a> {
 
     /// Transitive native closure of a package: every `cc_import` reachable
     /// through the dependency graph (inactive optional edges skipped).
-    fn collect_cc(&self, pkg_name: &str, pkg_map: &BTreeMap<&str, &Package>) -> Vec<String> {
+    fn collect_cc(&self, pkg: &Package, pkg_map: &BTreeMap<PackageId, &Package>) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut stack = vec![pkg_name.to_owned()];
-        while let Some(name) = stack.pop() {
-            let Some(current) = pkg_map.get(name.as_str()) else {
+        let mut stack = vec![pkg.id.clone()];
+        while let Some(id) = stack.pop() {
+            let Some(current) = pkg_map.get(&id) else {
                 continue;
             };
             for dep in current
@@ -1258,16 +1289,14 @@ impl<'a> RustBackend<'a> {
                     }
                     self.model
                         .feature_map
-                        .active_optional_deps
-                        .get(&current.name)
-                        .is_some_and(|active| active.contains(&dep.extern_name))
+                        .edge_active(&current.id, &dep.extern_name)
                 })
             {
-                if self.cc.contains_key(&dep.package) {
+                if self.cc.contains_key(&dep.package.name) {
                     if seen.insert(dep.package.clone()) {
-                        out.push(dep.package.clone());
+                        out.push(dep.package.name.clone());
                     }
-                } else if pkg_map.contains_key(dep.package.as_str()) {
+                } else if pkg_map.contains_key(&dep.package) {
                     stack.push(dep.package.clone());
                 }
             }
@@ -1276,9 +1305,9 @@ impl<'a> RustBackend<'a> {
         out
     }
 
-    fn cc_for(&self, pkg_name: &str) -> Vec<(String, TreeDigest, String)> {
+    fn cc_for(&self, pkg: &PackageId) -> Vec<(String, TreeDigest, String)> {
         self.cc_closure
-            .get(pkg_name)
+            .get(pkg)
             .unwrap()
             .iter()
             .map(|name| {

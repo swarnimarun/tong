@@ -168,6 +168,7 @@ fn root(deps: Vec<ResolvedDep>) -> LocalPackage {
     LocalPackage {
         name: "root".to_owned(),
         version: semver::Version::new(0, 1, 0),
+        source: Some("path+.".to_owned()),
         deps,
     }
 }

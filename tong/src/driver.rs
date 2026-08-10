@@ -693,7 +693,7 @@ fn prepare(
                 scope.spawn(move || capture_system_rust(&cas_clone))
             });
 
-            let sources = LockedSource::new(root, &store);
+            let sources = LockfileSource::new(root, &store);
             let model = load_model(root, manifest.as_ref(), &sources)?;
             tracing::debug!(
                 target: "tong::perf",
@@ -955,6 +955,16 @@ fn feature_requests(
             if target.rule == "cc_import" || !selected(name) {
                 continue;
             }
+            let id = model
+                .packages
+                .iter()
+                .find(|p| p.name == *name)
+                .map(|p| p.id.clone())
+                .ok_or_else(|| {
+                    BuildError::Manifest(format!(
+                        "target {name:?} produced no feature-bearing package"
+                    ))
+                })?;
             let mut features = target.features.clone();
             features.extend(options.features.features.iter().cloned());
             let default_features = if options.features.all_features {
@@ -965,14 +975,14 @@ fn feature_requests(
                 target.default_features.unwrap_or(true)
             };
             requests.push(tong_rust::FeatureRequest {
-                package: name.clone(),
+                package: id,
                 features,
                 default_features,
             });
         }
     } else {
-        for name in &model.members {
-            if !selected(name) {
+        for id in &model.members {
+            if !selected(&id.name) {
                 continue;
             }
             let mut features = options.features.features.clone();
@@ -982,12 +992,12 @@ fn feature_requests(
                 !options.features.no_default_features
             };
             if options.features.all_features
-                && let Some(package) = model.packages.iter().find(|p| &p.name == name)
+                && let Some(package) = model.packages.iter().find(|p| p.id == *id)
             {
                 features.extend(package.features.keys().cloned());
             }
             requests.push(tong_rust::FeatureRequest {
-                package: name.clone(),
+                package: id.clone(),
                 features,
                 default_features,
             });
@@ -997,9 +1007,9 @@ fn feature_requests(
         // No selection matched (or an empty native manifest): fall back to
         // all members so the feature map still covers the graph.
         for package in &model.packages {
-            if model.members.contains(&package.name) {
+            if model.members.contains(&package.id) {
                 requests.push(tong_rust::FeatureRequest {
-                    package: package.name.clone(),
+                    package: package.id.clone(),
                     features: Vec::new(),
                     default_features: true,
                 });
@@ -1198,14 +1208,18 @@ impl Completed for CompletedMap {
 struct CompletedMap(BTreeMap<ActionId, CachedResult>);
 
 /// The lockfile-backed source provider used by builds and `tong fetch`:
-/// resolves registry deps against `Tong.lock` and materializes checkouts
-/// from the source store (never the network).
-struct LockedSource {
+/// resolves registry dep edges to their exact locked packages and
+/// materializes checkouts from the source store (never the network).
+///
+/// Every edge is resolved through the lockfile dependency tuples
+/// (`<name> <version> <source>` recorded on the parent's locked entry), so
+/// two versions of one crate can never alias.
+struct LockfileSource {
     lock: Option<tong_fetch::TongLock>,
     store: PathBuf,
 }
 
-impl LockedSource {
+impl LockfileSource {
     fn new(root: &Path, store: &Path) -> Self {
         let lock = tong_fetch::TongLock::load(root).ok();
         Self {
@@ -1214,75 +1228,145 @@ impl LockedSource {
         }
     }
 
-    fn locked_package(&self, name: &str) -> Result<&tong_fetch::LockedPackage, BuildError> {
-        let lock = self.lock.as_ref().ok_or_else(|| {
-            BuildError::Offline(format!(
-                "registry dependency `{name}` requires Tong.lock; run `tong lock`"
-            ))
-        })?;
-        lock.package(name).ok_or_else(|| {
-            BuildError::Offline(format!(
-                "registry dependency `{name}` is not in Tong.lock; run `tong lock`"
-            ))
-        })
-    }
-}
-
-impl tong_rust::LockedSourceProvider for LockedSource {
-    fn locked_version(
+    /// The exact locked package for a registry edge.
+    ///
+    /// 1. The parent's locked entry (exact name/version/source) names every
+    ///    edge as a `(name, version, source)` tuple; the first matching
+    ///    tuple pins the package exactly.
+    /// 2. Version-1 locks (migrated in memory) carry no dependency strings;
+    ///    fall back to requirement matching, which the v1 migration made
+    ///    unambiguous.
+    ///
+    /// `Ok(None)` means the edge is not in the locked graph: an inactive
+    /// optional dependency (the lock covers the activated feature graph,
+    /// cargo-style).
+    fn locked_package(
         &self,
         edge: &tong_rust::RegistryEdge,
-    ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
-        let package = match self.locked_package(&edge.package) {
-            Ok(package) => package,
-            // Optional dependencies missing from the lock are inactive by
-            // definition (the lock covers the activated feature graph,
-            // cargo-style): skip them instead of erroring. A *mandatory*
-            // dep missing from the lock is a stale lock — error.
-            Err(_) if edge.optional => return Ok(None),
-            Err(err) => {
-                return Err(tong_rust::CargoImportError::Unsupported(err.to_string()));
-            }
-        };
+    ) -> Result<Option<tong_fetch::LockedPackage>, BuildError> {
+        let lock = self.lock.as_ref().ok_or_else(|| {
+            BuildError::Offline(format!(
+                "registry dependency `{}` requires Tong.lock; run `tong lock`",
+                edge.package
+            ))
+        })?;
         let req = semver::VersionReq::parse(&edge.req).map_err(|err| {
-            tong_rust::CargoImportError::Unsupported(format!(
+            BuildError::Offline(format!(
                 "invalid version requirement {:?} for `{}`: {err}",
                 edge.req, edge.package
             ))
         })?;
-        if !req.matches(&package.version) {
-            return Err(tong_rust::CargoImportError::Unsupported(format!(
-                "lockfile out of date: `{}` requires {} but Tong.lock has {}; \
-                 run `tong lock`",
-                edge.package, edge.req, package.version
-            )));
-        }
-        Ok(Some(package.version.clone()))
-    }
 
-    fn source_dir(
-        &self,
-        name: &str,
-        version: &semver::Version,
-    ) -> Result<PathBuf, tong_rust::CargoImportError> {
-        let package = self
-            .locked_package(name)
-            .map_err(|err| tong_rust::CargoImportError::Unsupported(err.to_string()))?;
-        if package.version != *version {
-            return Err(tong_rust::CargoImportError::Unsupported(format!(
-                "lockfile out of date: `{name}` locked at {} but {version} requested; \
-                 run `tong lock`",
-                package.version
+        // The parent's locked entry names its edges exactly.
+        let parent_source = edge.parent.lock_source();
+        if let Some(parent_entry) =
+            lock.exact(&edge.parent.name, &edge.parent.version, &parent_source)
+            && !parent_entry.dependencies.is_empty()
+        {
+            for dep in &parent_entry.dependencies {
+                let (name, version, source) = tong_fetch::LockedPackage::parse_dependency(dep);
+                if name != edge.package {
+                    continue;
+                }
+                let Some(package) = lock.packages.iter().find(|package| {
+                    package.name == name
+                        && package.version.to_string() == version
+                        && package.source == source
+                }) else {
+                    // The tuple names a package that is not locked: stale.
+                    return Err(BuildError::Offline(format!(
+                        "lockfile out of date: `{}` locks a dependency of `{}` that is \
+                         not in Tong.lock; run `tong lock`",
+                        edge.parent.name, edge.package
+                    )));
+                };
+                if !req.matches(&package.version) {
+                    return Err(BuildError::Offline(format!(
+                        "lockfile out of date: `{}` requires {} but Tong.lock has {}; \
+                         run `tong lock`",
+                        edge.package, edge.req, package.version
+                    )));
+                }
+                return Ok(Some(package.clone()));
+            }
+            // The parent's locked edges do not include this one: an
+            // inactive optional edge, or a stale lock.
+            if edge.optional {
+                return Ok(None);
+            }
+            return Err(BuildError::Offline(format!(
+                "lockfile out of date: `{}` requires `{}` but the locked graph of `{}` \
+                 does not include it; run `tong lock`",
+                edge.parent.name, edge.package, edge.parent.name
             )));
         }
+
+        // Version-1 fallback: requirement matching over the lock, which the
+        // v1 migration kept unambiguous.
+        let candidates: Vec<&tong_fetch::LockedPackage> = lock
+            .candidates(&edge.package)
+            .filter(|package| req.matches(&package.version))
+            .collect();
+        match candidates.len() {
+            0 => {
+                // Optional dependencies missing from the lock are inactive
+                // by definition (the lock covers the activated feature
+                // graph, cargo-style): skip them instead of erroring. A
+                // *mandatory* dep missing from the lock is a stale lock.
+                if edge.optional {
+                    Ok(None)
+                } else {
+                    Err(BuildError::Offline(format!(
+                        "registry dependency `{}` is not in Tong.lock; run `tong lock`",
+                        edge.package
+                    )))
+                }
+            }
+            1 => Ok(Some(candidates[0].clone())),
+            _ => Err(BuildError::Offline(format!(
+                "Tong.lock is ambiguous for package `{}` ({} candidates match {}); \
+                 run `tong lock`",
+                edge.package,
+                candidates.len(),
+                edge.req
+            ))),
+        }
+    }
+}
+
+impl tong_rust::LockedSourceProvider for LockfileSource {
+    fn locked_package(
+        &self,
+        edge: &tong_rust::RegistryEdge,
+    ) -> Result<Option<tong_rust::LockedSource>, tong_rust::CargoImportError> {
+        let package = match self.locked_package(edge) {
+            Ok(Some(package)) => package,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                return Err(tong_rust::CargoImportError::Unsupported(err.to_string()));
+            }
+        };
         let checksum = package.checksum.as_deref().ok_or_else(|| {
             tong_rust::CargoImportError::Unsupported(format!(
-                "`{name} {version}` is not a registry package"
+                "`{} {}` is not a registry package",
+                package.name, package.version
             ))
         })?;
-        tong_fetch::materialize_source(&self.store, name, version, checksum).map_err(|err| {
-            tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
-        })
+        let source_dir =
+            tong_fetch::materialize_source(&self.store, &package.name, &package.version, checksum)
+                .map_err(|err| {
+                    tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
+                })?;
+        let source = tong_rust::model::SourceId::parse_lock_source(&package.source)
+            .map_err(tong_rust::CargoImportError::Unsupported)?;
+        Ok(Some(tong_rust::LockedSource {
+            id: tong_rust::model::PackageId {
+                name: package.name,
+                version: package.version,
+                source,
+            },
+            source_dir,
+        }))
     }
 }
 
@@ -1300,10 +1384,10 @@ impl CollectProvider {
 }
 
 impl tong_rust::LockedSourceProvider for CollectProvider {
-    fn locked_version(
+    fn locked_package(
         &self,
         edge: &tong_rust::RegistryEdge,
-    ) -> Result<Option<semver::Version>, tong_rust::CargoImportError> {
+    ) -> Result<Option<tong_rust::LockedSource>, tong_rust::CargoImportError> {
         // Validate the requirement syntax so `tong lock` fails early.
         semver::VersionReq::parse(&edge.req).map_err(|err| {
             tong_rust::CargoImportError::Unsupported(format!(
@@ -1313,16 +1397,6 @@ impl tong_rust::LockedSourceProvider for CollectProvider {
         })?;
         self.edges.borrow_mut().push(edge.clone());
         Ok(None)
-    }
-
-    fn source_dir(
-        &self,
-        _name: &str,
-        _version: &semver::Version,
-    ) -> Result<PathBuf, tong_rust::CargoImportError> {
-        Err(tong_rust::CargoImportError::Unsupported(
-            "registry packages are not imported during `tong lock`".to_owned(),
-        ))
     }
 }
 
@@ -1353,6 +1427,57 @@ pub fn update(root: &Path, package: Option<&str>) -> Result<(), BuildError> {
     lock_with(root, false, package)
 }
 
+/// Seeds a resolver preference from an existing `Cargo.lock` (no
+/// `Tong.lock` yet): exact registry versions and checksums carry over, so
+/// `tong lock` is stable against a Cargo-generated lock. Registry entries
+/// are matched by name+version; the Cargo source strings are remapped to
+/// the configured index. Path/git entries are not seeded (the workspace
+/// import resolves those).
+fn seed_from_cargo_lock(
+    root: &Path,
+    registry_source: &str,
+) -> Result<tong_fetch::TongLock, BuildError> {
+    #[derive(serde::Deserialize)]
+    struct CargoLock {
+        #[serde(default)]
+        package: Vec<CargoLockPackage>,
+    }
+    #[derive(serde::Deserialize)]
+    struct CargoLockPackage {
+        name: String,
+        version: semver::Version,
+        source: Option<String>,
+        checksum: Option<String>,
+    }
+    let text = fs::read_to_string(root.join("Cargo.lock"))
+        .map_err(|err| BuildError::Manifest(format!("cannot read Cargo.lock: {err}")))?;
+    let cargo: CargoLock = toml::from_str(&text)
+        .map_err(|err| BuildError::Manifest(format!("cannot parse Cargo.lock: {err}")))?;
+    let mut lock = tong_fetch::TongLock {
+        version: tong_fetch::LOCKFILE_VERSION,
+        packages: Vec::new(),
+    };
+    for package in cargo.package {
+        if package
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("registry+"))
+        {
+            lock.packages.push(tong_fetch::LockedPackage {
+                name: package.name,
+                version: package.version,
+                source: registry_source.to_owned(),
+                checksum: package.checksum,
+                yanked: false,
+                publish_time: None,
+                manifest_checksum: None,
+                dependencies: Vec::new(),
+            });
+        }
+    }
+    Ok(lock)
+}
+
 fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Result<(), BuildError> {
     let manifest = load_manifest(root)?;
     let store = store_dir(root, manifest.as_ref())?;
@@ -1373,8 +1498,37 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     let mut index = tong_fetch::IndexClient::new(store.join("index"), registry.clone());
     index.set_offline(offline);
     let mut preferences = tong_fetch::TongLock::load(root).unwrap_or_default();
+    if preferences.packages.is_empty() && root.join("Cargo.lock").is_file() {
+        // No Tong.lock yet: seed the resolver preference with the exact
+        // registry versions/checksums from an existing Cargo.lock, so
+        // `tong lock` stays stable against a Cargo-generated lock (Cargo
+        // semantics: `--locked` forbids creating or updating it, enforced
+        // by the build driver before any network request).
+        let registry_source = format!("registry+{}", registry.index_url);
+        preferences = seed_from_cargo_lock(root, &registry_source)?;
+    }
     if let Some(package) = drop_preference {
         preferences.packages.retain(|p| p.name != package);
+    }
+
+    // The version resolver keys local (workspace/path) packages by name.
+    // Two local packages sharing a name would alias there; Cargo can
+    // express that (path deps at different directories), but Tong's
+    // resolver is name-keyed — reject with a targeted diagnostic instead
+    // of silently picking one. Registry packages never enter `locals`, so
+    // a local `foo` and a registry `foo` coexist fine.
+    let mut local_names: BTreeMap<&str, &tong_rust::Package> = BTreeMap::new();
+    for pkg in &model.packages {
+        if let Some(previous) = local_names.insert(&pkg.name, pkg) {
+            return Err(BuildError::Manifest(format!(
+                "two local packages named {} ({} and {}); Tong cannot resolve \
+                 same-name path packages yet — rename one or use \
+                 `package = \"...\"` renames",
+                pkg.name,
+                previous.dir.display(),
+                pkg.dir.display()
+            )));
+        }
     }
 
     // Workspace/path packages enter the resolution graph as roots; their
@@ -1382,19 +1536,20 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     // target package at its exact version (cargo semantics). Optional
     // edges are filtered by the resolved feature map, exactly like the
     // roots were.
-    let edge_map: BTreeMap<(String, String, String), &tong_rust::RegistryEdge> = edges
-        .iter()
-        .map(|edge| {
-            (
+    let edge_map: BTreeMap<(tong_rust::PackageId, String, String), &tong_rust::RegistryEdge> =
+        edges
+            .iter()
+            .map(|edge| {
                 (
-                    edge.parent.clone(),
-                    edge.package.clone(),
-                    edge.extern_name.clone(),
-                ),
-                edge,
-            )
-        })
-        .collect();
+                    (
+                        edge.parent.clone(),
+                        edge.package.clone(),
+                        edge.extern_name.clone(),
+                    ),
+                    edge,
+                )
+            })
+            .collect();
     let mut locals: Vec<tong_fetch::LocalPackage> = Vec::new();
     let mut registry_edges = 0usize;
     for pkg in &model.packages {
@@ -1403,11 +1558,7 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         // registry deps from the model's dep lists (the provider records
         // them instead).
         let active = |extern_name: &str, optional: bool| {
-            !optional
-                || feature_map
-                    .active_optional_deps
-                    .get(&pkg.name)
-                    .is_some_and(|active| active.contains(extern_name))
+            !optional || feature_map.edge_active(&pkg.id, extern_name)
         };
         let mut deps: Vec<tong_fetch::ResolvedDep> = Vec::new();
         for (dep, dev) in pkg
@@ -1418,15 +1569,15 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             .chain(pkg.dev_deps.iter().map(|dep| (dep, true)))
         {
             let is_registry = edge_map.contains_key(&(
-                pkg.name.clone(),
-                dep.package.clone(),
+                pkg.id.clone(),
+                dep.package.name.clone(),
                 dep.extern_name.clone(),
             ));
             if is_registry || !active(&dep.extern_name, dep.optional) {
                 continue;
             }
             deps.push(tong_fetch::ResolvedDep {
-                name: dep.package.clone(),
+                name: dep.package.name.clone(),
                 req: None,
                 optional: dep.optional,
                 dev,
@@ -1437,9 +1588,9 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         let dev_edges: BTreeSet<(String, String)> = pkg
             .dev_deps
             .iter()
-            .map(|dep| (dep.package.clone(), dep.extern_name.clone()))
+            .map(|dep| (dep.package.name.clone(), dep.extern_name.clone()))
             .collect();
-        for edge in edges.iter().filter(|edge| edge.parent == pkg.name) {
+        for edge in edges.iter().filter(|edge| edge.parent == pkg.id) {
             if !active(&edge.extern_name, edge.optional) {
                 continue;
             }
@@ -1461,6 +1612,7 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             name: pkg.name.clone(),
             version: semver::Version::parse(&pkg.version)
                 .unwrap_or_else(|_| semver::Version::new(0, 0, 0)),
+            source: Some(pkg.id.lock_source()),
             deps,
         });
     }
@@ -1481,23 +1633,35 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     );
 
     // Assemble the lock: every resolved package, registry or local, with
-    // exact per-edge versions (a name may resolve to several versions).
+    // exact per-edge identities (a name may resolve to several versions or
+    // sources). Sources come from the resolver — a local `foo` and a
+    // registry `foo` never alias.
     let mut locked = tong_fetch::TongLock {
         version: tong_fetch::LOCKFILE_VERSION,
         packages: Vec::new(),
     };
     let registry_source = format!("registry+{}", registry.index_url);
-    let model_pkg = |name: &str| model.packages.iter().find(|p| p.name == name);
-    let path_source = |pkg: &tong_rust::Package| {
-        let relative = pkg.dir.strip_prefix(root).unwrap_or(&pkg.dir);
-        format!("path+{}", relative.to_string_lossy())
+    // Local packages are unique by name (checked above); find the dir for
+    // the manifest checksum.
+    let local_pkg = |name: &str| {
+        model.packages.iter().find(|p| {
+            p.id.name == name
+                && matches!(
+                    p.id.source,
+                    tong_rust::model::SourceId::Workspace(_) | tong_rust::model::SourceId::Path(_)
+                )
+        })
     };
     for package in &resolved {
-        let local = model_pkg(&package.name);
-        let source = match local {
-            Some(pkg) => path_source(pkg),
-            None => registry_source.clone(),
+        let local = if package.local {
+            local_pkg(&package.name)
+        } else {
+            None
         };
+        let source = package
+            .source
+            .clone()
+            .unwrap_or_else(|| registry_source.clone());
         let manifest_checksum = if let Some(pkg) = local {
             fs::read(pkg.dir.join("Cargo.toml"))
                 .ok()
@@ -1508,11 +1672,10 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         let mut deps: Vec<String> = package
             .dependencies
             .iter()
-            .map(|(name, version)| {
-                let dep_source = match model_pkg(name) {
-                    Some(pkg) => path_source(pkg),
-                    None => registry_source.clone(),
-                };
+            .map(|(name, version, dep_source)| {
+                let dep_source = dep_source
+                    .clone()
+                    .unwrap_or_else(|| registry_source.clone());
                 format!("{name} {version} {dep_source}")
             })
             .collect();
@@ -1615,6 +1778,7 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
         let resolved = tong_fetch::ResolvedPackage {
             name: package.name.clone(),
             version: package.version.clone(),
+            source: None,
             checksum: Some(checksum.clone()),
             yanked: package.yanked,
             local: false,

@@ -13,6 +13,8 @@ tong-graph = { path = "../tong-graph" }
 tong-rust = { path = "../tong-rust" }
 tong-store = { path = "../tong-store" }
 semver = "1"
+serde = { workspace = true, features = ["derive"] }
+toml = "0.8"
 clap = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
