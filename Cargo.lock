@@ -2794,6 +2794,7 @@ dependencies = [
  "flate2",
  "semver",
  "serde",
+ "serde_json",
  "tar",
  "tempfile",
  "toml",

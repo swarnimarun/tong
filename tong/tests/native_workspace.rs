@@ -68,7 +68,7 @@ fn native_workspace_builds_and_activates_cross_member_features() {
     // `--target web-app` builds the app binary; its dep table activates
     // core's optional `extra` feature, which compiles and links the
     // cross-member `extra` library.
-    let output = run_tong(ws, None, &["build", "--target", "web-app"]);
+    let output = run_tong(ws, None, &["build", "//app:app"]);
     assert!(
         output.status.success(),
         "build failed: {}{}",
@@ -104,11 +104,11 @@ fn native_workspace_rejects_escapes_and_unknown_rules() {
     let ws = work.path();
 
     // An escaping crate_root is rejected before planning.
-    let app = ws.join("crates/app/Tong.toml");
+    let app = ws.join("app/Tong.toml");
     let text = fs::read_to_string(&app).unwrap();
     let text = text.replace(
-        "deps = [{ label = \"//crates/core:core\", alias = \"core\", features = [\"extra\"] }]",
-        "crate_root = \"../..\"\ndeps = [{ label = \"//crates/core:core\", alias = \"core\", features = [\"extra\"] }]",
+        "deps = [{ label = \"//core:core\", alias = \"core\", features = [\"extra\"] }]",
+        "crate_root = \"../..\"\ndeps = [{ label = \"//core:core\", alias = \"core\", features = [\"extra\"] }]",
     );
     fs::write(&app, text).unwrap();
     let output = run_tong(ws, None, &["build"]);
@@ -122,7 +122,7 @@ fn native_workspace_rejects_escapes_and_unknown_rules() {
     // An unknown rule is a hard error listing the supported rules.
     let work = fixture_copy();
     let ws = work.path();
-    let app = ws.join("crates/app/Tong.toml");
+    let app = ws.join("app/Tong.toml");
     let text = fs::read_to_string(&app)
         .unwrap()
         .replace("rule = \"rust_binary\"", "rule = \"rust_wizard\"");
@@ -147,17 +147,19 @@ fn native_label_rename_is_digest_stable() {
 
     let first = fixture_copy();
     let ws = first.path();
-    let output = run_tong(ws, Some(store_path), &["build", "--target", "web-app"]);
+    let output = run_tong(ws, Some(store_path), &["build", "//app:app"]);
     assert!(output.status.success(), "first build failed");
 
     let second = fixture_copy();
     let ws2 = second.path();
-    let app = ws2.join("crates/app/Tong.toml");
+    let app = ws2.join("app/Tong.toml");
     let text = fs::read_to_string(&app).unwrap();
     // Rename only the table key; the stable fields stay.
     let text = text.replace("[target.app]", "[target.webapp]");
     fs::write(&app, text).unwrap();
-    let output = run_tong(ws2, Some(store_path), &["build", "--target", "web-app"]);
+    // The `app` key no longer exists; build the whole workspace so the
+    // renamed target still compiles against the shared store.
+    let output = run_tong(ws2, Some(store_path), &["build"]);
     assert!(
         output.status.success(),
         "renamed build failed: {}{}",

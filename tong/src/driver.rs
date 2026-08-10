@@ -23,6 +23,15 @@ use tong_store::{
 
 use crate::manifest_mode::manifest_to_model;
 
+/// Build-target kinds for kind selectors (`--lib`/`--bins`/`--tests`/…).
+pub const KIND_LIB: u32 = 1 << 0;
+pub const KIND_BIN: u32 = 1 << 1;
+pub const KIND_TEST: u32 = 1 << 2;
+pub const KIND_EXAMPLE: u32 = 1 << 3;
+pub const KIND_BENCH: u32 = 1 << 4;
+/// Every target kind.
+pub const KIND_ALL: u32 = KIND_LIB | KIND_BIN | KIND_TEST | KIND_EXAMPLE | KIND_BENCH;
+
 /// Default retention for unmarked cache objects (auto-GC after builds).
 pub const DEFAULT_RETENTION: &str = "7d";
 /// Default store size budget (auto-GC after builds).
@@ -109,6 +118,14 @@ pub struct BuildOptions {
     /// or an outdated one fails instead of being regenerated. `--frozen`
     /// is exactly `--locked --offline`.
     pub locked: bool,
+    /// `--check`: rustc emits metadata only; nothing is assembled.
+    pub check: bool,
+    /// `--no-run`: test/bench compiles without their run actions.
+    pub no_run: bool,
+    /// Target kinds to build (`KIND_*` bitmask).
+    pub kinds: u32,
+    /// Rust target triple for target units (`--target`; host by default).
+    pub target_triple: Option<String>,
 }
 
 /// Feature selection for a build (`--features`, `--no-default-features`,
@@ -206,7 +223,7 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
     let t_build = std::time::Instant::now();
-    let prepared = prepare(root, options, false, false, &[])?;
+    let prepared = prepare(root, options, false, &[])?;
     let tong_dir = &prepared.tong_dir;
     let cas = &prepared.cas;
     let cache = &prepared.cache;
@@ -216,6 +233,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     // Schedule: concretize, check cache, execute.
     let mut completed = CompletedMap(BTreeMap::new());
     let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
+    let mut events: Vec<BuildEvent> = Vec::new();
     let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
     let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
     if options.deps_only {
@@ -248,8 +266,11 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         // insertion. Their digest still covers the policy, so a NoCache
         // action can never alias a cacheable one.
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
+        let t_action = std::time::Instant::now();
+        let mut cache_source = "executed";
         let cached = if cacheable && let Some(result) = cache.get(digest)? {
             outcome.actions_cached += 1;
+            cache_source = "cached";
             println!(
                 "  [{}/{}] {} ({}) [cached]",
                 index + 1,
@@ -301,6 +322,13 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
             outcome.actions_executed += 1;
             cached
         };
+        events.push(BuildEvent {
+            action: spec.logical_id.0.clone(),
+            digest,
+            cache: cache_source,
+            duration_ms: t_action.elapsed().as_millis() as u64,
+            outcome: "success",
+        });
         // Record for the build-state manifest (GC root set).
         graph_pairs.insert(spec.logical_id.0.clone(), digest);
         sources.push(spec.input_root.digest());
@@ -397,6 +425,7 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         &options.profile,
         options.deps_only,
     )?;
+    record_events(root, &prepared.store, &events);
     tracing::debug!(
         target: "tong::perf",
         phase = "record_state",
@@ -420,7 +449,7 @@ pub fn test(
     libtest_args: &[String],
     options: &BuildOptions,
 ) -> Result<i32, BuildError> {
-    let prepared = prepare(root, options, true, true, libtest_args)?;
+    let prepared = prepare(root, options, true, libtest_args)?;
     let cas = &prepared.cas;
     let cache = &prepared.cache;
     let executor = &prepared.executor;
@@ -428,6 +457,7 @@ pub fn test(
 
     let mut completed = CompletedMap(BTreeMap::new());
     let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
+    let mut events: Vec<BuildEvent> = Vec::new();
     let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
     let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
     let mut toolchains: Vec<tong_core::digest::Digest> = Vec::new();
@@ -442,6 +472,8 @@ pub fn test(
 
         // Test runs: skipped when they do not match the label filter.
         let is_test_run = spec.logical_id.0.starts_with("rust:test-run:");
+        let t_action = std::time::Instant::now();
+        let mut cache_source = "executed";
         if is_test_run
             && let Some(label) = label
             && !test_run_matches(&spec.logical_id.0, label)
@@ -454,6 +486,7 @@ pub fn test(
         // caching via `cache_test_result = true`).
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
         let cached = if cacheable && let Some(result) = cache.get(digest)? {
+            cache_source = "cached";
             println!(
                 "  [{}/{}] {} ({}) [cached]",
                 index + 1,
@@ -505,6 +538,13 @@ pub fn test(
         if is_test_run {
             test_runs.push((spec.logical_id.0.clone(), cached.stdout));
         }
+        events.push(BuildEvent {
+            action: spec.logical_id.0.clone(),
+            digest,
+            cache: cache_source,
+            duration_ms: t_action.elapsed().as_millis() as u64,
+            outcome: "success",
+        });
         graph_pairs.insert(spec.logical_id.0.clone(), digest);
         sources.push(spec.input_root.digest());
         if let Some(reference) = &spec.environment_bundle {
@@ -567,8 +607,20 @@ pub fn test(
         &options.profile,
         false,
     )?;
+    record_events(root, &prepared.store, &events);
 
     Ok(if failed || failed_tests > 0 { 1 } else { 0 })
+}
+
+/// Runs the workspace's benchmark targets (`tong bench`); benchmark runs
+/// are test-run actions selected by `options.kinds`.
+pub fn bench(
+    root: &Path,
+    label: Option<&str>,
+    libtest_args: &[String],
+    options: &BuildOptions,
+) -> Result<i32, BuildError> {
+    test(root, label, libtest_args, options)
 }
 
 /// Whether a test-run logical id (`rust:test-run:<pkg>:<name>`) matches a
@@ -598,6 +650,7 @@ struct Prepared {
     tong_dir: PathBuf,
     store: PathBuf,
     manifest: Option<Manifest>,
+    model: tong_rust::RustModel,
     cas: Cas,
     cache: ActionCache,
     executor: LocalExecutor,
@@ -615,7 +668,6 @@ fn prepare(
     root: &Path,
     options: &BuildOptions,
     include_dev_deps: bool,
-    tests_enabled: bool,
     test_args: &[String],
 ) -> Result<Prepared, BuildError> {
     let t_prep = std::time::Instant::now();
@@ -808,6 +860,8 @@ fn prepare(
     // Plan.
     let state = tong_store::StateStore::open(&store)?;
     let project_hash = tong_store::project_hash(root).ok();
+    let tests_enabled = options.kinds & (KIND_TEST | KIND_BENCH) != 0;
+    let examples_enabled = options.kinds & (KIND_EXAMPLE | KIND_BENCH) != 0;
     let mut backend = RustBackend::with_tests_state(
         cas.clone(),
         &model,
@@ -818,10 +872,10 @@ fn prepare(
         Some(state),
         project_hash,
         network_allow,
-        tests_enabled,
-        false,
-        false,
-        None,
+        examples_enabled,
+        options.no_run || options.check,
+        options.check,
+        options.target_triple.clone(),
     )?;
     let planned = backend.plan()?;
     let artifacts = backend.final_artifacts();
@@ -864,6 +918,7 @@ fn prepare(
         tong_dir,
         store,
         manifest,
+        model,
         cas,
         cache,
         executor,
@@ -969,6 +1024,52 @@ fn record_state(
         }
     }
     Ok(())
+}
+
+/// One structured build event (one action execution/cache hit).
+struct BuildEvent {
+    action: String,
+    digest: tong_core::digest::Digest,
+    cache: &'static str,
+    duration_ms: u64,
+    outcome: &'static str,
+}
+
+/// Appends a build's action events to `state/events/<project_hash>/` as
+/// one JSON-lines file per build (bound by the same project retention as
+/// the build-state manifests; best-effort).
+fn record_events(root: &Path, store: &Path, events: &[BuildEvent]) {
+    let Some(project_hash) = project_hash(root).ok() else {
+        return;
+    };
+    let dir = store
+        .join("state")
+        .join("events")
+        .join(project_hash.to_hex());
+    if let Err(err) = fs::create_dir_all(&dir) {
+        eprintln!("tong: warning: cannot record build events: {err}");
+        return;
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("{timestamp}.jsonl"));
+    let mut lines = Vec::new();
+    for event in events {
+        lines.push(format!(
+            "{{\"action\":\"{}\",\"digest\":\"{}\",\"cache\":\"{}\",\
+             \"duration_ms\":{},\"outcome\":\"{}\"}}",
+            event.action,
+            event.digest.to_hex(),
+            event.cache,
+            event.duration_ms,
+            event.outcome
+        ));
+    }
+    if let Err(err) = fs::write(&path, lines.join("\n")) {
+        eprintln!("tong: warning: cannot record build events: {err}");
+    }
 }
 
 /// Removes every entry of the exec directory (stale exec roots from failed
@@ -1132,7 +1233,21 @@ pub fn run(
     args: &[String],
     options: &BuildOptions,
 ) -> Result<i32, BuildError> {
-    let outcome = build(root, options)?;
+    let mut options = options.clone();
+    // A `//member:key` label names the target key; the artifact carries
+    // the declared output name. Resolve the label to the output artifact
+    // name before building so the assembly filter matches.
+    if target.contains('/') || target.starts_with(':') {
+        let manifest = load_manifest(root)?;
+        let model = load_model_unlocked(root, manifest.as_ref())?;
+        if let Some(pkg) = resolve_package_label(root, &manifest, &model, target)
+            && let Some(bin) = pkg.bins.first()
+        {
+            options.targets.clear();
+            options.targets.push(bin.name.clone());
+        }
+    }
+    let outcome = build(root, &options)?;
     let binary = outcome
         .artifacts
         .first()
@@ -1143,6 +1258,333 @@ pub fn run(
         .status()
         .map_err(BuildError::Io)?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// `tong query`: prints the target, dependency, or action graph as text
+/// or versioned JSON.
+pub fn query(
+    root: &Path,
+    what: &str,
+    label: Option<&str>,
+    format: &str,
+    options: &BuildOptions,
+) -> Result<(), BuildError> {
+    let prepared = prepare(root, options, true, &[])?;
+    let json = format == "json";
+    if json {
+        println!("{{\"schema\":1}}");
+    }
+    match what {
+        "targets" => {
+            for pkg in &prepared.model.packages {
+                let features = prepared
+                    .model
+                    .feature_map
+                    .features_for(&pkg.id, false)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let kind = if pkg.lib.is_some() {
+                    "lib"
+                } else if !pkg.bins.is_empty() {
+                    "bin"
+                } else if !pkg.tests.is_empty() {
+                    "test"
+                } else {
+                    "other"
+                };
+                if json {
+                    println!(
+                        "{{\"label\":\"{}\",\"package\":\"{}\",\"kind\":\"{kind}\",\"features\":{:?}}}",
+                        pkg_label_for_query(&pkg.id),
+                        pkg.id,
+                        features
+                    );
+                } else {
+                    println!("{} kind={kind} features={features:?}", pkg.id);
+                }
+            }
+        }
+        "deps" => {
+            let Some(pkg) = (match label {
+                Some(label) => {
+                    resolve_package_label(root, &prepared.manifest, &prepared.model, label)
+                }
+                None => prepared.model.packages.first(),
+            }) else {
+                return Err(BuildError::Manifest(format!(
+                    "no package matches label {:?}",
+                    label.unwrap_or("")
+                )));
+            };
+            for dep in &pkg.deps {
+                if json {
+                    println!(
+                        "{{\"extern\":\"{}\",\"package\":\"{}\",\"optional\":{}}}",
+                        dep.extern_name, dep.package, dep.optional
+                    );
+                } else {
+                    println!("{} -> {} (extern {})", pkg.id, dep.package, dep.extern_name);
+                }
+            }
+        }
+        "actions" => {
+            let Some(pkg) = (match label {
+                Some(label) => {
+                    resolve_package_label(root, &prepared.manifest, &prepared.model, label)
+                }
+                None => prepared.model.packages.first(),
+            }) else {
+                return Err(BuildError::Manifest(format!(
+                    "no package matches label {:?}",
+                    label.unwrap_or("")
+                )));
+            };
+            for action in &prepared.planned {
+                if !action.logical_id.0.contains(&pkg.name)
+                    && !action.logical_id.0.contains(&crate_name_dash(&pkg.name))
+                {
+                    continue;
+                }
+                // Concretization needs completed dependencies; on a fresh
+                // workspace report the planned identity without a digest.
+                let spec = (action.make)(&CompletedMap(BTreeMap::new()), &prepared.cas);
+                let digest = match &spec {
+                    Ok(spec) => spec.digest().to_hex(),
+                    Err(_) => "pending".to_owned(),
+                };
+                let spec = spec.ok();
+                if json {
+                    println!(
+                        "{{\"logical_id\":\"{}\",\"digest\":\"{}\",\"mnemonic\":\"{}\",\"deps\":{:?},\"cacheable\":{},\"platform\":\"{}\"}}",
+                        action.logical_id.0,
+                        digest,
+                        action.mnemonic,
+                        action.deps.iter().map(|d| d.0.clone()).collect::<Vec<_>>(),
+                        spec.as_ref().is_none_or(
+                            |s| s.cache_policy == tong_core::action::CachePolicy::Enabled
+                        ),
+                        spec.as_ref()
+                            .map(|s| format!("{:?}", s.execution_platform))
+                            .unwrap_or_default()
+                    );
+                } else {
+                    println!(
+                        "{} ({}) digest={}",
+                        action.logical_id.0, action.mnemonic, digest
+                    );
+                }
+            }
+        }
+        other => {
+            return Err(BuildError::Manifest(format!(
+                "unknown query {other:?}; expected \"targets\", \"deps\", or \"actions\""
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn crate_name_dash(name: &str) -> String {
+    name.replace('_', "-")
+}
+
+/// The canonical label of a package (`//<member-path>:<name>`).
+fn pkg_label_for_query(id: &tong_rust::PackageId) -> String {
+    let rel = match &id.source {
+        tong_rust::SourceId::Workspace(rel) => rel.clone(),
+        _ => return id.name.clone(),
+    };
+    if rel == "." {
+        format!(":{}", id.name)
+    } else {
+        format!("//{rel}:{}", id.name)
+    }
+}
+
+/// `tong graph`: prints the planned action graph as JSON or DOT.
+pub fn graph(root: &Path, format: &str, options: &BuildOptions) -> Result<(), BuildError> {
+    let prepared = prepare(root, options, true, &[])?;
+    match format {
+        "json" => {
+            println!("{{\"schema\":1,\"nodes\":[");
+            for (index, action) in prepared.planned.iter().enumerate() {
+                let comma = if index + 1 < prepared.planned.len() {
+                    ","
+                } else {
+                    ""
+                };
+                println!(
+                    "{{\"id\":\"{}\",\"mnemonic\":\"{}\",\"deps\":{:?}}}{comma}",
+                    action.logical_id.0,
+                    action.mnemonic,
+                    action.deps.iter().map(|d| d.0.clone()).collect::<Vec<_>>()
+                );
+            }
+            println!("]}}");
+        }
+        "dot" => {
+            println!("digraph tong {{");
+            for action in &prepared.planned {
+                for dep in &action.deps {
+                    println!("  \"{}\" -> \"{}\"", dep.0, action.logical_id.0);
+                }
+            }
+            println!("}}");
+        }
+        other => {
+            return Err(BuildError::Manifest(format!(
+                "unknown graph format {other:?}; expected \"json\" or \"dot\""
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `tong explain rebuild <label>`: compares the newest two build records
+/// and reports the first changed semantic field of the label's actions.
+pub fn explain(
+    root: &Path,
+    what: &str,
+    label: &str,
+    _options: &BuildOptions,
+) -> Result<(), BuildError> {
+    let _ = _options;
+    if what != "rebuild" {
+        return Err(BuildError::Manifest(format!(
+            "unknown explanation {what:?}; expected \"rebuild\""
+        )));
+    }
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let state = StateStore::open(&store)?;
+    let project_hash = project_hash(root)
+        .map_err(|_| BuildError::Manifest("cannot compute the project hash".to_owned()))?;
+    let latest = state.latest(&project_hash).ok_or_else(|| {
+        BuildError::Manifest("no build records yet; run a build first".to_owned())
+    })?;
+    let previous = state
+        .history(&project_hash)
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| {
+            BuildError::Manifest("only one build record; run another build first".to_owned())
+        })?;
+    let mut matched = false;
+    for action in &latest.actions {
+        if !action.logical_id.contains(label) {
+            continue;
+        }
+        matched = true;
+        let old = previous
+            .actions
+            .iter()
+            .find(|a| a.logical_id == action.logical_id);
+        let Some(old) = old else {
+            println!("{}: new action", action.logical_id);
+            continue;
+        };
+        if old.action_digest == action.action_digest {
+            continue;
+        }
+        let field = if old.input_root != action.input_root {
+            format!("input (tree {})", action.input_root.digest())
+        } else if old.env_bundle != action.env_bundle {
+            "toolchain".to_owned()
+        } else if old.executable != action.executable {
+            "executable".to_owned()
+        } else {
+            "args/env/policy".to_owned()
+        };
+        println!("{}: changed {field}", action.logical_id);
+    }
+    if !matched {
+        return Err(BuildError::Manifest(format!(
+            "no recorded action matches label {label:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// `tong log`: prints structured build events from `state/events/`.
+pub fn log(root: &Path, format: &str, _options: &BuildOptions) -> Result<(), BuildError> {
+    let _ = _options;
+    let manifest = load_manifest(root)?;
+    let store = store_dir(root, manifest.as_ref())?;
+    let Some(project_hash) = project_hash(root).ok() else {
+        return Ok(());
+    };
+    let events_dir = store
+        .join("state")
+        .join("events")
+        .join(project_hash.to_hex());
+    let entries = match fs::read_dir(&events_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("no build events recorded");
+            return Ok(());
+        }
+        Err(err) => return Err(BuildError::Io(err)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(BuildError::Io)?;
+        let text = fs::read_to_string(entry.path()).map_err(BuildError::Io)?;
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            if format == "json" {
+                println!("{line}");
+            } else {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
+                let action = event["action"].as_str().unwrap_or("");
+                let source = event["cache"].as_str().unwrap_or("");
+                let duration = event["duration_ms"].as_u64().unwrap_or(0);
+                println!("{action} cache={source} duration_ms={duration}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a target label (`:name`, `//member:name`, or a plain name) to
+/// the workspace package it names, mapping native target keys through the
+/// root/member manifests to their declared `package_name`.
+fn resolve_package_label<'a>(
+    root: &Path,
+    manifest: &Option<Manifest>,
+    model: &'a tong_rust::RustModel,
+    label: &str,
+) -> Option<&'a tong_rust::Package> {
+    let name = label
+        .strip_prefix(':')
+        .or_else(|| label.rsplit_once(':').map(|(_, name)| name))
+        .unwrap_or(label);
+    let mut matched: Vec<&tong_rust::Package> = model
+        .packages
+        .iter()
+        .filter(|p| p.name == name || artifact_name_matches(name, &p.name))
+        .collect();
+    if matched.is_empty() {
+        // Native labels name the target KEY (`[target.app]` in the root
+        // or the member manifest), which maps to the declared
+        // `package_name`.
+        let member_dir = label
+            .strip_prefix("//")
+            .and_then(|rest| rest.rsplit_once(':').map(|(dir, _)| dir))
+            .filter(|dir| !dir.is_empty());
+        let member_manifest =
+            member_dir.and_then(|dir| tong_graph::manifest::Manifest::load(&root.join(dir)).ok());
+        let package_name = member_manifest
+            .as_ref()
+            .or(manifest.as_ref())
+            .and_then(|manifest| manifest.target.get(name))
+            .and_then(|target| target.package_name.clone())
+            .unwrap_or_else(|| name.to_owned());
+        matched = model
+            .packages
+            .iter()
+            .filter(|p| p.name == package_name)
+            .collect();
+    }
+    matched.first().copied()
 }
 
 /// Matches a target label (`:name`, `//path:name`, or `name`) against an

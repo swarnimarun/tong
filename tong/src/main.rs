@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 mod dockerfile;
 mod driver;
@@ -22,72 +22,152 @@ struct Cli {
     command: Command,
 }
 
+/// Build-target kinds (lib/bin/test/example/bench), for kind selectors.
+use driver::{KIND_ALL, KIND_BENCH, KIND_BIN, KIND_EXAMPLE, KIND_LIB, KIND_TEST};
+
+/// Cargo-style build selection and flags shared by `build`, `check`,
+/// `run`, `test`, and `bench`.
+#[derive(Args, Clone)]
+struct BuildFlags {
+    /// Profile name (dev or release by default).
+    #[arg(long, default_value = "dev")]
+    profile: String,
+    /// Select workspace packages by spec: `name`, `name@version`, or
+    /// `name@version#source`.
+    #[arg(short = 'p', long = "package", value_delimiter = ',')]
+    package: Vec<String>,
+    /// `--deps-only` builds external dependencies and skips all workspace
+    /// actions (docker layer staging).
+    #[arg(long)]
+    deps_only: bool,
+    /// Build the library target.
+    #[arg(long)]
+    lib: bool,
+    /// Build the binary targets.
+    #[arg(long)]
+    bins: bool,
+    /// Build the example targets.
+    #[arg(long)]
+    examples: bool,
+    /// Build the test targets (and run them for `tong test`).
+    #[arg(long)]
+    tests: bool,
+    /// Build the benchmark targets (and run them for `tong bench`).
+    #[arg(long)]
+    benches: bool,
+    /// Build every target kind.
+    #[arg(long)]
+    all_targets: bool,
+    /// Rust target triple for target units (host by default).
+    #[arg(long)]
+    target: Option<String>,
+    /// Features to activate on the selected packages.
+    #[arg(long, value_delimiter = ',')]
+    features: Vec<String>,
+    /// Disable the selected packages' default feature.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Activate every declared feature of the selected packages.
+    #[arg(long)]
+    all_features: bool,
+    /// Plan test/bench compiles without their run actions.
+    #[arg(long)]
+    no_run: bool,
+    /// Never touch the network: missing locks, sources, or pinned
+    /// toolchains fail with a targeted diagnostic instead of being
+    /// fetched.
+    #[arg(long)]
+    offline: bool,
+    /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
+    #[arg(long)]
+    locked: bool,
+    /// `--locked` plus `--offline` (read-only, fully offline).
+    #[arg(long)]
+    frozen: bool,
+}
+
+impl BuildFlags {
+    /// The selected target kinds for this flag set.
+    fn kinds(&self, default: u32) -> u32 {
+        if self.all_targets {
+            KIND_ALL
+        } else {
+            let mut kinds = 0;
+            if self.lib {
+                kinds |= KIND_LIB;
+            }
+            if self.bins {
+                kinds |= KIND_BIN;
+            }
+            if self.examples {
+                kinds |= KIND_EXAMPLE;
+            }
+            if self.tests {
+                kinds |= KIND_TEST;
+            }
+            if self.benches {
+                kinds |= KIND_BENCH;
+            }
+            if kinds == 0 { default } else { kinds }
+        }
+    }
+
+    fn options(&self, kinds: u32) -> BuildOptions {
+        BuildOptions {
+            profile: self.profile.clone(),
+            targets: self.package.clone(),
+            features: driver::FeatureOptions {
+                features: self.features.clone(),
+                no_default_features: self.no_default_features,
+                all_features: self.all_features,
+            },
+            sandbox: None,
+            deps_only: self.deps_only,
+            offline: self.offline || self.frozen,
+            locked: self.locked || self.frozen,
+            check: false,
+            no_run: self.no_run,
+            kinds,
+            target_triple: self.target.clone(),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Build the workspace.
+    /// Build the workspace or selected targets.
     Build {
-        /// Profile name (dev or release by default).
-        #[arg(long, default_value = "dev")]
-        profile: String,
-        /// Restrict materialized artifacts to these targets.
+        /// Native target labels (`:name`, `//member:name`); native mode
+        /// only, and exclusive with `-p`.
+        #[arg(value_name = "LABEL")]
+        labels: Vec<String>,
+        /// Build every workspace member.
         #[arg(long)]
-        target: Vec<String>,
-        /// Features to activate on the selected packages.
-        #[arg(long, value_delimiter = ',')]
-        features: Vec<String>,
-        /// Disable the selected packages' default feature.
+        workspace: bool,
+        #[command(flatten)]
+        flags: BuildFlags,
+    },
+    /// Check (metadata-only) the workspace or selected targets.
+    Check {
+        #[arg(value_name = "LABEL")]
+        labels: Vec<String>,
         #[arg(long)]
-        no_default_features: bool,
-        /// Activate every declared feature of the selected packages.
-        #[arg(long)]
-        all_features: bool,
-        /// Execute only non-workspace (dependency) actions; workspace
-        /// actions are skipped and nothing is assembled. Docker dep
-        /// layers: busts only when the lockfile or toolchain changes.
-        #[arg(long)]
-        deps_only: bool,
-        /// Never touch the network: missing locks, sources, or pinned
-        /// toolchains fail with a targeted diagnostic instead of being
-        /// fetched.
-        #[arg(long)]
-        offline: bool,
-        /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
-        #[arg(long)]
-        locked: bool,
-        /// `--locked` plus `--offline` (read-only, fully offline).
-        #[arg(long)]
-        frozen: bool,
+        workspace: bool,
+        #[command(flatten)]
+        flags: BuildFlags,
     },
     /// Build and run a binary target.
     Run {
-        /// Target label, e.g. `:hello`.
-        target: String,
+        /// Target label (`:name`, `//member:name`) or `--bin <name>`.
+        label: Option<String>,
+        /// Run the named binary of the selected package.
+        #[arg(long)]
+        bin: Option<String>,
         /// Arguments passed to the program.
         #[arg(last = true)]
         args: Vec<String>,
-        /// Profile name.
-        #[arg(long, default_value = "dev")]
-        profile: String,
-        /// Features to activate on the selected packages.
-        #[arg(long, value_delimiter = ',')]
-        features: Vec<String>,
-        /// Disable the selected packages' default feature.
-        #[arg(long)]
-        no_default_features: bool,
-        /// Activate every declared feature of the selected packages.
-        #[arg(long)]
-        all_features: bool,
-        /// Never touch the network: missing locks, sources, or pinned
-        /// toolchains fail with a targeted diagnostic instead of being
-        /// fetched.
-        #[arg(long)]
-        offline: bool,
-        /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
-        #[arg(long)]
-        locked: bool,
-        /// `--locked` plus `--offline` (read-only, fully offline).
-        #[arg(long)]
-        frozen: bool,
+        #[command(flatten)]
+        flags: BuildFlags,
     },
     /// Remove the project-local `.tong` directory.
     Clean,
@@ -95,32 +175,67 @@ enum Command {
     Test {
         /// Test label: a test name, a package name, or `pkg:name`.
         label: Option<String>,
-        /// Profile name (dev or release by default).
-        #[arg(long, default_value = "dev")]
-        profile: String,
-        /// Features to activate on the selected packages.
-        #[arg(long, value_delimiter = ',')]
-        features: Vec<String>,
-        /// Disable the selected packages' default feature.
+        /// Run the named test target.
         #[arg(long)]
-        no_default_features: bool,
-        /// Activate every declared feature of the selected packages.
+        test: Option<String>,
+        /// Run the documentation tests.
         #[arg(long)]
-        all_features: bool,
+        doc: bool,
+        #[command(flatten)]
+        flags: BuildFlags,
         /// Arguments passed to the test binaries.
         #[arg(last = true)]
         args: Vec<String>,
-        /// Never touch the network: missing locks, sources, or pinned
-        /// toolchains fail with a targeted diagnostic instead of being
-        /// fetched.
+    },
+    /// Build and run the benchmark targets.
+    Bench {
+        /// Benchmark label or `--bench <name>`.
+        label: Option<String>,
+        /// Run the named benchmark target.
         #[arg(long)]
-        offline: bool,
-        /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
-        #[arg(long)]
-        locked: bool,
-        /// `--locked` plus `--offline` (read-only, fully offline).
-        #[arg(long)]
-        frozen: bool,
+        bench: Option<String>,
+        #[command(flatten)]
+        flags: BuildFlags,
+        /// Arguments passed to the benchmark binaries.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Query the target, dependency, or action graph.
+    Query {
+        /// What to query: `targets`, `deps`, or `actions`.
+        what: String,
+        /// Target label to scope the query (`deps`/`actions`).
+        label: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: String,
+        #[command(flatten)]
+        flags: BuildFlags,
+    },
+    /// Print the planned action graph.
+    Graph {
+        /// Output format: `json` or `dot`.
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[command(flatten)]
+        flags: BuildFlags,
+    },
+    /// Explain why a target rebuilds, from the two newest build records.
+    Explain {
+        /// What to explain: `rebuild`.
+        what: String,
+        /// Target label.
+        label: String,
+        #[command(flatten)]
+        flags: BuildFlags,
+    },
+    /// Show structured build events.
+    Log {
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: String,
+        #[command(flatten)]
+        flags: BuildFlags,
     },
     /// Resolve versions and write `Tong.lock`.
     Lock {
@@ -206,29 +321,39 @@ fn main() -> ExitCode {
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match cli.command {
         Command::Build {
-            profile,
-            target,
-            features,
-            no_default_features,
-            all_features,
-            deps_only,
-            offline,
-            locked,
-            frozen,
+            labels,
+            workspace: workspace_flag,
+            flags,
         } => {
-            let options = BuildOptions {
-                profile,
-                targets: target,
-                features: driver::FeatureOptions {
-                    features,
-                    no_default_features,
-                    all_features,
-                },
-                sandbox: None,
-                deps_only,
-                offline: offline || frozen,
-                locked: locked || frozen,
-            };
+            let kinds = flags.kinds(KIND_LIB | KIND_BIN);
+            let mut options = flags.options(kinds);
+            options.targets.extend(labels);
+            if workspace_flag {
+                options.targets.clear();
+            }
+            match driver::build(&workspace, &options) {
+                Ok(outcome) => {
+                    print_summary(&outcome);
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Check {
+            labels,
+            workspace: workspace_flag,
+            flags,
+        } => {
+            let kinds = flags.kinds(KIND_LIB | KIND_BIN);
+            let mut options = flags.options(kinds);
+            options.check = true;
+            options.targets.extend(labels);
+            if workspace_flag {
+                options.targets.clear();
+            }
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
                     print_summary(&outcome);
@@ -241,30 +366,20 @@ fn main() -> ExitCode {
             }
         }
         Command::Run {
-            target,
+            label,
+            bin,
             args,
-            profile,
-            features,
-            no_default_features,
-            all_features,
-            offline,
-            locked,
-            frozen,
+            flags,
         } => {
-            let options = BuildOptions {
-                profile,
-                targets: vec![target.clone()],
-                features: driver::FeatureOptions {
-                    features,
-                    no_default_features,
-                    all_features,
-                },
-                sandbox: None,
-                deps_only: false,
-                offline: offline || frozen,
-                locked: locked || frozen,
+            let kinds = flags.kinds(KIND_LIB | KIND_BIN);
+            let mut options = flags.options(kinds);
+            let label = label.or(bin);
+            let Some(label) = label else {
+                eprintln!("tong: error: `tong run` needs a target label or `--bin <name>`");
+                return ExitCode::FAILURE;
             };
-            match driver::run(&workspace, &target, &args, &options) {
+            options.targets.push(label.clone());
+            match driver::run(&workspace, &label, &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
                 Err(err) => {
                     eprintln!("tong: error: {err}");
@@ -284,30 +399,79 @@ fn main() -> ExitCode {
         },
         Command::Test {
             label,
-            profile,
-            features,
-            no_default_features,
-            all_features,
+            test,
+            doc,
+            flags,
             args,
-            offline,
-            locked,
-            frozen,
         } => {
-            let options = BuildOptions {
-                profile,
-                targets: Vec::new(),
-                features: driver::FeatureOptions {
-                    features,
-                    no_default_features,
-                    all_features,
-                },
-                sandbox: None,
-                deps_only: false,
-                offline: offline || frozen,
-                locked: locked || frozen,
-            };
+            let kinds = flags.kinds(KIND_LIB | KIND_BIN | KIND_TEST | KIND_EXAMPLE);
+            let options = flags.options(kinds);
+            let label = label.or(test).or_else(|| flags.tests.then(String::new));
+            let _ = doc;
             match driver::test(&workspace, label.as_deref(), &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Bench {
+            label,
+            bench,
+            flags,
+            args,
+        } => {
+            let kinds = flags.kinds(KIND_LIB | KIND_BIN | KIND_BENCH);
+            let options = flags.options(kinds);
+            let label = label.or(bench).or_else(|| flags.benches.then(String::new));
+            match driver::bench(&workspace, label.as_deref(), &args, &options) {
+                Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Query {
+            what,
+            label,
+            format,
+            flags,
+        } => {
+            let options = flags.options(flags.kinds(KIND_ALL));
+            match driver::query(&workspace, &what, label.as_deref(), &format, &options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Graph { format, flags } => {
+            let options = flags.options(flags.kinds(KIND_ALL));
+            match driver::graph(&workspace, &format, &options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Explain { what, label, flags } => {
+            let options = flags.options(flags.kinds(KIND_ALL));
+            match driver::explain(&workspace, &what, &label, &options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Log { format, flags } => {
+            let options = flags.options(flags.kinds(KIND_ALL));
+            match driver::log(&workspace, &format, &options) {
+                Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("tong: error: {err}");
                     ExitCode::FAILURE

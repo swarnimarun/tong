@@ -1222,7 +1222,11 @@ impl<'a> RustBackend<'a> {
         } else if crate_type == "bin" {
             check_output(crate_name.clone())
         } else {
-            let ext = if crate_type == "proc-macro" {
+            // Check builds produce `.rmeta` (consumers reference the same
+            // name).
+            let ext = if check && crate_type != "proc-macro" {
+                "rmeta"
+            } else if crate_type == "proc-macro" {
                 dll_extension()
             } else {
                 match crate_type {
@@ -1231,7 +1235,7 @@ impl<'a> RustBackend<'a> {
                     _ => dll_extension(),
                 }
             };
-            check_output(format!("lib{crate_name}-{meta}.{ext}"))
+            format!("lib{crate_name}-{meta}.{ext}")
         };
         let dep_specs = self.resolve_deps(&pkg.id, deps)?;
         // Transitive closure of the direct deps: rustc resolves transitive
@@ -1629,6 +1633,13 @@ impl<'a> RustBackend<'a> {
             .ok_or_else(|| PlanError::Message(format!("no planned action for {key}")))?;
         let lib_name = lib_crate_name(pkg);
         let meta = self.metadata(pkg, &lib_name, kind);
+        // Check builds produce `.rmeta` instead of `.rlib` (the producer
+        // and every consumer must agree on the file name).
+        let ext = if self.check && ext == "rlib" {
+            "rmeta"
+        } else {
+            ext
+        };
         Ok(DepSpec::Rust {
             extern_name: dep.extern_name.clone(),
             action,

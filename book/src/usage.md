@@ -25,8 +25,9 @@ Commands:
 `hello` (bare — dashes and underscores are interchangeable, so
 `:voxel_city` finds the Cargo package `voxel-city`), or `//path:name`
 (parsed for compatibility). `tong run` and `tong test` take labels;
-`tong build --target` restricts *materialized* artifacts to the listed
-targets (the whole graph still builds).
+`tong build` with positional labels restricts *materialized* artifacts
+to the listed targets (the whole graph still builds). `--target` is
+exclusively a Rust target triple, like Cargo's.
 
 **Profiles.** `dev` is the default, `release` exists by default; further
 profiles are declared in `Tong.toml` (`[profile.<name>]`) or imported

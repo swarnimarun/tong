@@ -233,6 +233,36 @@ impl StateStore {
         newest_in(&self.project_dir(project_hash))
     }
 
+    /// A project's retained manifests, newest first. The newest is the GC
+    /// root; older ones are kept for diagnostics and rebuild explanation.
+    pub fn history(&self, project_hash: &Digest) -> Vec<BuildManifest> {
+        let mut entries: Vec<(String, PathBuf)> = fs::read_dir(self.project_dir(project_hash))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".state"))
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            })
+            .collect();
+        entries.sort();
+        let mut out = Vec::new();
+        for (_, path) in entries.into_iter().rev() {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(manifest) = tong_core::canonical::decode_all::<BuildManifest>(&bytes) else {
+                continue;
+            };
+            out.push(manifest);
+        }
+        out
+    }
+
     /// The newest manifest of every project — the GC root set in shared
     /// mode. Older manifests are retained on disk (diagnostics), but only
     /// the latest successful graph of each project is a GC root, so

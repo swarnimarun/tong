@@ -9,4 +9,4 @@ output_name = "web-app"
 edition = "2021"
 # The dep table activates core's optional `extra` feature across members:
 # core then compiles and links the optional `extra` dependency.
-deps = [{ label = "//crates/core:core", alias = "core", features = ["extra"] }]
+deps = [{ label = "//core:core", alias = "core", features = ["extra"] }]

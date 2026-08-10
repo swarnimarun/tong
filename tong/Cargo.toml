@@ -14,6 +14,7 @@ tong-rust = { path = "../tong-rust" }
 tong-store = { path = "../tong-store" }
 semver = "1"
 serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 clap = { workspace = true }
 tracing.workspace = true

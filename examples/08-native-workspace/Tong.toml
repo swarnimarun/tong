@@ -2,7 +2,7 @@ schema = 1
 
 [workspace]
 name = "native-workspace"
-members = ["crates/*", "tests"]
+members = ["app", "core", "extra", "tests"]
 
 [toolchain.rust]
 kind = "system"
