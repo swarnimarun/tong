@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tong_core::action::ActionId;
+use tong_core::action::{ActionId, CachePolicy};
 use tong_core::artifact::TreeDigest;
 use tong_core::units::{parse_duration, parse_size};
 use tong_exec::{ExecError, LocalExecutor};
@@ -100,6 +100,15 @@ pub struct BuildOptions {
     /// and nothing is assembled. Docker dep layers: busts only when the
     /// lockfile or toolchain changes (docs/docker-caching.md).
     pub deps_only: bool,
+    /// Never touch the network: a missing or outdated `Tong.lock`, absent
+    /// sources, or an absent pinned toolchain fail with a targeted
+    /// diagnostic instead of being fetched. Auto-lock/auto-fetch are
+    /// disabled; `tong lock`/`tong fetch` run separately.
+    pub offline: bool,
+    /// Forbid rewriting `Tong.lock`: a missing lock (auto-lock disabled)
+    /// or an outdated one fails instead of being regenerated. `--frozen`
+    /// is exactly `--locked --offline`.
+    pub locked: bool,
 }
 
 /// Feature selection for a build (`--features`, `--no-default-features`,
@@ -234,7 +243,12 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         }
         let spec = (action.make)(&completed, cas)?;
         let digest = spec.digest();
-        let cached = if let Some(result) = cache.get(digest)? {
+        // `CachePolicy::NoCache` actions (test runs, network-allowed
+        // actions) must bypass the action cache entirely: no lookup, no
+        // insertion. Their digest still covers the policy, so a NoCache
+        // action can never alias a cacheable one.
+        let cacheable = spec.cache_policy == CachePolicy::Enabled;
+        let cached = if cacheable && let Some(result) = cache.get(digest)? {
             outcome.actions_cached += 1;
             println!(
                 "  [{}/{}] {} ({}) [cached]",
@@ -281,7 +295,9 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 stderr: result.stderr,
                 duration_millis: result.duration.as_millis() as u64,
             };
-            cache.put(digest, &cached)?;
+            if cacheable {
+                cache.put(digest, &cached)?;
+            }
             outcome.actions_executed += 1;
             cached
         };
@@ -433,7 +449,11 @@ pub fn test(
             continue;
         }
 
-        let cached = if let Some(result) = cache.get(digest)? {
+        // Test runs are `CachePolicy::NoCache`: never look up or insert —
+        // every run re-executes (deterministic native tests opt into
+        // caching via `cache_test_result = true`).
+        let cacheable = spec.cache_policy == CachePolicy::Enabled;
+        let cached = if cacheable && let Some(result) = cache.get(digest)? {
             println!(
                 "  [{}/{}] {} ({}) [cached]",
                 index + 1,
@@ -477,7 +497,9 @@ pub fn test(
                 stderr: result.stderr,
                 duration_millis: result.duration.as_millis() as u64,
             };
-            cache.put(digest, &cached)?;
+            if cacheable {
+                cache.put(digest, &cached)?;
+            }
             cached
         };
         if is_test_run {
@@ -601,18 +623,30 @@ fn prepare(
     let manifest = load_manifest(root)?;
     // Auto-lock (cargo generates Cargo.lock on build; tong does the same
     // for Tong.lock): a missing lock is not an error — resolve it first
-    // and say so.
+    // and say so. `--offline`/`--locked` forbid creating the lock (that
+    // is a network request); fail with a targeted diagnostic instead.
     if manifest.is_none() && root.join("Cargo.toml").is_file() && !root.join("Tong.lock").is_file()
     {
+        if options.offline || options.locked {
+            return Err(BuildError::Offline(
+                "no Tong.lock; run `tong lock` first \
+                 (--offline/--locked forbid auto-locking)"
+                    .to_owned(),
+            ));
+        }
         println!("tong: no Tong.lock — running `tong lock` first");
         lock(root, false)?;
     }
     let store = store_dir(root, manifest.as_ref())?;
     // Auto-fetch (cargo downloads sources as needed; tong does the same):
     // when a locked registry archive is missing from the source store,
-    // fetch first and say so.
-    let needs_fetch = tong_fetch::TongLock::load(root).is_ok_and(|lock| {
-        lock.packages.iter().any(|pkg| {
+    // fetch first and say so. `--offline` forbids the download — fail
+    // naming every missing source instead.
+    let missing_sources: Vec<String> = tong_fetch::TongLock::load(root)
+        .ok()
+        .into_iter()
+        .flat_map(|lock| lock.packages)
+        .filter(|pkg| {
             pkg.source.starts_with("registry+")
                 && pkg.checksum.as_deref().is_some_and(|checksum| {
                     !store
@@ -621,8 +655,16 @@ fn prepare(
                         .is_file()
                 })
         })
-    });
-    if needs_fetch {
+        .map(|pkg| format!("{} {}", pkg.name, pkg.version))
+        .collect();
+    if !missing_sources.is_empty() {
+        if options.offline {
+            return Err(BuildError::Offline(format!(
+                "sources not fetched: missing {}; \
+                 run `tong fetch` (--offline forbids downloading)",
+                missing_sources.join(", ")
+            )));
+        }
         println!("tong: sources not fetched — running `tong fetch` first");
         fetch(root, false)?;
     }
@@ -1509,10 +1551,19 @@ pub fn toolchain_fetch(root: &Path, version: &str, target: Option<&str>) -> Resu
 }
 
 /// Downloads every locked registry package into the source store; a no-op
-/// when everything is already stored.
+/// when everything is already stored. `--offline` never touches the
+/// network: missing blobs fail with a targeted diagnostic before any
+/// download is attempted.
 pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
     let manifest = load_manifest(root)?;
     if !root.join("Tong.lock").is_file() {
+        if offline {
+            return Err(BuildError::Offline(
+                "no Tong.lock; run `tong lock` first \
+                 (--offline forbids auto-locking)"
+                    .to_owned(),
+            ));
+        }
         println!("tong: no Tong.lock — running `tong lock` first");
         lock(root, false)?;
     }
@@ -1521,7 +1572,26 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
     let lock =
         tong_fetch::TongLock::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
     let registry = registry_config(manifest.as_ref())?;
-    let _ = offline;
+    let missing: Vec<&tong_fetch::LockedPackage> = lock
+        .packages
+        .iter()
+        .filter(|package| {
+            package.source.starts_with("registry+")
+                && package.checksum.as_deref().is_some_and(|checksum| {
+                    !tong_fetch::crate_blob_path(&store, checksum).is_file()
+                })
+        })
+        .collect();
+    if offline && !missing.is_empty() {
+        return Err(BuildError::Offline(format!(
+            "sources not fetched: missing {}; run `tong fetch` online first",
+            missing
+                .iter()
+                .map(|package| format!("{} {}", package.name, package.version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let total = lock
         .packages
         .iter()

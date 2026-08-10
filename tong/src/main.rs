@@ -46,6 +46,17 @@ enum Command {
         /// layers: busts only when the lockfile or toolchain changes.
         #[arg(long)]
         deps_only: bool,
+        /// Never touch the network: missing locks, sources, or pinned
+        /// toolchains fail with a targeted diagnostic instead of being
+        /// fetched.
+        #[arg(long)]
+        offline: bool,
+        /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
+        #[arg(long)]
+        locked: bool,
+        /// `--locked` plus `--offline` (read-only, fully offline).
+        #[arg(long)]
+        frozen: bool,
     },
     /// Build and run a binary target.
     Run {
@@ -66,6 +77,17 @@ enum Command {
         /// Activate every declared feature of the selected packages.
         #[arg(long)]
         all_features: bool,
+        /// Never touch the network: missing locks, sources, or pinned
+        /// toolchains fail with a targeted diagnostic instead of being
+        /// fetched.
+        #[arg(long)]
+        offline: bool,
+        /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
+        #[arg(long)]
+        locked: bool,
+        /// `--locked` plus `--offline` (read-only, fully offline).
+        #[arg(long)]
+        frozen: bool,
     },
     /// Remove the project-local `.tong` directory.
     Clean,
@@ -88,6 +110,17 @@ enum Command {
         /// Arguments passed to the test binaries.
         #[arg(last = true)]
         args: Vec<String>,
+        /// Never touch the network: missing locks, sources, or pinned
+        /// toolchains fail with a targeted diagnostic instead of being
+        /// fetched.
+        #[arg(long)]
+        offline: bool,
+        /// Forbid rewriting `Tong.lock` (missing or outdated locks fail).
+        #[arg(long)]
+        locked: bool,
+        /// `--locked` plus `--offline` (read-only, fully offline).
+        #[arg(long)]
+        frozen: bool,
     },
     /// Resolve versions and write `Tong.lock`.
     Lock {
@@ -179,6 +212,9 @@ fn main() -> ExitCode {
             no_default_features,
             all_features,
             deps_only,
+            offline,
+            locked,
+            frozen,
         } => {
             let options = BuildOptions {
                 profile,
@@ -190,6 +226,8 @@ fn main() -> ExitCode {
                 },
                 sandbox: None,
                 deps_only,
+                offline: offline || frozen,
+                locked: locked || frozen,
             };
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
@@ -209,6 +247,9 @@ fn main() -> ExitCode {
             features,
             no_default_features,
             all_features,
+            offline,
+            locked,
+            frozen,
         } => {
             let options = BuildOptions {
                 profile,
@@ -220,6 +261,8 @@ fn main() -> ExitCode {
                 },
                 sandbox: None,
                 deps_only: false,
+                offline: offline || frozen,
+                locked: locked || frozen,
             };
             match driver::run(&workspace, &target, &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -246,6 +289,9 @@ fn main() -> ExitCode {
             no_default_features,
             all_features,
             args,
+            offline,
+            locked,
+            frozen,
         } => {
             let options = BuildOptions {
                 profile,
@@ -257,6 +303,8 @@ fn main() -> ExitCode {
                 },
                 sandbox: None,
                 deps_only: false,
+                offline: offline || frozen,
+                locked: locked || frozen,
             };
             match driver::test(&workspace, label.as_deref(), &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),

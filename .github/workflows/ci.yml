@@ -172,7 +172,7 @@ jobs:
           cd examples/07-web-app
           ../../target/release/tong lock
           ../../target/release/tong fetch
-          ../../target/release/tong build --offline
+          ../../target/release/tong build --offline --locked
 
       - name: Headless runs (SDL examples)
         if: matrix.needs_sdl
