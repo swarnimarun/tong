@@ -223,7 +223,10 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
     let t_build = std::time::Instant::now();
-    let prepared = prepare(root, options, false, &[])?;
+    // Test/bench/example targets pull in dev-dependencies (cargo's
+    // `--all-targets` semantics); plain builds exclude them.
+    let include_dev = options.kinds & (KIND_TEST | KIND_EXAMPLE | KIND_BENCH) != 0;
+    let prepared = prepare(root, options, include_dev, &[])?;
     let tong_dir = &prepared.tong_dir;
     let cas = &prepared.cas;
     let cache = &prepared.cache;
@@ -765,6 +768,20 @@ fn prepare(
 
             let sources = LockfileSource::new(root, &store, cas.clone());
             let model = load_model(root, manifest.as_ref(), &sources)?;
+            if std::env::var_os("TONG_DEBUG_VIEW").is_some() {
+                for pkg in &model.packages {
+                    if pkg.name == "syn" {
+                        eprintln!(
+                            "DEBUG: syn {:?} deps={:?}",
+                            pkg.id.source,
+                            pkg.deps
+                                .iter()
+                                .map(|d| d.extern_name.clone())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
             tracing::debug!(
                 target: "tong::perf",
                 phase = "prepare.model",
@@ -884,8 +901,14 @@ fn prepare(
     let order = match topological_order(&planned) {
         Ok(order) => order,
         Err(cycle) => {
+            if !cycle.missing.is_empty() {
+                return Err(BuildError::Cycle(format!(
+                    "planned actions reference unplanned actions: {:?}",
+                    cycle.missing
+                )));
+            }
             return Err(BuildError::Cycle(format!(
-                "action cycle: {:?}",
+                "action cycle or duplicate action ids: {:?}",
                 cycle.remaining
             )));
         }
@@ -1407,21 +1430,7 @@ pub fn graph(root: &Path, format: &str, options: &BuildOptions) -> Result<(), Bu
     let prepared = prepare(root, options, true, &[])?;
     match format {
         "json" => {
-            println!("{{\"schema\":1,\"nodes\":[");
-            for (index, action) in prepared.planned.iter().enumerate() {
-                let comma = if index + 1 < prepared.planned.len() {
-                    ","
-                } else {
-                    ""
-                };
-                println!(
-                    "{{\"id\":\"{}\",\"mnemonic\":\"{}\",\"deps\":{:?}}}{comma}",
-                    action.logical_id.0,
-                    action.mnemonic,
-                    action.deps.iter().map(|d| d.0.clone()).collect::<Vec<_>>()
-                );
-            }
-            println!("]}}");
+            graph_json(&prepared)?;
         }
         "dot" => {
             println!("digraph tong {{");
@@ -1438,6 +1447,159 @@ pub fn graph(root: &Path, format: &str, options: &BuildOptions) -> Result<(), Bu
             )));
         }
     }
+    Ok(())
+}
+
+/// `tong graph --format json`: the resolver view (package identities,
+/// resolved features, active dependency edges, target kinds) followed by
+/// the planned action graph. The resolver view is the differential corpus
+/// surface compared against `cargo metadata`; the node list mirrors the
+/// old action graph.
+fn graph_json(prepared: &Prepared) -> Result<(), BuildError> {
+    let model = &prepared.model;
+    let map = &model.feature_map;
+    if std::env::var_os("TONG_DEBUG_VIEW").is_some() {
+        for pkg in &model.packages {
+            if pkg.name == "syn" {
+                eprintln!(
+                    "DEBUG: syn deps={:?}",
+                    pkg.deps
+                        .iter()
+                        .map(|d| d.extern_name.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    println!("{{\"schema\":1,\"packages\":[");
+    for (index, pkg) in model.packages.iter().enumerate() {
+        let comma = if index + 1 < model.packages.len() {
+            ","
+        } else {
+            ""
+        };
+        // Resolved features (target domain), sorted.
+        let features: Vec<&str> = map
+            .features_for(&pkg.id, false)
+            .iter()
+            .map(|f| f.as_str())
+            .collect();
+        // Active edges: non-optional deps plus activated optional edges,
+        // across normal/dev/build kinds.
+        let mut edges: Vec<String> = Vec::new();
+        for dep in pkg
+            .deps
+            .iter()
+            .chain(pkg.build_deps.iter())
+            .chain(pkg.dev_deps.iter())
+        {
+            // Cargo's resolve-node edges cover activated dependencies
+            // (weak-ref-activated optionals included); inactive optional
+            // edges stay out of the differential view.
+            if dep.optional && !map.edge_active(&pkg.id, &dep.extern_name) {
+                continue;
+            }
+            let kind = if pkg
+                .dev_deps
+                .iter()
+                .any(|d| d.extern_name == dep.extern_name)
+            {
+                "dev"
+            } else if pkg
+                .build_deps
+                .iter()
+                .any(|d| d.extern_name == dep.extern_name)
+            {
+                "build"
+            } else {
+                "normal"
+            };
+            let package_label = format!("{}@{}", dep.package.name, dep.package.version);
+            edges.push(format!(
+                "{{\"package\":\"{package_label}\",\"source\":\"{}\",\"kind\":\"{kind}\",\"optional\":{},\"default_features\":{},\"features\":{:?},\"target\":{}}}",
+                dep.package.lock_source(),
+                dep.optional,
+                dep.default_features,
+                dep.features,
+                dep.target
+                    .as_ref()
+                    .map(|t| {
+                        // cfg expressions contain quotes; JSON-escape them.
+                        let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+                        format!("\"{escaped}\"")
+                    })
+                    .unwrap_or_else(|| "null".to_owned())
+            ));
+        }
+        // Target kinds, mirroring cargo's `targets[].kind`.
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(lib) = &pkg.lib {
+            let kind = if lib.proc_macro { "proc-macro" } else { "lib" };
+            // Cargo's default lib target name is the SANITIZED package
+            // name (sharded-slab's lib target is `sharded_slab`).
+            let lib_name = lib
+                .name
+                .clone()
+                .unwrap_or_else(|| tong_rust::model::crate_name(&pkg.name));
+            targets.push(format!("{{\"kind\":\"{kind}\",\"name\":\"{lib_name}\"}}"));
+        }
+        if pkg.build_script.is_some() {
+            targets.push("{\"kind\":\"custom-build\",\"name\":\"build-script-build\"}".to_owned());
+        }
+        for bin in &pkg.bins {
+            targets.push(format!("{{\"kind\":\"bin\",\"name\":\"{}\"}}", bin.name));
+        }
+        for example in &pkg.examples {
+            targets.push(format!(
+                "{{\"kind\":\"example\",\"name\":\"{}\"}}",
+                example.name
+            ));
+        }
+        for test in &pkg.tests {
+            // The auto-derived lib unit test is not a declared cargo
+            // target (`cargo metadata` omits it); skip it here so target
+            // kinds compare 1:1.
+            if pkg.lib.as_ref().is_some_and(|lib| lib.path == test.path) {
+                continue;
+            }
+            let kind = if test.doc {
+                "doc-test"
+            } else if test.bench {
+                "bench"
+            } else {
+                "test"
+            };
+            targets.push(format!(
+                "{{\"kind\":\"{kind}\",\"name\":\"{}\"}}",
+                test.name
+            ));
+        }
+        println!(
+            "{{\"id\":\"{}\",\"name\":\"{}\",\"version\":\"{}\",\"source\":\"{}\",\"features\":{:?},\"edges\":[{}],\"targets\":[{}]}}{comma}",
+            pkg.id,
+            pkg.name,
+            pkg.version,
+            pkg.id.lock_source(),
+            features,
+            edges.join(","),
+            targets.join(",")
+        );
+    }
+    println!("],\"nodes\":[");
+    for (index, action) in prepared.planned.iter().enumerate() {
+        let comma = if index + 1 < prepared.planned.len() {
+            ","
+        } else {
+            ""
+        };
+        println!(
+            "{{\"id\":\"{}\",\"mnemonic\":\"{}\",\"deps\":{:?}}}{comma}",
+            action.logical_id.0,
+            action.mnemonic,
+            action.deps.iter().map(|d| d.0.clone()).collect::<Vec<_>>()
+        );
+    }
+    println!("]}}");
     Ok(())
 }
 
@@ -1723,6 +1885,9 @@ struct CompletedMap(BTreeMap<ActionId, CachedResult>);
 /// (`<name> <version> <source>` recorded on the parent's locked entry), so
 /// two versions of one crate can never alias.
 struct LockfileSource {
+    /// Workspace root (resolves `path+<rel>` locked sources to member
+    /// directories — `[patch]`-replaced crates like serde's facade).
+    root: PathBuf,
     lock: Option<tong_fetch::TongLock>,
     store: PathBuf,
     cas: Cas,
@@ -1735,6 +1900,7 @@ impl LockfileSource {
     fn new(root: &Path, store: &Path, cas: Cas) -> Self {
         let lock = tong_fetch::TongLock::load(root).ok();
         Self {
+            root: root.to_path_buf(),
             lock,
             store: store.to_path_buf(),
             cas,
@@ -1781,7 +1947,6 @@ impl LockfileSource {
         let parent_source = edge.parent.lock_source();
         if let Some(parent_entry) =
             lock.exact(&edge.parent.name, &edge.parent.version, &parent_source)
-            && !parent_entry.dependencies.is_empty()
         {
             for dep in &parent_entry.dependencies {
                 let (name, version, source) = tong_fetch::LockedPackage::parse_dependency(dep);
@@ -1800,24 +1965,24 @@ impl LockfileSource {
                         edge.parent.name, edge.package
                     )));
                 };
-                if !req.matches(&package.version) {
-                    return Err(BuildError::Offline(format!(
-                        "lockfile out of date: `{}` requires {} but Tong.lock has {}; \
-                         run `tong lock`",
-                        edge.package, edge.req, package.version
-                    )));
+                // Renamed dependencies can pin several versions of one
+                // package (combine's `bytes_05 = { package = "bytes",
+                // version = "0.5" }` beside `bytes = "1"`): match the
+                // requirement, not just the name.
+                if req.matches(&package.version) {
+                    return Ok(Some(package.clone()));
                 }
-                return Ok(Some(package.clone()));
             }
-            // The parent's locked edges do not include this one: an
-            // inactive optional edge, or a stale lock.
+            // The parent's locked edges do not include a version matching
+            // this requirement: an inactive optional edge, or a stale
+            // lock.
             if edge.optional {
                 return Ok(None);
             }
             return Err(BuildError::Offline(format!(
-                "lockfile out of date: `{}` requires `{}` but the locked graph of `{}` \
+                "lockfile out of date: `{}` requires {} but the locked graph of `{}` \
                  does not include it; run `tong lock`",
-                edge.parent.name, edge.package, edge.parent.name
+                edge.parent.name, edge.req, edge.parent.name
             )));
         }
 
@@ -1913,6 +2078,22 @@ impl tong_rust::LockedSourceProvider for LockfileSource {
                 },
                 source_dir,
                 propagate_source: true,
+            }));
+        }
+        // `[patch]`-replaced crates lock to a workspace/path member: the
+        // edge's source is `path+<rel>` — return the member directory
+        // instead of a registry checkout.
+        if let Some(rel) = package.source.strip_prefix("path+") {
+            let id = tong_rust::model::PackageId {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: tong_rust::model::SourceId::parse_lock_source(&package.source)
+                    .map_err(tong_rust::CargoImportError::Unsupported)?,
+            };
+            return Ok(Some(tong_rust::LockedSource {
+                id,
+                source_dir: self.root.join(rel),
+                propagate_source: false,
             }));
         }
         let checksum = package.checksum.as_deref().ok_or_else(|| {
@@ -2031,6 +2212,10 @@ impl CollectProvider {
 }
 
 impl tong_rust::LockedSourceProvider for CollectProvider {
+    fn collecting(&self) -> bool {
+        true
+    }
+
     fn locked_package(
         &self,
         edge: &tong_rust::RegistryEdge,
@@ -2236,6 +2421,26 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     let requests = feature_requests(&model, &BuildOptions::default(), manifest.as_ref())?;
     let feature_map = tong_rust::resolve_features(&model, &requests, true)
         .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    if std::env::var_os("TONG_DEBUG_VIEW").is_some() {
+        for pkg in &model.packages {
+            if pkg.name == "syn"
+                && matches!(pkg.id.source, tong_rust::model::SourceId::Workspace(_))
+            {
+                eprintln!(
+                    "DEBUG: lock syn deps={:?} active_optional={:?}",
+                    pkg.deps
+                        .iter()
+                        .map(|d| d.extern_name.clone())
+                        .collect::<Vec<_>>(),
+                    feature_map
+                        .active_optional_deps
+                        .get(&pkg.id)
+                        .cloned()
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
 
     // The version resolver keys local (workspace/path) packages by name.
     // Two local packages sharing a name would alias there; Cargo can
@@ -2303,9 +2508,13 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
                 continue;
             }
             deps.push(tong_fetch::ResolvedDep {
-                name: dep.package.name.clone(),
+                name: dep.extern_name.clone(),
+                package: Some(dep.package.name.clone()),
                 req: None,
-                optional: dep.optional,
+                // The edge is feature-resolved as ACTIVE here; marking it
+                // optional would let the resolver's empty root closure
+                // drop it from the lock.
+                optional: false,
                 dev,
                 features: dep.features.clone(),
                 default_features: dep.default_features,
@@ -2324,9 +2533,11 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
                 .map_err(|err| BuildError::Manifest(err.to_string()))?;
             let dev = dev_edges.contains(&(edge.package.clone(), edge.extern_name.clone()));
             deps.push(tong_fetch::ResolvedDep {
-                name: edge.package.clone(),
+                name: edge.extern_name.clone(),
+                package: Some(edge.package.clone()),
                 req: Some(req),
-                optional: edge.optional,
+                // Feature-resolved active; see the model-deps loop.
+                optional: false,
                 dev,
                 features: edge.features.clone(),
                 default_features: edge.default_features,
@@ -2349,7 +2560,17 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         registry.index_url
     );
     let t_resolve = std::time::Instant::now();
-    let resolved = tong_fetch::resolve(&index, &locals, &preferences)
+    // `[patch]` applies to Cargo workspaces only (`manifest` is `None`
+    // for Cargo mode); native Tong.toml roots have no Cargo.toml.
+    let patched: std::collections::BTreeSet<String> = if manifest.is_none() {
+        tong_rust::cargo_patch_names(root)
+            .map_err(|err| BuildError::Manifest(err.to_string()))?
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let resolved = tong_fetch::resolve(&index, &locals, &preferences, &patched)
         .map_err(|err| BuildError::Manifest(err.to_string()))?;
     tracing::info!(
         target: "tong::lock",

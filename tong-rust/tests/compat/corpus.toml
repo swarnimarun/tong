@@ -1,0 +1,56 @@
+# The synthetic compatibility matrix: discovery is data-driven from this
+# file (the checked-in source of truth). Every fixture directory under
+# `tests/compat/<name>/` is a Cargo workspace; `pass` asserts full package
+# set, version, feature, and edge equality against `cargo metadata`.
+#
+# Statuses:
+#   pass         - resolver equality asserted; the fixture must match cargo.
+#   unsupported  - import must fail with a targeted diagnostic.
+#   divergent    - import succeeds; the documented divergence is recorded.
+[fixtures.features]
+status = "pass"
+reason = ""
+
+[fixtures.targets]
+status = "pass"
+reason = "target-specific deps are filtered at import (host only); cargo keeps them in the resolve graph for lockfile completeness"
+
+[fixtures.tests]
+status = "pass"
+reason = ""
+
+[fixtures.build-script]
+status = "pass"
+reason = ""
+
+[fixtures.registry]
+status = "pass"
+reason = ""
+
+[fixtures.examples]
+status = "pass"
+reason = "[[example]] targets are not supported in this wave"
+
+[fixtures.workspace-selection]
+status = "pass"
+reason = "excluded members are dropped; default-members narrow the default build"
+
+[fixtures.config]
+status = "pass"
+reason = "rustflags and linker do not alter the resolve graph"
+
+[fixtures.profiles]
+status = "pass"
+reason = "incremental stays disabled for cacheability (documented divergence)"
+
+[fixtures.patches]
+status = "pass"
+reason = ""
+
+[fixtures.autodiscovery]
+status = "pass"
+reason = ""
+
+[fixtures.wgpu-resolver]
+status = "pass"
+reason = "default-member globs, target tables, optional features, and two simultaneous versions"

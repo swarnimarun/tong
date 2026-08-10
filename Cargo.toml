@@ -8,7 +8,11 @@ members = [
     "tong-graph",
     "tong-rust",
     "tong-store",
+    "tools/corpus-runner",
 ]
+# Pinned external corpus checkouts live under target/tong-corpus; keep
+# cargo's workspace discovery from walking up into the repo root.
+exclude = ["target/tong-corpus"]
 
 [workspace.package]
 version = "0.1.0"

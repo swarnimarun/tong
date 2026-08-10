@@ -241,19 +241,19 @@ fn resolve_commit(
         Transport::Gix => {
             let repo = gix::open(repo).map_err(|err| GitError::Repo(err.to_string()))?;
             let id = if let Some(rev) = rev {
+                // Full 40-hex ids parse directly; short hash prefixes and
+                // refs (e.g. wgpu's `rev = "d550741"`) go through rev-parse
+                // so the bare repo resolves the abbreviated id.
                 if let Ok(id) = gix::ObjectId::from_hex(rev.as_bytes()) {
                     id
                 } else {
-                    repo.find_reference(&format!("refs/heads/{rev}"))
-                        .or_else(|_| repo.find_reference(rev))
+                    repo.rev_parse_single(rev)
+                        .map(|object| object.detach())
                         .map_err(|_| {
                             GitError::Resolve(format!(
                                 "cannot resolve rev {rev:?} of {url}: not a commit id or ref"
                             ))
                         })?
-                        .peel_to_id()
-                        .map_err(|err| GitError::Resolve(err.to_string()))?
-                        .detach()
                 }
             } else if let Some(tag) = tag {
                 repo.find_reference(&format!("refs/tags/{tag}"))

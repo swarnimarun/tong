@@ -2,6 +2,7 @@
 //! with index files and gzipped `.crate` archives whose checksums match the
 //! index (no real network).
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -155,6 +156,7 @@ fn client(registry: &FixtureRegistry) -> IndexClient {
 fn edge(name: &str, req: &str) -> ResolvedDep {
     ResolvedDep {
         name: name.to_owned(),
+        package: None,
         req: Some(semver::VersionReq::parse(req).unwrap()),
         optional: false,
         dev: false,
@@ -204,6 +206,7 @@ fn resolve_picks_highest_and_backtracks() {
         &client,
         &[root(vec![edge("alpha", "*"), edge("beta", "*")])],
         &locked,
+        &BTreeSet::new(),
     )
     .unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
@@ -230,7 +233,13 @@ fn resolve_prefers_locked_version() {
         publish_time: None,
         dependencies: Vec::new(),
     });
-    let packages = resolve(&client, &[root(vec![edge("alpha", "*")])], &locked).unwrap();
+    let packages = resolve(
+        &client,
+        &[root(vec![edge("alpha", "*")])],
+        &locked,
+        &BTreeSet::new(),
+    )
+    .unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
     assert_eq!(alpha.version.to_string(), "1.0.0");
 }
@@ -245,6 +254,7 @@ fn fetch_crate_verifies_and_rejects_corruption() {
         &client,
         &[root(vec![edge("alpha", "*")])],
         &TongLock::default(),
+        &BTreeSet::new(),
     )
     .unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();

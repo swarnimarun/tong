@@ -7,7 +7,7 @@
 //! [`LockedSourceProvider`]). Git dependencies are not yet supported and
 //! fail with a targeted diagnostic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -260,7 +260,7 @@ struct CargoExample {
     #[serde(default)]
     required_features: Option<Vec<String>>,
     #[serde(default)]
-    crate_type: Option<String>,
+    crate_type: Vec<String>,
     #[serde(default)]
     harness: Option<bool>,
     #[serde(default)]
@@ -294,8 +294,8 @@ struct CargoProfile {
     codegen_backend: Option<String>,
     /// Build-script override table (unsupported).
     build_override: Option<toml::Value>,
-    /// Per-package overrides (unsupported).
-    package: Option<toml::Value>,
+    /// Per-package overrides (`[profile.<name>.package.<spec>]`).
+    package: Option<BTreeMap<String, CargoProfile>>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -418,6 +418,31 @@ pub trait LockedSourceProvider {
     /// lock, missing entry, or a lockfile out of date).
     fn locked_package(&self, edge: &RegistryEdge)
     -> Result<Option<LockedSource>, CargoImportError>;
+
+    /// Whether this provider is in collecting mode (`tong lock`): every
+    /// registry edge is recorded for the lockfile even when it cannot be
+    /// resolved yet, and the model keeps provisional edges so feature
+    /// resolution can activate `dep:` references. Lock-backed providers
+    /// leave this false: unresolved edges are dropped from the model.
+    fn collecting(&self) -> bool {
+        false
+    }
+}
+
+/// The crate names replaced by the root manifest's `[patch]` tables.
+/// Registry requirements on these names resolve to the patched local
+/// package (serde's root patches `serde`/`serde_core`/`serde_derive` to
+/// the workspace members).
+pub fn cargo_patch_names(workspace_root: &Path) -> Result<Vec<String>, CargoImportError> {
+    let manifest = read_manifest(workspace_root)?;
+    let mut names: Vec<String> = manifest
+        .patch
+        .get("crates-io")
+        .map(|entries| entries.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Imports a Cargo workspace into a [`RustModel`].
@@ -524,12 +549,16 @@ pub fn import_cargo_workspace(
     // the workspace are imported recursively (Cargo semantics), so the
     // graph is closed over every path dep, not just the members.
     let mut packages: BTreeMap<PathBuf, Package> = BTreeMap::new();
-    let mut visiting: Vec<PathBuf> = Vec::new();
+    // (canonical dir, reached via a dev-dependency edge). Cargo permits
+    // cycles that contain a dev edge anywhere in the cycle, not only on
+    // the closing edge.
+    let mut visiting: Vec<(PathBuf, bool)> = Vec::new();
     let mut member_ids: Vec<PackageId> = Vec::new();
     for member in &members {
         let id = import_package(
             member,
             true,
+            false,
             None,
             &mut packages,
             &mut visiting,
@@ -538,6 +567,7 @@ pub fn import_cargo_workspace(
             host_triple,
             sources,
             &patches,
+            &members,
         )?;
         member_ids.push(id);
     }
@@ -575,7 +605,9 @@ pub fn import_cargo_workspace(
     }
 
     // Profiles from the workspace root manifest (Cargo: [profile.*] tables).
-    model.profiles = resolve_profiles(&root_manifest.profile)?;
+    let (profiles, package_profiles) = resolve_profiles(&root_manifest.profile)?;
+    model.profiles = profiles;
+    model.package_profiles = package_profiles;
     model
         .profiles
         .entry("dev".to_owned())
@@ -601,11 +633,10 @@ pub fn import_cargo_workspace(
             "source replacement in .cargo/config is not supported".to_owned(),
         ));
     }
-    if !config.alias.is_empty() {
-        return Err(CargoImportError::Unsupported(
-            "dependency aliases in .cargo/config are not supported".to_owned(),
-        ));
-    }
+    // `[alias]` is a cargo CLI convenience (`cargo xtask` →
+    // `cargo run -p wgpu-xtask --`); it never alters the build graph, so
+    // it is parsed and ignored like other benign metadata.
+    let _ = &config.alias;
     if config.net.is_some() || config.http.is_some() {
         return Err(CargoImportError::Unsupported(
             "[net] and [http] settings in .cargo/config are not supported".to_owned(),
@@ -697,13 +728,30 @@ fn expand_members(
         excluded.contains(&canonical)
     };
     for member in members {
-        if let Some(glob) = member.strip_suffix("/*") {
-            let dir = root.join(glob);
+        if member.ends_with('*') {
+            // Cargo member globs support a single trailing `*` on the
+            // last component: `crates/*` lists every crate under
+            // `crates/`, and `axum-*` lists every root directory whose
+            // name starts with `axum-`.
+            let (dir, name_prefix) = if let Some(dir) = member.strip_suffix("/*") {
+                (root.join(dir), String::new())
+            } else {
+                let prefix = &member[..member.len() - 1];
+                match prefix.rfind('/') {
+                    Some(slash) => (root.join(&prefix[..slash]), prefix[slash + 1..].to_owned()),
+                    None => (root.to_path_buf(), prefix.to_owned()),
+                }
+            };
             let entries = fs::read_dir(&dir)
                 .map_err(|err| CargoImportError::Io(dir.display().to_string(), err))?;
             let mut found = false;
             for entry in entries {
                 let entry = entry.map_err(|err| CargoImportError::Io(String::new(), err))?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with(&name_prefix) {
+                    continue;
+                }
                 if entry
                     .file_type()
                     .map_err(|err| CargoImportError::Io(String::new(), err))?
@@ -759,125 +807,172 @@ enum ForcedIdentity {
 fn import_package(
     dir: &Path,
     is_member: bool,
+    via_dev: bool,
     forced: Option<ForcedIdentity>,
     packages: &mut BTreeMap<PathBuf, Package>,
-    visiting: &mut Vec<PathBuf>,
+    visiting: &mut Vec<(PathBuf, bool)>,
     inherited: &Inherited,
     workspace_root: &Path,
     host_triple: &str,
     sources: &dyn LockedSourceProvider,
     patches: &BTreeMap<String, DepValue>,
+    members: &[PathBuf],
 ) -> Result<PackageId, CargoImportError> {
     let canonical = fs::canonicalize(dir)
         .map_err(|err| CargoImportError::Io(dir.display().to_string(), err))?;
     if let Some(pkg) = packages.get(&canonical) {
         return Ok(pkg.id.clone());
     }
-    if visiting.contains(&canonical) {
+    // A package reached through a dependency traversal is still a member
+    // when the members list names it (axum's normal dep axum-core is
+    // imported before the member loop reaches it): dev-dependencies and
+    // the Workspace source identity then apply.
+    let is_member = is_member
+        || members.iter().any(|member| {
+            fs::canonicalize(member)
+                .map(|m| m == canonical)
+                .unwrap_or(false)
+        });
+    let manifest = read_manifest(&canonical)?;
+    // A path dependency may be its own workspace root; its
+    // `[workspace.dependencies]`/`[workspace.package]` then apply,
+    // not the importer's.
+    let inherited = match &manifest.workspace {
+        Some(workspace) => Inherited {
+            deps: workspace.dependencies.clone(),
+            package: workspace.package.clone(),
+        },
+        None => inherited.clone(),
+    };
+    let package = manifest.package.as_ref().ok_or_else(|| {
+        CargoImportError::Unsupported(format!(
+            "{} declares a workspace but not a package",
+            canonical.display()
+        ))
+    })?;
+
+    let version = resolve_field(
+        &package.version,
+        inherited.package.as_ref(),
+        &package.name,
+        "version",
+        &canonical,
+        "0.0.0",
+    )?;
+    let edition = resolve_field(
+        &package.edition,
+        inherited.package.as_ref(),
+        &package.name,
+        "edition",
+        &canonical,
+        "2015",
+    )?;
+
+    // Exact identity: registry/git checkouts take the locked identity;
+    // workspace members and path deps derive it from the lexical path
+    // relative to the workspace root (never the canonical absolute
+    // path, so digests are host-independent).
+    let id = match &forced {
+        Some(ForcedIdentity::Exact(locked)) => {
+            let parsed = semver::Version::parse(&version).ok();
+            if locked.name != package.name || parsed.as_ref() != Some(&locked.version) {
+                return Err(CargoImportError::Unsupported(format!(
+                    "locked dependency {} v{} resolves to package {} v{} in {}, \
+                     but the manifest declares {} v{version}; run `tong lock`",
+                    locked.name,
+                    locked.version,
+                    package.name,
+                    parsed
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".to_owned()),
+                    canonical.display(),
+                    package.name,
+                )));
+            }
+            locked.clone()
+        }
+        Some(ForcedIdentity::Source(source)) => {
+            let version = semver::Version::parse(&version).map_err(|err| {
+                CargoImportError::Unsupported(format!(
+                    "package {} in {} has invalid version {:?}: {err}",
+                    package.name,
+                    canonical.display(),
+                    version
+                ))
+            })?;
+            PackageId {
+                name: package.name.clone(),
+                version,
+                source: source.clone(),
+            }
+        }
+        None => {
+            let version = semver::Version::parse(&version).map_err(|err| {
+                CargoImportError::Unsupported(format!(
+                    "package {} in {} has invalid version {:?}: {err}",
+                    package.name,
+                    canonical.display(),
+                    version
+                ))
+            })?;
+            let rel = source_rel_path(dir, workspace_root);
+            let source = if is_member {
+                SourceId::Workspace(rel)
+            } else {
+                SourceId::Path(rel)
+            };
+            PackageId {
+                name: package.name.clone(),
+                version,
+                source,
+            }
+        }
+    };
+
+    // Cargo permits dependency cycles that contain a dev-dependency or
+    // inactive optional edge anywhere in the cycle (e.g. axum and
+    // axum-extra dev-depend on each other; tracing dev-depends on
+    // tracing-mock which normal-depends back). The identity must match
+    // what the real import will derive — in particular, a cycle-closing
+    // edge back to a workspace member carries the Workspace source, not
+    // Path.
+    if visiting.iter().any(|(dir, _)| dir == &canonical) {
+        let cycle_has_dev_edge = via_dev || visiting.iter().any(|(_, dev)| *dev);
+        if cycle_has_dev_edge {
+            let member = members.iter().any(|member| {
+                fs::canonicalize(member)
+                    .map(|m| m == canonical)
+                    .unwrap_or(false)
+            });
+            let rel = source_rel_path(dir, workspace_root);
+            let source = if member {
+                SourceId::Workspace(rel)
+            } else {
+                SourceId::Path(rel)
+            };
+            let id = match &forced {
+                Some(ForcedIdentity::Exact(locked)) => locked.clone(),
+                Some(ForcedIdentity::Source(source)) => PackageId {
+                    name: package.name.clone(),
+                    version: id.version,
+                    source: source.clone(),
+                },
+                None => PackageId {
+                    name: package.name.clone(),
+                    version: id.version,
+                    source,
+                },
+            };
+            return Ok(id);
+        }
         return Err(CargoImportError::Unsupported(format!(
             "cyclic path dependency involving {}",
             dir.display()
         )));
     }
-    visiting.push(canonical.clone());
+    visiting.push((canonical.clone(), via_dev));
 
     let result = (|| {
-        let manifest = read_manifest(&canonical)?;
-        // A path dependency may be its own workspace root; its
-        // `[workspace.dependencies]`/`[workspace.package]` then apply,
-        // not the importer's.
-        let inherited = match &manifest.workspace {
-            Some(workspace) => Inherited {
-                deps: workspace.dependencies.clone(),
-                package: workspace.package.clone(),
-            },
-            None => inherited.clone(),
-        };
-        let package = manifest.package.as_ref().ok_or_else(|| {
-            CargoImportError::Unsupported(format!(
-                "{} declares a workspace but not a package",
-                canonical.display()
-            ))
-        })?;
-
-        let version = resolve_field(
-            &package.version,
-            inherited.package.as_ref(),
-            &package.name,
-            "version",
-            &canonical,
-            "0.0.0",
-        )?;
-        let edition = resolve_field(
-            &package.edition,
-            inherited.package.as_ref(),
-            &package.name,
-            "edition",
-            &canonical,
-            "2015",
-        )?;
-
-        // Exact identity: registry/git checkouts take the locked identity;
-        // workspace members and path deps derive it from the lexical path
-        // relative to the workspace root (never the canonical absolute
-        // path, so digests are host-independent).
-        let id = match &forced {
-            Some(ForcedIdentity::Exact(locked)) => {
-                let parsed = semver::Version::parse(&version).ok();
-                if locked.name != package.name || parsed.as_ref() != Some(&locked.version) {
-                    return Err(CargoImportError::Unsupported(format!(
-                        "locked dependency {} v{} resolves to package {} v{} in {}, \
-                         but the manifest declares {} v{version}; run `tong lock`",
-                        locked.name,
-                        locked.version,
-                        package.name,
-                        parsed
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "?".to_owned()),
-                        canonical.display(),
-                        package.name,
-                    )));
-                }
-                locked.clone()
-            }
-            Some(ForcedIdentity::Source(source)) => {
-                let version = semver::Version::parse(&version).map_err(|err| {
-                    CargoImportError::Unsupported(format!(
-                        "package {} in {} has invalid version {:?}: {err}",
-                        package.name,
-                        canonical.display(),
-                        version
-                    ))
-                })?;
-                PackageId {
-                    name: package.name.clone(),
-                    version,
-                    source: source.clone(),
-                }
-            }
-            None => {
-                let version = semver::Version::parse(&version).map_err(|err| {
-                    CargoImportError::Unsupported(format!(
-                        "package {} in {} has invalid version {:?}: {err}",
-                        package.name,
-                        canonical.display(),
-                        version
-                    ))
-                })?;
-                let rel = source_rel_path(dir, workspace_root);
-                let source = if is_member {
-                    SourceId::Workspace(rel)
-                } else {
-                    SourceId::Path(rel)
-                };
-                PackageId {
-                    name: package.name.clone(),
-                    version,
-                    source,
-                }
-            }
-        };
-
         let mut pkg = Package {
             id: id.clone(),
             name: package.name.clone(),
@@ -891,6 +986,7 @@ fn import_package(
             build_script: None,
             links: package.links.clone(),
             deps: Vec::new(),
+            optional_anywhere: BTreeSet::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),
             features: manifest.features.clone(),
@@ -1075,12 +1171,12 @@ fn import_package(
                 pkg.tests.push(TestTarget {
                     name,
                     path,
+                    bench: kind == "bench",
                     harness: target.harness.unwrap_or(true),
                     doc: false,
                     cache_test_result: false,
                     required_features: target.required_features.clone().unwrap_or_default(),
                 });
-                let _ = kind;
             }
             // Auto-discovery: `tests/*.rs` / `benches/*.rs` when no
             // explicit entries exist (Cargo conventions).
@@ -1099,6 +1195,7 @@ fn import_package(
                         pkg.tests.push(TestTarget {
                             name: name.clone(),
                             path: PathBuf::from(format!("{default_dir}/{name}.rs")),
+                            bench: kind == "bench",
                             harness: true,
                             doc: false,
                             cache_test_result: false,
@@ -1113,6 +1210,7 @@ fn import_package(
             pkg.tests.push(TestTarget {
                 name: lib_crate_name(&pkg),
                 path: lib.path.clone(),
+                bench: false,
                 harness: true,
                 doc: false,
                 cache_test_result: false,
@@ -1124,8 +1222,9 @@ fn import_package(
         // target-specific tables merged in for matching targets. Direct
         // paths resolve relative to this manifest; inherited paths resolve
         // relative to the workspace root.
-        let (dependencies, build_dependencies, dev_dependencies) =
+        let (dependencies, build_dependencies, dev_dependencies, optional_anywhere) =
             merge_target_tables(&manifest, host_triple)?;
+        pkg.optional_anywhere = optional_anywhere;
         let resolved_deps = resolve_deps(
             &dependencies,
             &pkg,
@@ -1163,11 +1262,12 @@ fn import_package(
         let mut deps = Vec::new();
         let mut build_deps = Vec::new();
         let mut dev_deps = Vec::new();
-        for (resolved, target) in [
-            (resolved_deps, &mut deps),
-            (resolved_build_deps, &mut build_deps),
-            (resolved_dev_deps, &mut dev_deps),
+        for (resolved, target, via_dev) in [
+            (resolved_deps, &mut deps, false),
+            (resolved_build_deps, &mut build_deps, false),
+            (resolved_dev_deps, &mut dev_deps, true),
         ] {
+            let _ = &via_dev;
             for dep in resolved {
                 let package_id = match dep.path {
                     Some(path) => {
@@ -1180,9 +1280,11 @@ fn import_package(
                             }
                             _ => None,
                         };
+                        let allow_cycle = via_dev || dep.optional;
                         let imported = import_package(
                             &path,
                             false,
+                            allow_cycle,
                             forced,
                             packages,
                             visiting,
@@ -1191,6 +1293,7 @@ fn import_package(
                             host_triple,
                             sources,
                             patches,
+                            members,
                         )?;
                         if imported.name != dep.package {
                             return Err(CargoImportError::Unsupported(format!(
@@ -1210,6 +1313,25 @@ fn import_package(
                         // the requirement); in collecting mode the edge was
                         // recorded and nothing is imported.
                         let Some(locked) = dep.locked else {
+                            // Collecting mode (`tong lock`): the provider
+                            // recorded the RegistryEdge; the model keeps a
+                            // provisional edge so feature resolution can
+                            // activate `dep:` references (e.g. axum's
+                            // `tracing = ["dep:tracing"]`). The exact
+                            // identity is substituted once the lock
+                            // resolves the version.
+                            target.push(Dep {
+                                extern_name: dep.extern_name,
+                                package: PackageId {
+                                    name: dep.package.clone(),
+                                    version: semver::Version::new(0, 0, 0),
+                                    source: SourceId::Registry(String::new()),
+                                },
+                                optional: dep.optional,
+                                default_features: dep.default_features,
+                                features: dep.features,
+                                target: dep.target,
+                            });
                             continue;
                         };
                         let forced = if locked.propagate_source {
@@ -1220,6 +1342,7 @@ fn import_package(
                         import_package(
                             &locked.source_dir,
                             false,
+                            via_dev || dep.optional,
                             Some(forced),
                             packages,
                             visiting,
@@ -1228,6 +1351,7 @@ fn import_package(
                             host_triple,
                             sources,
                             patches,
+                            members,
                         )?
                     }
                 };
@@ -1505,8 +1629,16 @@ fn resolve_deps(
                         }
                         Some(DepValue::Table {
                             version: Some(version),
+                            default_features: inherited_default_features,
                             ..
                         }) => {
+                            // The workspace's `default-features = false`
+                            // applies to the inherited edge (cargo: serde's
+                            // `[workspace.dependencies] syn =
+                            // { version = "3", default-features = false }`
+                            // must not activate syn's defaults).
+                            let default_features =
+                                default_features && inherited_default_features.unwrap_or(true);
                             let edge = RegistryEdge {
                                 parent: parent.id.clone(),
                                 extern_name: name.replace('-', "_"),
@@ -1588,10 +1720,26 @@ fn resolve_deps(
                 target,
                 locked: Some(locked),
             });
+        } else if sources.collecting() {
+            // Collecting mode (`tong lock`): the edge was recorded by the
+            // provider; return it unlocked so the caller keeps a
+            // provisional edge in the model for feature resolution. In
+            // lock-backed mode an unresolved edge is an inactive optional
+            // dep absent from the locked feature graph — dropped here.
+            out.push(ResolvedDep {
+                extern_name: name.replace('-', "_"),
+                package,
+                path: None,
+                optional,
+                default_features,
+                features,
+                target,
+                locked: None,
+            });
         }
-        // Collecting mode (`tong lock`) or an inactive optional edge:
-        // `locked` is None — the edge was recorded by the provider (or is
-        // absent from the locked feature graph); nothing is imported.
+        // Lock-backed mode with an inactive optional edge: `locked` is
+        // None — the edge is absent from the locked feature graph; nothing
+        // is imported.
     }
     Ok(out)
 }
@@ -1690,11 +1838,14 @@ fn apply_patch(
     }
 }
 
-/// The manifest's dependency tables after target-specific merging.
+/// The manifest's dependency tables after target-specific merging, plus
+/// the set of dependency names that are optional in at least one target
+/// table (cargo feature references validate against the union).
 type MergedTables = (
     BTreeMap<String, DepValue>,
     BTreeMap<String, DepValue>,
     BTreeMap<String, DepValue>,
+    BTreeSet<String>,
 );
 
 /// Merges the manifest's dependency tables with its matching
@@ -1707,7 +1858,36 @@ fn merge_target_tables(
     let mut dependencies = manifest.dependencies.clone();
     let mut build_dependencies = manifest.build_dependencies.clone();
     let mut dev_dependencies = manifest.dev_dependencies.clone();
+    // Names optional in any table (union semantics, computed BEFORE the
+    // host-specific merge: wgpu's `wgpu-hal` is optional in the wasm
+    // target table but plain elsewhere, and cargo feature references
+    // validate against the union).
+    let mut optional_anywhere: BTreeSet<String> = BTreeSet::new();
+    let is_optional = |dep: &DepValue| {
+        matches!(
+            dep,
+            DepValue::Table {
+                optional: Some(true),
+                ..
+            }
+        )
+    };
+    for (name, dep) in manifest
+        .dependencies
+        .iter()
+        .chain(&manifest.build_dependencies)
+    {
+        if is_optional(dep) {
+            optional_anywhere.insert(name.clone());
+        }
+    }
     for (key, table) in &manifest.target {
+        let _ = key;
+        for (name, dep) in table.dependencies.iter().chain(&table.build_dependencies) {
+            if is_optional(dep) {
+                optional_anywhere.insert(name.clone());
+            }
+        }
         // Every target table's deps enter the model with the target key
         // recorded (the backend filters at plan time), so the feature walk
         // and the lock see all targets. Cargo's override semantics: a
@@ -1748,7 +1928,12 @@ fn merge_target_tables(
             }
         }
     }
-    Ok((dependencies, build_dependencies, dev_dependencies))
+    Ok((
+        dependencies,
+        build_dependencies,
+        dev_dependencies,
+        optional_anywhere,
+    ))
 }
 
 /// Whether a target key (`cfg(...)` expression or literal triple) matches
@@ -1802,9 +1987,15 @@ fn parse_edition(text: &str) -> Result<Edition, CargoImportError> {
     }
 }
 
+/// Resolves the profile table: named profiles plus the per-package
+/// `[profile.<name>.package.<spec>]` overrides (profile name, spec) →
+/// fully merged profile.
+type ProfileTables = BTreeMap<String, CargoProfile>;
+type PackageOverrides = BTreeMap<(String, String), ProfileSpec>;
+
 fn resolve_profiles(
-    tables: &BTreeMap<String, CargoProfile>,
-) -> Result<BTreeMap<String, ProfileSpec>, CargoImportError> {
+    tables: &ProfileTables,
+) -> Result<(BTreeMap<String, ProfileSpec>, PackageOverrides), CargoImportError> {
     // Resolve `inherits` chains first (Cargo: every profile implicitly
     // inherits `dev` unless `inherits` names another).
     let mut bases: BTreeMap<String, String> = BTreeMap::new();
@@ -1822,11 +2013,13 @@ fn resolve_profiles(
         bases.insert(name.clone(), base);
     }
     let mut resolved: BTreeMap<String, ProfileSpec> = BTreeMap::new();
+    let mut package_overrides: BTreeMap<(String, String), ProfileSpec> = BTreeMap::new();
     for name in tables.keys() {
-        let spec = resolve_profile_chain(name, tables, &bases, &mut resolved)?;
+        let spec =
+            resolve_profile_chain(name, tables, &bases, &mut resolved, &mut package_overrides)?;
         resolved.insert(name.clone(), spec);
     }
-    Ok(resolved)
+    Ok((resolved, package_overrides))
 }
 
 fn resolve_profile_chain(
@@ -1834,6 +2027,7 @@ fn resolve_profile_chain(
     tables: &BTreeMap<String, CargoProfile>,
     bases: &BTreeMap<String, String>,
     resolved: &mut BTreeMap<String, ProfileSpec>,
+    package_overrides: &mut BTreeMap<(String, String), ProfileSpec>,
 ) -> Result<ProfileSpec, CargoImportError> {
     if let Some(spec) = resolved.get(name) {
         return Ok(spec.clone());
@@ -1855,23 +2049,143 @@ fn resolve_profile_chain(
     } else if base_name == "release" {
         ProfileSpec::release()
     } else if tables.contains_key(&base_name) {
-        resolve_profile_chain(&base_name, tables, bases, resolved)?
+        resolve_profile_chain(&base_name, tables, bases, resolved, package_overrides)?
     } else {
         return Err(CargoImportError::Unsupported(format!(
             "profile {name:?} inherits unknown profile {base_name:?}"
         )));
     };
-    let mut spec = base_spec;
+    let mut spec = base_spec.clone();
     let table = &tables[name];
     if table.build_override.is_some() {
         return Err(CargoImportError::Unsupported(format!(
             "profile {name:?} build-override is not supported"
         )));
     }
-    if table.package.is_some() {
-        return Err(CargoImportError::Unsupported(format!(
-            "profile {name:?} package overrides are not supported"
-        )));
+    if let Some(package) = &table.package {
+        for (spec, override_table) in package {
+            // Cargo: package overrides may set opt-level, debug,
+            // split-debuginfo, debug-assertions, overflow-checks, lto,
+            // panic, rpath, strip, codegen-units, incremental; they merge
+            // over the resolved base profile.
+            if override_table.inherits.is_some() {
+                return Err(CargoImportError::Unsupported(format!(
+                    "profile {name:?} package override for {spec:?} sets inherits"
+                )));
+            }
+            if override_table.codegen_backend.is_some() {
+                return Err(CargoImportError::Unsupported(format!(
+                    "profile {name:?} package override for {spec:?} sets codegen-backend"
+                )));
+            }
+            if override_table.build_override.is_some() {
+                return Err(CargoImportError::Unsupported(format!(
+                    "profile {name:?} package override for {spec:?} sets build-override"
+                )));
+            }
+            let mut merged = base_spec.clone();
+            if let Some(level) = &override_table.opt_level {
+                merged.opt_level = match level {
+                    OptLevelValue::Num(n) => {
+                        if *n > 3 {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "profile {name:?} package override for {spec:?} \
+                                 opt-level = {n}; expected 0-3, \"s\", or \"z\""
+                            )));
+                        }
+                        n.to_string()
+                    }
+                    OptLevelValue::Str(s) => match s.as_str() {
+                        "0" | "1" | "2" | "3" | "s" | "z" => s.clone(),
+                        other => {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "profile {name:?} package override for {spec:?} \
+                                 opt-level = {other:?}; expected 0-3, \"s\", or \"z\""
+                            )));
+                        }
+                    },
+                };
+            }
+            if let Some(debug) = &override_table.debug {
+                merged.debug = match debug {
+                    DebugValue::Bool(b) => *b,
+                    DebugValue::Num(n) => {
+                        if *n > 2 {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "profile {name:?} package override for {spec:?} \
+                                 debug = {n}; expected 0, 1, 2, \"full\", or \"none\""
+                            )));
+                        }
+                        *n > 0
+                    }
+                    DebugValue::Str(s) => match s.as_str() {
+                        "full" | "true" => true,
+                        "none" | "false" => false,
+                        "line-tables-only" => true,
+                        other => {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "profile {name:?} package override for {spec:?} \
+                                 debug = {other:?}; expected 0, 1, 2, \"full\", or \"none\""
+                            )));
+                        }
+                    },
+                };
+            }
+            if let Some(lto) = &override_table.lto {
+                merged.lto = match lto {
+                    LtoValue::Bool(true) => Lto::Fat,
+                    LtoValue::Bool(false) => Lto::Off,
+                    LtoValue::Str(s) => match s.as_str() {
+                        "thin" => Lto::Thin,
+                        "fat" | "true" => Lto::Fat,
+                        "off" | "false" => Lto::Off,
+                        other => {
+                            return Err(CargoImportError::Unsupported(format!(
+                                "profile {name:?} package override for {spec:?} \
+                                 lto = {other:?}; expected \"thin\", \"fat\", \"off\""
+                            )));
+                        }
+                    },
+                };
+            }
+            if let Some(panic) = &override_table.panic {
+                merged.panic = match panic.as_str() {
+                    "unwind" => PanicStrategy::Unwind,
+                    "abort" => PanicStrategy::Abort,
+                    other => {
+                        return Err(CargoImportError::Unsupported(format!(
+                            "profile {name:?} package override for {spec:?} has invalid \
+                             panic {other:?}"
+                        )));
+                    }
+                };
+            }
+            if let Some(units) = override_table.codegen_units {
+                merged.codegen_units = Some(units);
+            }
+            if let Some(value) = override_table.overflow_checks {
+                merged.overflow_checks = Some(value);
+            }
+            if let Some(value) = override_table.debug_assertions {
+                merged.debug_assertions = Some(value);
+            }
+            if let Some(value) = &override_table.strip {
+                merged.strip = Some(value.clone());
+            }
+            if let Some(value) = override_table.rpath {
+                merged.rpath = Some(value);
+            }
+            if let Some(value) = &override_table.split_debuginfo {
+                merged.split_debuginfo = Some(value.clone());
+            }
+            if override_table.incremental == Some(true) {
+                eprintln!(
+                    "tong: warning: profile {name:?} package override for {spec:?} \
+                     requests incremental compilation, which Tong keeps disabled"
+                );
+            }
+            package_overrides.insert((name.to_owned(), spec.clone()), merged);
+        }
     }
     if table.codegen_backend.is_some() {
         return Err(CargoImportError::Unsupported(format!(

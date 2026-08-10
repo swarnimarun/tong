@@ -296,6 +296,33 @@ pub fn resolve_features(
         }
     }
 
+    // Weak features for deps present in the graph: cargo applies
+    // `dep?/feat` whenever the dep is in the resolution (locked) graph,
+    // even if no feature activated it (e.g. toml's `std` =
+    // `["indexmap?/std"]` with `preserve_order` off). The edge itself is
+    // not activated — the dep is not pulled into the build — but the
+    // feature name lands in the dep's activated set, matching cargo's
+    // resolve-node features.
+    let pending = std::mem::take(&mut state.pending_weak);
+    for (parent, dep_name, feature, reference, _domain) in pending {
+        let Some((dep, dep_domain)) = state
+            .edge(&parent, &dep_name)
+            .map(|(d, dd)| (d.clone(), dd))
+        else {
+            continue;
+        };
+        let active = state
+            .active_set(dep_domain)
+            .get(&parent)
+            .is_some_and(|active| active.contains(&dep.extern_name));
+        if !active {
+            state.enqueue_dep_feature(&parent, &dep, dep_domain, &feature, &reference)?;
+        }
+    }
+    while let Some((package, feature, domain)) = state.queue.pop() {
+        state.process(&package, &feature, domain)?;
+    }
+
     Ok(FeatureMap {
         packages: state.features_on,
         active_optional_deps: state.active_optional,
@@ -395,7 +422,16 @@ impl<'a> Resolver<'a> {
     /// edge kind, returning the edge and the domain it belongs to.
     fn edge(&self, package: &PackageId, name: &str) -> Option<(&Dep, Domain)> {
         let pkg = self.packages.get(package)?;
-        let matches = |dep: &Dep| dep.package.name == name || dep.extern_name == name;
+        // Declared names compare dash-insensitively: rustls-webpki
+        // declares `pki-types` (extern `pki_types`, crate
+        // `rustls-pki-types`) and its features reference `pki-types/alloc`.
+        let normalized = name.replace('-', "_");
+        let matches = |dep: &Dep| {
+            dep.package.name == name
+                || dep.extern_name == name
+                || dep.extern_name.replace('-', "_") == normalized
+                || dep.package.name.replace('-', "_") == normalized
+        };
         if let Some(dep) = pkg.deps.iter().find(|dep| matches(dep)) {
             return Some((dep, Domain::Target));
         }
@@ -485,6 +521,17 @@ impl<'a> Resolver<'a> {
         if self.native_imports.contains(dep.package.name.as_str()) {
             return Ok(());
         }
+        // Provisional registry edges (`tong lock` collecting mode) have a
+        // placeholder identity and no package in the model yet — the edge
+        // activates, but its own features are unknown until the registry
+        // resolves the version.
+        let provisional = matches!(
+            &dep.package.source,
+            crate::model::SourceId::Registry(url) if url.is_empty()
+        );
+        if provisional {
+            return Ok(());
+        }
         self.pkg(&dep.package)?;
         self.ensure_expanded(&dep.package, domain);
         if dep.default_features {
@@ -515,10 +562,14 @@ impl<'a> Resolver<'a> {
         }
         // Implicit feature: a plain name matching an optional dep activates
         // it (resolver v2 keeps the legacy `foo = ["bar"]` form working).
+        // Cargo's resolve graph also lists the dep name itself among the
+        // package's activated features, so the implicit activation is
+        // recorded both as an edge and as a feature name.
         if let Some((dep, dep_domain)) = self.edge(package, feature) {
             let dep = dep.clone();
             if dep.optional {
                 self.activate_edge(&pkg.id, &dep, dep_domain)?;
+                self.mark_feature(package, &dep.package.name, domain);
                 return Ok(());
             }
             return Err(FeatureError::NotOptionalDep {
@@ -550,11 +601,19 @@ impl<'a> Resolver<'a> {
                     })?;
             let dep = dep.clone();
             if !dep.optional {
-                return Err(FeatureError::NotOptionalDep {
-                    package: package.name.clone(),
-                    feature: reference.to_owned(),
-                    dep: dep.extern_name.clone(),
-                });
+                // Cargo validates `dep:x` against the union of target
+                // tables: `x` optional in any table makes the reference
+                // legal, and on hosts where the merged edge is plain the
+                // dependency is already active (wgpu's `wgpu-hal` is
+                // optional only on wasm).
+                if !pkg.optional_anywhere.contains(dep_name) {
+                    return Err(FeatureError::NotOptionalDep {
+                        package: package.name.clone(),
+                        feature: reference.to_owned(),
+                        dep: dep.extern_name.clone(),
+                    });
+                }
+                return Ok(());
             }
             return self.activate_edge(&pkg.id, &dep, dep_domain);
         }
@@ -587,28 +646,22 @@ impl<'a> Resolver<'a> {
         } else {
             true
         };
+        let _ = dep_active;
         if weak {
-            // `dep?/feat` — activate the dep feature only when the dep is
-            // already active; defer until the fixpoint sees it active.
-            if dep_active {
-                self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference)?;
-            } else {
-                let pending = (
-                    package.clone(),
-                    dep.extern_name.clone(),
-                    feature.to_owned(),
-                    reference.to_owned(),
-                    dep_domain,
-                );
-                if !self.pending_weak.contains(&pending) {
-                    self.pending_weak.push(pending);
-                }
-            }
-            return Ok(());
+            // `dep?/feat` — cargo activates the dependency and applies
+            // the feature like a strong reference, but the dep's own name
+            // is NOT listed in the parent's node features (syn's
+            // `quote?/proc-macro` lists no `quote`).
+            self.activate_edge(&pkg.id, &dep, dep_domain)?;
+            return self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference);
         }
         // `dep/feat` — strong reference: activates the dep and its
-        // feature.
+        // feature. Cargo's resolve-node features also list the dep's own
+        // name (tokio's `net = ["mio/os-poll", ...]` lists `mio`).
         self.activate_edge(&pkg.id, &dep, dep_domain)?;
+        if dep.optional {
+            self.mark_feature(package, &dep.package.name, _domain);
+        }
         self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference)
     }
 
@@ -620,14 +673,29 @@ impl<'a> Resolver<'a> {
         feature: &str,
         reference: &str,
     ) -> Result<(), FeatureError> {
+        // Provisional registry edges (`tong lock` collecting mode) have no
+        // package in the model yet; the reference resolves after locking.
+        let provisional = matches!(
+            &dep.package.source,
+            crate::model::SourceId::Registry(url) if url.is_empty()
+        );
+        if provisional {
+            return Ok(());
+        }
         let dep_package = self.pkg(&dep.package)?;
         // The feature may be the implicit feature of an optional dep
         // (e.g. `tracing/log` — tracing's `log` dep has no explicit
         // feature entry; cargo resolves the reference to the dep).
-        let implicit = dep_package
-            .deps
-            .iter()
-            .any(|dep| dep.optional && (dep.package.name == feature || dep.extern_name == feature));
+        let implicit = dep_package.deps.iter().any(|dep| {
+            // Dash-insensitive: mongodb's `mongocrypt/bson-2`
+            // references the optional renamed dep `bson-2` whose
+            // extern name is `bson_2`.
+            dep.optional
+                && (dep.package.name == feature
+                    || dep.extern_name == feature
+                    || dep.extern_name.replace('-', "_") == feature.replace('-', "_")
+                    || dep.package.name.replace('-', "_") == feature.replace('-', "_"))
+        });
         if !dep_package.features.contains_key(feature) && !implicit {
             return Err(FeatureError::UnknownDepFeature {
                 package: dep_package.name.clone(),
@@ -668,6 +736,7 @@ mod tests {
             build_script: None,
             links: None,
             deps: Vec::new(),
+            optional_anywhere: BTreeSet::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),
             features: features
@@ -783,15 +852,19 @@ mod tests {
         assert!(map.packages[&pid("extra")].contains("feat"));
     }
 
+    /// Cargo activates optional deps referenced by `dep?/feat` weak
+    /// references exactly like strong ones (verified against `cargo
+    /// metadata`: `futures-core?/alloc` in a default feature activates
+    /// the dep, its edge, and the feature).
     #[test]
-    fn weak_dep_feature_skipped_when_inactive() {
+    fn weak_dep_feature_activates_dep() {
         let mut app = package("app", &[("default", &["extra?/feat"])], true);
         app.deps.push(dep("extra", "extra", true));
         let extra = package("extra", &[("default", &[]), ("feat", &[])], true);
         let model = model(vec![app, extra], &["app"]);
         let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
-        assert!(!map.active_optional_deps.contains_key(&pid("app")));
-        assert!(map.packages[&pid("extra")].is_empty());
+        assert!(map.active_optional_deps[&pid("app")].contains("extra"));
+        assert!(map.packages[&pid("extra")].contains("feat"));
     }
 
     #[test]
@@ -1046,6 +1119,7 @@ mod tests {
             build_script: None,
             links: None,
             deps: Vec::new(),
+            optional_anywhere: BTreeSet::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),
             features: BTreeMap::from([
@@ -1073,6 +1147,7 @@ mod tests {
             build_script: None,
             links: None,
             deps: Vec::new(),
+            optional_anywhere: BTreeSet::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),
             features: BTreeMap::from([("default".to_owned(), Vec::new())]),

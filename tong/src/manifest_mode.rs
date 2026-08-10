@@ -8,7 +8,7 @@
 //! Cargo-style auto-detection (src/lib.rs, src/main.rs) applies so native
 //! manifests stay small.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -343,6 +343,7 @@ impl PackageSeed {
                 self.tests.push(TestTarget {
                     name: key.to_owned(),
                     path,
+                    bench: target.rule == "rust_bench",
                     harness: target.harness.unwrap_or(true),
                     doc: false,
                     cache_test_result: target.cache_test_result.unwrap_or(false),
@@ -354,6 +355,7 @@ impl PackageSeed {
                 self.tests.push(TestTarget {
                     name: key.to_owned(),
                     path,
+                    bench: false,
                     harness: false,
                     doc: true,
                     cache_test_result: false,
@@ -390,6 +392,7 @@ impl PackageSeed {
             build_script: self.build_script,
             links: None,
             deps: self.deps,
+            optional_anywhere: BTreeSet::new(),
             build_deps: Vec::new(),
             dev_deps: self.dev_deps,
             features: self.features,

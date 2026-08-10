@@ -99,35 +99,93 @@ impl From<&str> for PlanError {
 pub struct CycleError {
     /// Actions still in the graph when the cycle was found.
     pub remaining: Vec<ActionId>,
+    /// Dependency edges that name no planned action (producer/consumer
+    /// id mismatch), when the failure is a missing dependency rather than
+    /// a cycle.
+    pub missing: Vec<(ActionId, ActionId)>,
 }
 
 impl fmt::Display for CycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cycle detected among actions: {:?}", self.remaining)
+        if self.missing.is_empty() {
+            write!(f, "cycle detected among actions: {:?}", self.remaining)
+        } else {
+            write!(
+                f,
+                "planned actions reference unplanned actions: {:?}",
+                self.missing
+            )
+        }
     }
 }
 
 impl std::error::Error for CycleError {}
 
 /// Returns actions in a valid execution order (dependencies first), or the
-/// cycle if the graph is not a DAG.
+/// cycle if the graph is not a DAG. Duplicate logical ids or duplicate
+/// dependency edges are structured errors, never scheduling underflows.
 pub fn topological_order(actions: &[PlannedAction]) -> Result<Vec<&PlannedAction>, CycleError> {
     let mut by_id = BTreeMap::new();
+    let mut duplicated = Vec::new();
     for action in actions {
-        by_id.insert(&action.logical_id, action);
+        if by_id.insert(&action.logical_id, action).is_some() {
+            duplicated.push(action.logical_id.0.clone());
+        }
     }
-    // Every dep edge must reference a known action.
-    let mut indegree: BTreeMap<&ActionId, usize> = actions
-        .iter()
-        .map(|action| (&action.logical_id, action.deps.len()))
-        .collect();
-    let mut dependents: BTreeMap<&ActionId, Vec<&ActionId>> = BTreeMap::new();
+    if !duplicated.is_empty() {
+        duplicated.sort();
+        duplicated.dedup();
+        return Err(CycleError {
+            remaining: duplicated.into_iter().map(ActionId).collect(),
+            missing: Vec::new(),
+        });
+    }
+    // Unknown dependency edges are hard errors: scheduling without a
+    // required input would silently drop work.
+    let mut missing: Vec<(ActionId, ActionId)> = Vec::new();
     for action in actions {
         for dep in &action.deps {
             if !by_id.contains_key(dep) {
-                // Unknown dependency: treat as an error via cycle report.
-                continue;
+                missing.push((action.logical_id.clone(), dep.clone()));
             }
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(CycleError {
+            remaining: Vec::new(),
+            missing,
+        });
+    }
+    // Every dep edge must reference a known action; dep lists may name the
+    // same action twice (a package reachable through both deps and
+    // dev-deps of one target), so edges are deduplicated before counting.
+    // Unknown deps are excluded from both sides — counting them in the
+    // indegree while skipping them in dependents would permanently block
+    // the action and masquerade as a cycle.
+    let mut indegree: BTreeMap<&ActionId, usize> = actions
+        .iter()
+        .map(|action| {
+            let mut seen: Vec<&ActionId> = action
+                .deps
+                .iter()
+                .filter(|dep| by_id.contains_key(dep))
+                .collect();
+            seen.sort();
+            seen.dedup();
+            (&action.logical_id, seen.len())
+        })
+        .collect();
+    let mut dependents: BTreeMap<&ActionId, Vec<&ActionId>> = BTreeMap::new();
+    for action in actions {
+        let mut seen: Vec<&ActionId> = action
+            .deps
+            .iter()
+            .filter(|dep| by_id.contains_key(dep))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        for dep in seen {
             dependents.entry(dep).or_default().push(&action.logical_id);
         }
     }
@@ -160,7 +218,10 @@ pub fn topological_order(actions: &[PlannedAction]) -> Result<Vec<&PlannedAction
             .filter(|(id, _)| !order.iter().any(|a| &a.logical_id == **id))
             .map(|(id, _)| (*id).clone())
             .collect();
-        return Err(CycleError { remaining });
+        return Err(CycleError {
+            remaining,
+            missing: Vec::new(),
+        });
     }
     Ok(order)
 }
@@ -243,5 +304,64 @@ mod tests {
         ];
         let err = topological_order(&actions).unwrap_err();
         assert_eq!(err.remaining.len(), 3);
+        assert!(err.missing.is_empty());
+    }
+
+    /// Duplicate logical ids must be a structured error — collapsing them
+    /// into one node while keeping both edges underflows the indegree.
+    #[test]
+    fn rejects_duplicate_logical_ids() {
+        let actions = vec![planned("dup", &[]), planned("dup", &[])];
+        let err = topological_order(&actions).unwrap_err();
+        assert_eq!(err.remaining, vec![ActionId("dup".to_owned())]);
+    }
+
+    /// A realistic build-script graph (serde's facade, core, and derive):
+    /// libs depend on their own script runs, script runs on their
+    /// compiles, and the derive proc-macro on its own script run plus
+    /// plain libs — no cycle.
+    #[test]
+    fn schedules_build_script_graph() {
+        let actions = vec![
+            planned("rust:bs-compile:serde", &[]),
+            planned("rust:bs-compile:serde_core", &[]),
+            planned("rust:bs-run:serde", &["rust:bs-compile:serde"]),
+            planned("rust:bs-run:serde_core", &["rust:bs-compile:serde_core"]),
+            planned(
+                "rust:bs-run:serde_derive",
+                &["rust:bs-compile:serde_derive"],
+            ),
+            planned("rust:bs-compile:serde_derive", &[]),
+            planned(
+                "rust:lib:serde",
+                &["rust:bs-run:serde", "rust:lib:serde_core"],
+            ),
+            planned("rust:lib:serde_core", &["rust:bs-run:serde_core"]),
+            planned("rust:lib:proc-macro2", &[]),
+            planned("rust:lib:quote", &[]),
+            planned("rust:lib:syn", &[]),
+            planned("rust:lib:unicode-ident", &[]),
+            planned(
+                "rust:proc-macro:serde_derive",
+                &[
+                    "rust:bs-run:serde_derive",
+                    "rust:lib:proc-macro2",
+                    "rust:lib:quote",
+                    "rust:lib:syn",
+                    "rust:lib:unicode-ident",
+                ],
+            ),
+        ];
+        let order = topological_order(&actions).unwrap();
+        assert_eq!(order.len(), actions.len());
+    }
+
+    /// Duplicate dependency edges on one action schedule exactly once.
+    #[test]
+    fn deduplicates_dependency_edges() {
+        let actions = vec![planned("app", &["lib", "lib"]), planned("lib", &[])];
+        let order = topological_order(&actions).unwrap();
+        let names: Vec<&str> = order.iter().map(|a| a.logical_id.0.as_str()).collect();
+        assert_eq!(names, vec!["lib", "app"]);
     }
 }

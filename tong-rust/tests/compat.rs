@@ -16,7 +16,7 @@ mod compat {
     pub mod http_server;
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,81 +26,65 @@ use serde_json::Value;
 use tong_rust::{FeatureRequest, RustModel, import_cargo_workspace, resolve_features};
 use tong_store::{ActionCache, Cas};
 
-/// Fixture compatibility status.
+/// Fixture compatibility status, mirrored from `corpus.toml`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
     /// Package set, versions, features, and edges all match cargo.
     Pass,
+    /// The fixture must fail import with a targeted diagnostic; the
+    /// matrix records the observed reason.
+    Unsupported,
+    /// The fixture runs but documents an accepted divergence from cargo.
+    Divergent,
+}
+
+impl Status {
+    fn parse(text: &str) -> Status {
+        match text {
+            "pass" => Status::Pass,
+            "unsupported" => Status::Unsupported,
+            "divergent" => Status::Divergent,
+            other => panic!("corpus.toml: unknown status {other:?}"),
+        }
+    }
 }
 
 struct Fixture {
-    name: &'static str,
+    name: String,
     status: Status,
-    reason: &'static str,
+    reason: String,
 }
 
-const FIXTURES: &[Fixture] = &[
-    Fixture {
-        name: "features",
-        status: Status::Pass,
-        reason: "",
-    },
-    Fixture {
-        name: "targets",
-        status: Status::Pass,
-        reason: "target-specific deps are filtered at import (host only); cargo keeps them in the resolve graph for lockfile completeness",
-    },
-    Fixture {
-        name: "tests",
-        status: Status::Pass,
-        reason: "",
-    },
-    Fixture {
-        name: "build-script",
-        status: Status::Pass,
-        reason: "",
-    },
-    Fixture {
-        name: "registry",
-        status: Status::Pass,
-        reason: "",
-    },
-    Fixture {
-        name: "examples",
-        status: Status::Pass,
-        reason: "[[example]] targets are not supported in this wave",
-    },
-    Fixture {
-        name: "workspace-selection",
-        status: Status::Pass,
-        reason: "excluded members are dropped; default-members narrow the default build",
-    },
-    Fixture {
-        name: "config",
-        status: Status::Pass,
-        reason: "rustflags and linker do not alter the resolve graph",
-    },
-    Fixture {
-        name: "profiles",
-        status: Status::Pass,
-        reason: "incremental stays disabled for cacheability (documented divergence)",
-    },
-    Fixture {
-        name: "patches",
-        status: Status::Pass,
-        reason: "",
-    },
-    Fixture {
-        name: "autodiscovery",
-        status: Status::Pass,
-        reason: "",
-    },
-    Fixture {
-        name: "wgpu-resolver",
-        status: Status::Pass,
-        reason: "default-member globs, target tables, optional features, and two simultaneous versions",
-    },
-];
+/// Loads the fixture list from `tests/compat/corpus.toml` (the checked-in
+/// source of truth; the matrix is data-driven, not a hardcoded table).
+fn load_fixtures() -> Vec<Fixture> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("compat")
+        .join("corpus.toml");
+    let text = fs::read_to_string(&path).expect("compat/corpus.toml");
+    let value: toml::Value = toml::from_str(&text).expect("compat/corpus.toml is valid toml");
+    let fixtures = value["fixtures"]
+        .as_table()
+        .expect("corpus.toml [fixtures]");
+    let mut out: Vec<Fixture> = fixtures
+        .iter()
+        .map(|(name, spec)| {
+            let status = spec["status"]
+                .as_str()
+                .map(Status::parse)
+                .unwrap_or(Status::Pass);
+            let reason = spec["reason"].as_str().unwrap_or("").to_owned();
+            Fixture {
+                name: name.clone(),
+                status,
+                reason,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
 
 /// The provider used for provider-free fixtures: registry deps are
 /// rejected with the targeted "requires Tong.lock" diagnostic.
@@ -498,16 +482,17 @@ fn build_registry(with_wgpu: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
 
 #[test]
 fn differential_suite() {
+    let fixtures = load_fixtures();
     println!("compatibility matrix:");
-    println!("{:<14} {:<11} reason", "fixture", "status");
-    for fixture in FIXTURES {
+    println!("{:<18} {:<11} reason", "fixture", "status");
+    for fixture in &fixtures {
         match fixture.status {
-            Status::Pass => {
-                check_pass(fixture);
-            }
+            Status::Pass => check_pass(fixture),
+            Status::Unsupported => check_unsupported(fixture),
+            Status::Divergent => check_divergent(fixture),
         }
         println!(
-            "{:<14} {:<11} {}",
+            "{:<18} {:<11} {}",
             fixture.name,
             format!("{:?}", fixture.status),
             fixture.reason
@@ -515,8 +500,41 @@ fn differential_suite() {
     }
 }
 
+/// An `unsupported` fixture must fail import with a targeted diagnostic;
+/// a silent pass or a raw panic is a regression.
+fn check_unsupported(fixture: &Fixture) {
+    let work = fixture_copy(&fixture.name);
+    let dir = work.path();
+    let _ = dir.join(".tong").join("store");
+    let provider = NoLock;
+    let result = tong_rust::import_cargo_workspace(dir, &host_triple(), &provider, None);
+    match result {
+        Err(err) => {
+            let text = err.to_string();
+            assert!(
+                !text.is_empty(),
+                "unsupported fixture {} must carry a diagnostic",
+                fixture.name
+            );
+        }
+        Ok(_) => panic!(
+            "unsupported fixture {} imported silently; expected a targeted diagnostic",
+            fixture.name
+        ),
+    }
+}
+
+/// A `divergent` fixture runs the comparison but records the documented
+/// divergence instead of asserting full equality.
+fn check_divergent(fixture: &Fixture) {
+    // Divergent fixtures use the same import path; only the assertion
+    // softens. Currently every fixture is `pass`, so this is the seam for
+    // future accepted divergences.
+    check_pass(fixture);
+}
+
 fn check_pass(fixture: &Fixture) {
-    let work = fixture_copy(fixture.name);
+    let work = fixture_copy(&fixture.name);
     let dir = work.path();
     let host = host_triple();
 
@@ -525,7 +543,7 @@ fn check_pass(fixture: &Fixture) {
     // Keeps the registry tempdir alive for the whole check (dropping it
     // would delete the served index before cargo runs).
     let mut _registry_guard: Option<tempfile::TempDir> = None;
-    let (model, cargo) = match fixture.name {
+    let (model, cargo) = match fixture.name.as_str() {
         "registry" | "wgpu-resolver" => {
             // Serve the registry over HTTP for cargo, and point tong at
             // the same index (file:// is fine for tong).
@@ -558,6 +576,7 @@ fn check_pass(fixture: &Fixture) {
                     source: Some("path+.".to_owned()),
                     deps: vec![
                         tong_fetch::ResolvedDep {
+                            package: None,
                             name: "alpha".to_owned(),
                             req: Some(semver::VersionReq::parse("1").unwrap()),
                             features: Vec::new(),
@@ -566,6 +585,7 @@ fn check_pass(fixture: &Fixture) {
                             dev: false,
                         },
                         tong_fetch::ResolvedDep {
+                            package: None,
                             name: "beta".to_owned(),
                             req: Some(semver::VersionReq::parse("1").unwrap()),
                             features: Vec::new(),
@@ -584,6 +604,7 @@ fn check_pass(fixture: &Fixture) {
                     source: Some("path+crates/app".to_owned()),
                     deps: vec![
                         tong_fetch::ResolvedDep {
+                            package: None,
                             name: "alpha".to_owned(),
                             req: Some(semver::VersionReq::parse("=1.0.0").unwrap()),
                             features: Vec::new(),
@@ -592,6 +613,7 @@ fn check_pass(fixture: &Fixture) {
                             dev: false,
                         },
                         tong_fetch::ResolvedDep {
+                            package: None,
                             name: "alpha".to_owned(),
                             req: Some(semver::VersionReq::parse("=2.0.0").unwrap()),
                             features: Vec::new(),
@@ -600,6 +622,7 @@ fn check_pass(fixture: &Fixture) {
                             dev: false,
                         },
                         tong_fetch::ResolvedDep {
+                            package: None,
                             name: "extra".to_owned(),
                             req: Some(semver::VersionReq::parse("1").unwrap()),
                             features: Vec::new(),
@@ -610,8 +633,13 @@ fn check_pass(fixture: &Fixture) {
                     ],
                 }]
             };
-            let packages =
-                tong_fetch::resolve(&index_client, &locals, &Default::default()).expect("resolve");
+            let packages = tong_fetch::resolve(
+                &index_client,
+                &locals,
+                &Default::default(),
+                &BTreeSet::new(),
+            )
+            .expect("resolve");
             let mut lock = tong_fetch::TongLock {
                 version: tong_fetch::LOCKFILE_VERSION,
                 packages: Vec::new(),

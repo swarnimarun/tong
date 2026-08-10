@@ -1,0 +1,133 @@
+# The pinned external corpus: the checked-in source of truth for the
+# `tong-corpus-runner`. `fetch` clones each entry at the exact `rev`,
+# verifies the checkout, and populates the per-entry cargo home and Tong
+# store; `resolve` compares tong's resolver graph against `cargo metadata
+# --locked --offline`; `build` executes the entry's Tong gate offline.
+#
+# Required entries must pass every gate; extended entries record observed
+# evidence and never block. `gate` selects the acceptance semantics:
+#   default - resolver equality + the entry's `tong` command
+#   tokio   - full-workspace metadata equality + `tong test --workspace
+#             --all-features --no-run --offline`
+#   wgpu    - full-workspace resolver equality + `tong check` of the five
+#             selected packages with `--all-features --offline`
+
+[entries.tokio]
+url = "https://github.com/tokio-rs/tokio"
+rev = "75fef53d0a8590c2d1dbb63672aa7b7d1ef51155"
+tier = "required"
+divergence = "resolve: unknown package tokio (member/registry collision)"
+gate = "tokio"
+platforms = ["all"]
+
+[entries.wgpu]
+url = "https://github.com/gfx-rs/wgpu"
+rev = "8bf3e5ff4ab45e2c150e0d6c70d01d25f5b126c1"
+tier = "required"
+divergence = "resolve: git env_logger collides with registry version"
+gate = "wgpu"
+platforms = ["all"]
+
+[entries.serde]
+url = "https://github.com/serde-rs/serde"
+rev = "7fc3b4c30c94f73a96ebd1553f2b090d928fc3a8"
+tier = "required"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.syn]
+url = "https://github.com/dtolnay/syn"
+rev = "23dbaab4b0c43f56cd803894054cf366661e53b0"
+tier = "required"
+divergence = "resolve: duplicate action ids for member+registry same-version syn"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.anyhow]
+url = "https://github.com/dtolnay/anyhow"
+rev = "1dbe1862aae650423e3361fbd20b7d17c5109cc3"
+tier = "required"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.clap]
+url = "https://github.com/clap-rs/clap"
+rev = "4a622b4340d5e1fffff60c0ecefdc6882f738159"
+tier = "required"
+divergence = "resolve: default features of inactive packages not expanded"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.tracing]
+url = "https://github.com/tokio-rs/tracing"
+rev = "74fc079d2308a959d3a17907b3ba592ffd0a98f7"
+tier = "required"
+divergence = "resolve: profile strip = true boolean not parsed"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.hyper]
+url = "https://github.com/hyperium/hyper"
+rev = "67ace6484db5d4a15367013847768f5f94f4b97d"
+tier = "required"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.axum]
+url = "https://github.com/tokio-rs/axum"
+rev = "c59208c86fded335cd85e388030ad59347b0e5ae"
+tier = "required"
+divergence = "resolve: cookie implicit aes-gcm feature unresolved"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.reqwest]
+url = "https://github.com/seanmonstar/reqwest"
+rev = "11489b34eda6d32b15ad4033e62beba2ee401350"
+tier = "required"
+divergence = "resolve: target-table dep system-configuration absent on host"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.ripgrep]
+url = "https://github.com/BurntSushi/ripgrep"
+rev = "3fce3b5bb0236da2df6d99672afb8a719642eca7"
+tier = "required"
+divergence = "resolve: default features of inactive packages not expanded"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.rustls]
+url = "https://github.com/rustls/rustls"
+rev = "fcf61cdbba30913cfd5b40aefa83989c6233812d"
+tier = "extended"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.sqlx]
+url = "https://github.com/launchbadge/sqlx"
+rev = "1d674f51581598f55436451d5b4b73100cae0b56"
+tier = "extended"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.bevy]
+url = "https://github.com/bevyengine/bevy"
+rev = "c6f634ca9f406d68ba5109d921247b654cb42c10"
+tier = "extended"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.cargo]
+url = "https://github.com/rust-lang/cargo"
+rev = "a07c49a989d565727725e5bb5a8038ff402006a8"
+tier = "extended"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]
+
+[entries.rust-analyzer]
+url = "https://github.com/rust-lang/rust-analyzer"
+rev = "57411b3a0fb0181ed5965f6541d5ed39a9d79d4c"
+tier = "extended"
+tong = ["check", "--workspace", "--all-targets", "--offline"]
+platforms = ["all"]

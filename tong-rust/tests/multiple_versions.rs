@@ -7,7 +7,7 @@
 //! renames (`alpha1 = { package = "alpha", version = "1" }` and
 //! `alpha2 = { package = "alpha", version = "2" }`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -122,6 +122,7 @@ alpha2 = { package = "alpha", version = "=2.0.0" }
         deps: vec![
             tong_fetch::ResolvedDep {
                 name: "alpha".to_owned(),
+                package: None,
                 req: Some(semver::VersionReq::parse("=1.0.0").unwrap()),
                 features: Vec::new(),
                 optional: false,
@@ -130,6 +131,7 @@ alpha2 = { package = "alpha", version = "=2.0.0" }
             },
             tong_fetch::ResolvedDep {
                 name: "alpha".to_owned(),
+                package: None,
                 req: Some(semver::VersionReq::parse("=2.0.0").unwrap()),
                 features: Vec::new(),
                 optional: false,
@@ -138,7 +140,13 @@ alpha2 = { package = "alpha", version = "=2.0.0" }
             },
         ],
     }];
-    let packages = tong_fetch::resolve(&index_client, &locals, &Default::default()).unwrap();
+    let packages = tong_fetch::resolve(
+        &index_client,
+        &locals,
+        &Default::default(),
+        &BTreeSet::new(),
+    )
+    .unwrap();
     let mut lock = tong_fetch::TongLock {
         version: tong_fetch::LOCKFILE_VERSION,
         packages: Vec::new(),

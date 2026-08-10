@@ -15,7 +15,7 @@ pub mod toolchain_dist;
 
 pub use backend::{FinalArtifact, RustBackend};
 pub use cargo_import::{
-    CargoImportError, LockedSource, LockedSourceProvider, import_cargo_workspace,
+    CargoImportError, LockedSource, LockedSourceProvider, cargo_patch_names, import_cargo_workspace,
 };
 pub use features::{FeatureError, FeatureMap, FeatureRequest, resolve_features};
 pub use model::{

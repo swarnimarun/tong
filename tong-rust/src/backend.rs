@@ -182,6 +182,14 @@ pub struct RustBackend<'a> {
     toolchain: SystemRust,
     profile_name: String,
     profile: ProfileSpec,
+    /// Per-package profile overrides for the active profile name.
+    package_profiles: BTreeMap<String, ProfileSpec>,
+    /// Packages that must be fully codegen'd even in check mode: the
+    /// transitive closure of proc-macro and build-script packages (cargo
+    /// check compiles those host units and their dependencies fully —
+    /// their consumers need real MIR, and `--emit=metadata` alone raises
+    /// "missing optimized MIR").
+    full_codegen: BTreeSet<PackageId>,
     source_trees: BTreeMap<PackageId, TreeDigest>,
     /// Original crate path (relative to the package dir) → rewritten path
     /// inside the source tree, for crate roots mounted outside the package
@@ -310,6 +318,13 @@ impl<'a> RustBackend<'a> {
             toolchain,
             profile_name: profile_name.to_owned(),
             profile,
+            package_profiles: model
+                .package_profiles
+                .iter()
+                .filter(|((name, _), _)| name == profile_name)
+                .map(|((_, spec), profile)| (spec.clone(), profile.clone()))
+                .collect(),
+            full_codegen: full_codegen_closure(model),
             source_trees: BTreeMap::new(),
             crate_roots: BTreeMap::new(),
             cc: BTreeMap::new(),
@@ -515,6 +530,9 @@ impl<'a> RustBackend<'a> {
             .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
 
+        if !self.is_member(pkg) {
+            return Ok(());
+        }
         for target in &pkg.tests {
             if !self.required_features_active(pkg, &target.required_features) {
                 continue;
@@ -560,6 +578,7 @@ impl<'a> RustBackend<'a> {
                 bs_run.clone(),
                 self.crate_root_for(&pkg.id, &target.path),
                 false,
+                true,
             )?;
 
             if self.no_run || self.check {
@@ -871,9 +890,16 @@ impl<'a> RustBackend<'a> {
             // file) would produce a new binary and rerun the script,
             // defeating rerun-if-changed.
             let previous = self.previous_directives(pkg);
+            // The COMPILE input narrows by the previous script-compile's
+            // dep-info (rustc's own module closure — `mod rustc;` must
+            // stay available); the RUN input narrows by rerun-if-changed.
             let mut script_tree = source_tree;
+            let compile_id = format!("rust:bs-compile:{}", self.pkg_label(pkg));
+            if let Some(paths) = self.previous_dep_info(&compile_id, pkg) {
+                script_tree = self.mount_package_paths(pkg, paths, "dep-info")?;
+            }
             if let Some(directives) = &previous {
-                script_tree = self.narrowed_script_tree(pkg, script_tree, directives)?;
+                run_source_tree = self.narrowed_script_tree(pkg, run_source_tree, directives)?;
                 // rerun-if-env-changed: declared env vars become explicit
                 // run-action inputs (the digest then covers their values).
                 // An unset var stays absent — forcing it to "" would change
@@ -902,6 +928,7 @@ impl<'a> RustBackend<'a> {
                 None,
                 script.clone(),
                 true,
+                false,
             )?;
 
             if previous.is_some() {
@@ -965,7 +992,7 @@ impl<'a> RustBackend<'a> {
                     env
                 },
                 cc: Vec::new(),
-                profile_flags: self.profile.rustc_flags(),
+                profile_flags: self.effective_profile(&pkg.name).rustc_flags(),
                 network_allow: self.network_allow,
                 target_triple: self.target_triple.clone(),
             };
@@ -995,6 +1022,7 @@ impl<'a> RustBackend<'a> {
                     bs_run.clone(),
                     self.crate_root_for(&pkg.id, &lib.path),
                     false,
+                    true,
                 )?;
             } else {
                 let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -1019,6 +1047,7 @@ impl<'a> RustBackend<'a> {
                         bs_run.clone(),
                         lib_root.clone(),
                         false,
+                        true,
                     )?;
                 }
             }
@@ -1041,6 +1070,9 @@ impl<'a> RustBackend<'a> {
             .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
 
+        if !self.is_member(pkg) {
+            return Ok(());
+        }
         for bin in &pkg.bins {
             if !self.required_features_active(pkg, &bin.required_features) {
                 continue;
@@ -1074,6 +1106,7 @@ impl<'a> RustBackend<'a> {
                 bs_run.clone(),
                 self.crate_root_for(&pkg.id, &bin.path),
                 false,
+                true,
             )?;
         }
         Ok(())
@@ -1093,6 +1126,9 @@ impl<'a> RustBackend<'a> {
             .planned_ids
             .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
+        if !self.is_member(pkg) {
+            return Ok(());
+        }
         for example in &pkg.examples {
             if !self.required_features_active(pkg, &example.required_features) {
                 continue;
@@ -1127,6 +1163,7 @@ impl<'a> RustBackend<'a> {
                 bs_run.clone(),
                 self.crate_root_for(&pkg.id, &example.path),
                 false,
+                true,
             )?;
         }
         Ok(())
@@ -1197,6 +1234,7 @@ impl<'a> RustBackend<'a> {
         build_script: Option<ActionId>,
         crate_root: PathBuf,
         host_unit: bool,
+        own_directives: bool,
     ) -> Result<ActionId, PlanError> {
         let mut source_tree = source_tree;
         // Narrow the input tree to the files the previous build's rustc
@@ -1208,7 +1246,7 @@ impl<'a> RustBackend<'a> {
         }
         // `--check` builds emit metadata only (cargo check); build
         // scripts always compile fully (they run even in check builds).
-        let check = self.check && !host_unit;
+        let check = self.check && !host_unit && !self.full_codegen.contains(&pkg.id);
         let meta = self.metadata(pkg, &crate_name, crate_type);
         let check_output = |output: String| {
             if check {
@@ -1274,7 +1312,7 @@ impl<'a> RustBackend<'a> {
         }
         // LTO is not supported for proc-macro crate types; Cargo disables it
         // automatically.
-        let mut profile_flags = self.profile.rustc_flags();
+        let mut profile_flags = self.effective_profile(&pkg.name).rustc_flags();
         if crate_type == "proc-macro" {
             let mut index = 0;
             while index < profile_flags.len() {
@@ -1301,7 +1339,7 @@ impl<'a> RustBackend<'a> {
                 output,
                 deps: dep_specs,
                 build_script,
-                directive_sources: self.link_directive_sources(pkg),
+                directive_sources: self.link_directive_sources(pkg, own_directives),
                 crate_root,
                 extra_flags,
                 feature_cfgs,
@@ -1355,6 +1393,28 @@ impl<'a> RustBackend<'a> {
 
     /// Internal disambiguated key for a package's planned actions:
     /// name@version@source. Never surfaces in digests or output.
+    /// Whether `pkg` is a workspace member. Cargo builds dependency
+    /// packages as libraries only — test/bench/example/bin targets of
+    /// non-members are never planned (`--all-targets` covers members).
+    fn is_member(&self, pkg: &Package) -> bool {
+        self.model.members.contains(&pkg.id)
+    }
+
+    /// The profile for `package_name`: an exact or glob-matching
+    /// `[profile.<name>.package.<spec>]` override, else the active
+    /// profile.
+    fn effective_profile(&self, package_name: &str) -> &ProfileSpec {
+        if let Some(profile) = self.package_profiles.get(package_name) {
+            return profile;
+        }
+        for (spec, profile) in &self.package_profiles {
+            if glob_match(spec, package_name) {
+                return profile;
+            }
+        }
+        &self.profile
+    }
+
     fn pkg_key(&self, pkg: &Package) -> String {
         format!("{}@{}@{}", pkg.name, pkg.version, pkg.id.lock_source())
     }
@@ -1442,6 +1502,14 @@ impl<'a> RustBackend<'a> {
         enc.write_str(&self.profile_name);
         enc.write_str(kind);
         enc.write_str(&self.toolchain.host_triple);
+        // The activated feature set disambiguates output file names: the
+        // same package built with different feature sets (e.g. tokio as
+        // hyper's dep vs reqwest's) must not collide in the deps dir.
+        if let Some(features) = self.model.feature_map.packages.get(&pkg.id) {
+            for feature in features {
+                enc.write_str(feature);
+            }
+        }
         enc.digest().to_hex()[..16].to_owned()
     }
 
@@ -1458,7 +1526,7 @@ impl<'a> RustBackend<'a> {
     /// the package's own script plus the scripts of every transitive
     /// dependency (Cargo propagates link directives to all dependents).
     /// Inactive optional dep edges are skipped.
-    fn link_directive_sources(&self, pkg: &Package) -> Vec<ActionId> {
+    fn link_directive_sources(&self, pkg: &Package, include_own: bool) -> Vec<ActionId> {
         fn active_deps<'b>(model: &RustModel, pkg: &'b Package) -> Vec<&'b Dep> {
             pkg.deps
                 .iter()
@@ -1473,9 +1541,13 @@ impl<'a> RustBackend<'a> {
         }
 
         let mut out = Vec::new();
-        if let Some(id) = self
-            .planned_ids
-            .get(&format!("bs-run:{}", self.pkg_key(pkg)))
+        // The package's own build-script run applies to its lib/test
+        // compiles; a build-script COMPILE must not depend on its own run
+        // (that would be a self-cycle).
+        if include_own
+            && let Some(id) = self
+                .planned_ids
+                .get(&format!("bs-run:{}", self.pkg_key(pkg)))
         {
             out.push(id.clone());
         }
@@ -1635,7 +1707,11 @@ impl<'a> RustBackend<'a> {
         let meta = self.metadata(pkg, &lib_name, kind);
         // Check builds produce `.rmeta` instead of `.rlib` (the producer
         // and every consumer must agree on the file name).
-        let ext = if self.check && ext == "rlib" {
+        // Check builds produce `.rmeta` instead of `.rlib` — but only
+        // when the producer is itself checked: packages in the
+        // full-codegen closure emit `.rlib` even under `cargo check`, so
+        // consumers must reference the same file.
+        let ext = if self.check && ext == "rlib" && !self.full_codegen.contains(&dep.package) {
             "rmeta"
         } else {
             ext
@@ -1772,6 +1848,58 @@ impl Ctx {
             }
         }
     }
+}
+
+/// The transitive dependency closure of packages needed by proc macros
+/// and build scripts: cargo check fully compiles host units and
+/// everything they depend on (their consumers need real MIR). The host
+/// units themselves are excluded — proc macros are handled by
+/// `is_proc_macro`, and build-script packages are compiled normally.
+fn full_codegen_closure(model: &RustModel) -> BTreeSet<PackageId> {
+    let mut closure: BTreeSet<PackageId> = BTreeSet::new();
+    let mut open: Vec<PackageId> = Vec::new();
+    let packages: BTreeMap<&PackageId, &Package> =
+        model.packages.iter().map(|pkg| (&pkg.id, pkg)).collect();
+    for pkg in &model.packages {
+        let host_unit =
+            pkg.lib.as_ref().is_some_and(|lib| lib.proc_macro) || pkg.build_script.is_some();
+        if host_unit {
+            for dep in pkg.deps.iter().chain(pkg.build_deps.iter()) {
+                open.push(dep.package.clone());
+            }
+        }
+    }
+    while let Some(id) = open.pop() {
+        if !closure.insert(id.clone()) {
+            continue;
+        }
+        if let Some(pkg) = packages.get(&id) {
+            for dep in pkg.deps.iter().chain(pkg.build_deps.iter()) {
+                open.push(dep.package.clone());
+            }
+        }
+    }
+    closure
+}
+
+/// Matches a cargo `[profile.<name>.package.<spec>]` package spec against
+/// a package name: exact equality, or a `*` glob (cargo semantics).
+fn glob_match(spec: &str, name: &str) -> bool {
+    if spec == name {
+        return true;
+    }
+    if let Some((prefix, suffix)) = spec.split_once('*') {
+        if prefix.is_empty() && suffix.is_empty() {
+            return true;
+        }
+        if name.starts_with(prefix)
+            && name.ends_with(suffix)
+            && name.len() >= prefix.len() + suffix.len()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Concretizes a planned action into a full `ActionSpec`.
@@ -2073,7 +2201,9 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             // The `.d` file lands in the output tree and lets later builds
             // narrow their inputs to the files rustc actually read.
             args.push("--emit".to_owned());
-            args.push(if spec.check {
+            args.push(if spec.check && !spec.is_proc_macro {
+                // Proc macros cannot be checked: cargo builds them fully
+                // even under `cargo check` (consumers link the dylib).
                 "metadata".to_owned()
             } else {
                 "link".to_owned()

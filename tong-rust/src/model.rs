@@ -4,7 +4,7 @@
 //! this model; the backend plans actions from it. The model is deliberately
 //! close to Cargo's package model because Rust's compiler is package-based.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -103,7 +103,9 @@ impl SourceId {
 
     /// Parses a lockfile source string into a [`SourceId`].
     pub fn parse_lock_source(text: &str) -> Result<Self, String> {
-        if let Some(url) = text.strip_prefix("registry+") {
+        if let Some(rel) = text.strip_prefix("path+") {
+            Ok(Self::Path(rel.to_owned()))
+        } else if let Some(url) = text.strip_prefix("registry+") {
             Ok(Self::Registry(url.to_owned()))
         } else if let Some(rest) = text.strip_prefix("git+") {
             let (url, rev) = rest
@@ -204,6 +206,10 @@ pub struct RustModel {
     pub members: Vec<PackageId>,
     /// Named, resolved profiles.
     pub profiles: BTreeMap<String, ProfileSpec>,
+    /// Per-package profile overrides: `(profile name, package spec)` →
+    /// the fully resolved profile for packages matching `spec` (a bare
+    /// name or a `*` glob, like cargo's `[profile.<name>.package.<spec>]`).
+    pub package_profiles: BTreeMap<(String, String), ProfileSpec>,
     /// Imported prebuilt native libraries.
     pub cc_imports: Vec<CcImport>,
     /// Workspace-wide rustc flags (e.g. `.cargo/config.toml` `[build]`).
@@ -225,6 +231,7 @@ impl Default for RustModel {
             packages: Vec::new(),
             members: Vec::new(),
             profiles: BTreeMap::new(),
+            package_profiles: BTreeMap::new(),
             cc_imports: Vec::new(),
             global_rustflags: Vec::new(),
             global_env: BTreeMap::new(),
@@ -265,6 +272,11 @@ pub struct Package {
     pub links: Option<String>,
     /// Normal dependencies.
     pub deps: Vec<Dep>,
+    /// Extern names that are optional in at least one target-specific
+    /// dependency table (cargo allows `dep:x` feature references against
+    /// the union of target tables; the edge may be non-optional on the
+    /// current host, e.g. wgpu's `wgpu-hal`).
+    pub optional_anywhere: BTreeSet<String>,
     /// Build-script-only dependencies.
     pub build_deps: Vec<Dep>,
     /// Dev-dependencies (test/example builds only).
@@ -353,6 +365,9 @@ pub struct TestTarget {
     pub name: String,
     /// Crate root, relative to the package dir.
     pub path: PathBuf,
+    /// Whether the target is a benchmark (`[[bench]]`/`benches/*`), which
+    /// cargo lists under `targets[].kind = ["bench"]`.
+    pub bench: bool,
     /// Whether the target uses the libtest harness (`--test`).
     pub harness: bool,
     /// Whether the target is a doc test (run via rustdoc; the run action
@@ -630,6 +645,7 @@ mod tests {
             build_script: None,
             links: None,
             deps: Vec::new(),
+            optional_anywhere: BTreeSet::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),
             features: BTreeMap::new(),

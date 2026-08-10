@@ -37,8 +37,12 @@ use crate::sparse_index::{IndexDepKind, IndexVersion};
 /// A version requirement edge in the resolution graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedDep {
-    /// Package name the edge points at.
+    /// The declared dependency name (the alias for renamed deps: deadpool
+    /// references `tokio_1 = { package = "tokio" }` by `tokio_1`).
     pub name: String,
+    /// The real crate name when the dependency is renamed (`Some`); the
+    /// index lookup and lock edges use it.
+    pub package: Option<String>,
     /// Version requirement (`None` for local/path edges).
     pub req: Option<VersionReq>,
     /// Optional (feature-activated) dependency.
@@ -258,7 +262,18 @@ impl<T: Clone> Clone for RcVecIter<T> {
 }
 
 /// A dependency edge plus its candidate summaries.
-type DepInfo = (ResolvedDep, Rc<Vec<Summary>>);
+/// One dependency of a resolved package: the edge, its candidate
+/// versions, and whether the target is expanded (recursed into).
+/// Inactive optional deps are version-locked and recorded as edges but
+/// not expanded — cargo's Cargo.lock lists every dependency of a
+/// resolved package without pulling in the targets' own optional
+/// closures.
+#[derive(Clone)]
+struct DepInfo {
+    dep: ResolvedDep,
+    candidates: Rc<Vec<Summary>>,
+    expand: bool,
+}
 
 /// The pending deps of one activated package (cargo `DepsFrame`).
 #[derive(Clone)]
@@ -273,7 +288,7 @@ impl DepsFrame {
     fn min_candidates(&self) -> usize {
         self.remaining_siblings
             .peek()
-            .map(|(_, candidates)| candidates.len())
+            .map(|info| info.candidates.len())
             .unwrap_or(0)
     }
 }
@@ -333,7 +348,7 @@ impl RemainingDeps {
             frame
                 .remaining_siblings
                 .remaining()
-                .map(move |(dep, candidates)| (parent.clone(), dep, candidates.len()))
+                .map(move |info| (parent.clone(), &info.dep, info.candidates.len()))
         })
     }
 }
@@ -358,15 +373,15 @@ impl RemainingCandidates {
     fn next(
         &mut self,
         conflicting_prev_active: &mut ConflictMap,
-        activations: &BTreeMap<ActivationKey, (Summary, usize)>,
+        activations: &BTreeMap<ActivationKey, (Summary, usize, bool)>,
     ) -> Option<(Summary, bool)> {
         let valid = |candidate: &Summary| match activations.get(&activation_key(&candidate.id)) {
-            Some((a, _)) => a.id == candidate.id,
+            Some((a, _, _)) => a.id == candidate.id,
             None => true,
         };
         while let Some(b) = self.remaining.next() {
             let key = activation_key(&b.id);
-            if let Some((a, _)) = activations.get(&key)
+            if let Some((a, _, _)) = activations.get(&key)
                 && a.id != b.id
             {
                 conflicting_prev_active
@@ -410,9 +425,11 @@ struct ResolverContext {
     /// Number of decisions made (backjump target ages).
     age: usize,
     /// Activation key (name, semver-compat group, source) → summary + age.
-    activations: BTreeMap<ActivationKey, (Summary, usize)>,
+    /// Lock-only registrations are inactive optional deps recorded for
+    /// lockfile completeness; a later real activation upgrades them.
+    activations: BTreeMap<ActivationKey, (Summary, usize, bool)>,
     /// Every resolved edge: (parent, dep, child).
-    edges: Vec<(PackageId, ResolvedDep, PackageId)>,
+    edges: Vec<(PackageId, ResolvedDep, PackageId, bool)>,
     /// Requested features per activated package (feature-aware optional
     /// deps, cargo style).
     requested: BTreeMap<PackageId, RequestedFeatures>,
@@ -430,7 +447,7 @@ impl ResolverContext {
     fn is_active(&self, id: &PackageId) -> Option<usize> {
         self.activations
             .get(&activation_key(id))
-            .and_then(|(s, age)| (s.id == *id).then_some(*age))
+            .and_then(|(s, age, _)| (s.id == *id).then_some(*age))
     }
     /// The newest age among `parent` and the conflict set, if all still
     /// active — the backjump target (cargo `is_conflicting`).
@@ -450,19 +467,34 @@ impl ResolverContext {
     }
     /// Activates `summary`; `Err(Conflict)` when a semver-compatible
     /// version is already active. Returns `true` when already activated.
-    fn flag_activated(&mut self, summary: &Summary) -> Result<bool, (PackageId, ConflictReason)> {
+    /// A lock-only registration does not block a later real activation:
+    /// the real one upgrades the entry and proceeds (cargo expands every
+    /// activated package exactly once regardless of earlier lock-only
+    /// sightings).
+    fn flag_activated(
+        &mut self,
+        summary: &Summary,
+        lock_only: bool,
+    ) -> Result<bool, (PackageId, ConflictReason)> {
         let id = summary.id.clone();
         let age = self.age;
         let key = activation_key(&id);
         match self.activations.get(&key) {
-            Some((a, _)) => {
+            Some((a, _, is_lock_only)) => {
                 if a.id != id {
                     return Err((a.id.clone(), ConflictReason::Semver));
+                }
+                if *is_lock_only && !lock_only {
+                    // Upgrade: this package is really activated now; its
+                    // deps must be expanded.
+                    self.activations.insert(key, (summary.clone(), age, false));
+                    return Ok(false);
                 }
                 Ok(true)
             }
             None => {
-                self.activations.insert(key, (summary.clone(), age));
+                self.activations
+                    .insert(key, (summary.clone(), age, lock_only));
                 Ok(false)
             }
         }
@@ -615,6 +647,7 @@ pub fn resolve(
     crates: &dyn CrateSource,
     locals: &[LocalPackage],
     locked: &TongLock,
+    patched: &BTreeSet<String>,
 ) -> Result<Vec<ResolvedPackage>, ResolveError> {
     let t_resolve = std::time::Instant::now();
     let locals_map: BTreeMap<String, Summary> = locals
@@ -625,6 +658,7 @@ pub fn resolve(
         crates,
         locked,
         locals: &locals_map,
+        patched,
         deps_cache: BTreeMap::new(),
     };
 
@@ -640,22 +674,26 @@ pub fn resolve(
             .expect("locals map covers every local")
             .clone();
         debug!(target: "tong::lock", phase = "resolve.activate_local", package = %local.name, version = %local.version);
-        let frame = activate(&mut ctx, &mut queryer, None, summary).map_err(|err| match err {
-            ActivateError::Fatal(err) => err,
-            ActivateError::Conflict(id, reason) => ResolveError::Unresolvable {
-                chain: format!(
-                    "cannot activate local package `{} v{}`: {:?}",
-                    id.name, id.version, reason
-                ),
-            },
-        })?;
+        let frame =
+            activate(&mut ctx, &mut queryer, None, summary, true).map_err(|err| match err {
+                ActivateError::Fatal(err) => err,
+                ActivateError::Conflict(id, reason) => ResolveError::Unresolvable {
+                    chain: format!(
+                        "cannot activate local package `{} v{}`: {:?}",
+                        id.name, id.version, reason
+                    ),
+                },
+            })?;
         if let Some(frame) = frame {
             remaining_deps.push(frame);
         }
     }
 
     let mut iterations: u64 = 0;
-    while let Some((parent, (dep, candidates))) = remaining_deps.pop_most_constrained() {
+    while let Some((parent, info)) = remaining_deps.pop_most_constrained() {
+        let dep = &info.dep;
+        let candidates = &info.candidates;
+        let expand = info.expand;
         iterations += 1;
         if iterations.is_multiple_of(50_000) {
             warn!(
@@ -673,7 +711,7 @@ pub fn resolve(
 
         let mut conflicting_activations = ConflictMap::new();
         let mut backtracked = false;
-        let mut remaining_candidates = RemainingCandidates::new(&candidates);
+        let mut remaining_candidates = RemainingCandidates::new(candidates);
 
         loop {
             let next = remaining_candidates.next(&mut conflicting_activations, &ctx.activations);
@@ -683,7 +721,7 @@ pub fn resolve(
                     // All candidates exhausted: record the conflict set and
                     // backjump to the newest frame that can change it.
                     if !backtracked {
-                        past_conflicting.insert(&dep, &conflicting_activations);
+                        past_conflicting.insert(dep, &conflicting_activations);
                     }
                     match find_candidate(
                         &ctx,
@@ -708,7 +746,7 @@ pub fn resolve(
                                 iterations,
                                 duration_ms = t_resolve.elapsed().as_millis() as u64,
                             );
-                            return Err(activation_error(&parent, &dep, &conflicting_activations));
+                            return Err(activation_error(&parent, dep, &conflicting_activations));
                         }
                     }
                 }
@@ -745,7 +783,13 @@ pub fn resolve(
                 backtrack_frames = backtrack_stack.len(),
                 duration_ms = t_resolve.elapsed().as_millis() as u64,
             );
-            let res = activate(&mut ctx, &mut queryer, Some((&parent, &dep)), candidate);
+            let res = activate(
+                &mut ctx,
+                &mut queryer,
+                Some((&parent, dep)),
+                candidate,
+                expand,
+            );
 
             // If any of our frame's deps are known unresolvable, we are too
             // (cargo's `has_past_conflicting_dep` pruning).
@@ -755,7 +799,7 @@ pub fn resolve(
                 if let Some(conflicting) = frame
                     .remaining_siblings
                     .remaining()
-                    .find_map(|(new_dep, _)| past_conflicting.conflicting(&ctx, new_dep))
+                    .find_map(|info: &DepInfo| past_conflicting.conflicting(&ctx, &info.dep))
                 {
                     conflicting_activations.extend(
                         conflicting
@@ -830,17 +874,17 @@ pub fn resolve(
     let mut out: Vec<ResolvedPackage> = ctx
         .activations
         .values()
-        .map(|(summary, _)| {
+        .map(|(summary, _, _)| {
             let mut dependencies: Vec<(String, Version, Option<String>)> = ctx
                 .edges
                 .iter()
-                .filter(|(parent, _, _)| *parent == summary.id)
-                .map(|(_, dep, child)| {
+                .filter(|(parent, _, _, _)| *parent == summary.id)
+                .map(|(_, _, child, _)| {
                     let source = ctx
                         .activations
                         .get(&activation_key(child))
-                        .and_then(|(child_summary, _)| child_summary.source.clone());
-                    (dep.name.clone(), child.version.clone(), source)
+                        .and_then(|(child_summary, _, _)| child_summary.source.clone());
+                    (child.name.clone(), child.version.clone(), source)
                 })
                 .collect();
             dependencies.sort();
@@ -857,7 +901,34 @@ pub fn resolve(
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
-    check_cycles(&out)?;
+    // Dev-dependency edges are excluded from the cycle walk: cargo permits
+    // cycles that close through a dev edge (e.g. the tracing workspace:
+    // tracing dev-depends on tracing-mock, which normal-depends back).
+    // Dev-dependency edges and inactive optional (lock-only) edges are
+    // excluded from the cycle walk: cargo permits cycles through dev
+    // edges and never cycle-checks the lock-only closure (e.g. axum's
+    // full optional closure contains spurious cycles through inactive
+    // optional deps like rand's quickcheck).
+    let cycle_edges: BTreeSet<(NodeId, NodeId)> = ctx
+        .edges
+        .iter()
+        .filter(|(_, dep, _, expand)| !dep.dev && *expand)
+        .map(|(parent, _, child, _)| {
+            (
+                (
+                    parent.name.clone(),
+                    parent.version.clone(),
+                    parent.source.clone(),
+                ),
+                (
+                    child.name.clone(),
+                    child.version.clone(),
+                    child.source.clone(),
+                ),
+            )
+        })
+        .collect();
+    check_cycles(&out, &cycle_edges)?;
     println!("  resolved {} packages", out.len());
     info!(
         target: "tong::lock",
@@ -897,6 +968,16 @@ fn feature_closure(summary: &Summary, requested: Option<&RequestedFeatures>) -> 
     closure.seen = open.iter().cloned().collect();
     while let Some(feature) = open.pop() {
         let Some(references) = summary.features.get(&feature) else {
+            // Implicit feature: the name matches an optional dependency
+            // (crates.io index v2 omits implicit feature keys). Activating
+            // it enables the dep (deadpool-runtime's `tokio_1` feature is
+            // the implicit feature of its renamed optional tokio_1 dep).
+            if summary.deps.iter().any(|dep| {
+                dep.optional
+                    && (dep.name == feature || dep.package.as_deref() == Some(feature.as_str()))
+            }) {
+                closure.enabled.insert(feature.clone());
+            }
             continue;
         };
         for reference in references {
@@ -934,6 +1015,7 @@ fn activate(
     queryer: &mut Queryer<'_>,
     parent: Option<(&Summary, &ResolvedDep)>,
     candidate: Summary,
+    expand: bool,
 ) -> Result<Option<DepsFrame>, ActivateError> {
     ctx.age += 1;
     // Cargo's re-activation: a new request for a feature (or defaults)
@@ -943,8 +1025,12 @@ fn activate(
     // via axum's `time`) would keep the deps from the first edge only.
     let mut re_request = false;
     if let Some((parent_summary, dep)) = parent {
-        ctx.edges
-            .push((parent_summary.id.clone(), dep.clone(), candidate.id.clone()));
+        ctx.edges.push((
+            parent_summary.id.clone(),
+            dep.clone(),
+            candidate.id.clone(),
+            expand,
+        ));
         let requested = ctx.requested.entry(candidate.id.clone()).or_default();
         re_request = dep
             .features
@@ -955,7 +1041,7 @@ fn activate(
         requested.default_features |= dep.default_features;
     }
     let already = ctx
-        .flag_activated(&candidate)
+        .flag_activated(&candidate, !expand)
         .map_err(|(id, reason)| ActivateError::Conflict(id, reason))?;
     if already && !re_request {
         return Ok(None);
@@ -965,17 +1051,59 @@ fn activate(
     // semver's `crates-index` pull enormous test-only closures). Local
     // packages lock theirs (cargo semantics for workspace members).
     // Feature-aware optional deps (cargo `build_deps`): an optional dep
-    // is locked only when the requested features enable it. The lock is
-    // the active feature graph — which is why cargo's lock for axum+tokio
-    // is ~50 packages, not the ~800 of the full optional closure.
+    // is locked only when the requested features enable it.
     // `dep/feat` references inside the closure also request the dep's
     // feature (cargo `build_requirements`): tower's `log = ["tracing/log"]`
     // must request `log` on the tracing edge.
     let closure = feature_closure(&candidate, ctx.requested.get(&candidate.id));
+    // Cargo locks every dependency of a resolved package — inactive
+    // optional deps included (verified against real Cargo.lock files:
+    // clap_builder's `anstream` and toml's `indexmap` appear even with
+    // their features off). Only dev-dependencies of non-local packages
+    // stay out. Inactive optional deps are version-locked and recorded as
+    // edges but NOT expanded: their own optional closures do not cascade
+    // (that is what keeps anyhow's lock at ~40 packages instead of the
+    // full optional closure of everything reachable).
+    //
+    // A lock-only package's own dependencies are still recorded one
+    // level (indexmap's non-optional `equivalent`/`hashbrown` edges
+    // appear with `preserve_order` off) with the same closure filter
+    // (indexmap's `arbitrary`/`borsh` optional deps stay out).
+    if !expand {
+        let deps: Vec<ResolvedDep> = candidate
+            .deps
+            .iter()
+            .filter(|dep| !dep.dev || candidate.local)
+            .filter(|dep| {
+                !dep.optional
+                    || closure.enabled.contains(&dep.name)
+                    || closure.seen.contains(&dep.name)
+            })
+            .cloned()
+            .collect();
+        for dep in deps {
+            let summaries = queryer
+                .query(&candidate, &dep)
+                .map_err(ActivateError::Fatal)?;
+            if let Some(child) = summaries.first().cloned() {
+                ctx.edges
+                    .push((candidate.id.clone(), dep, child.id.clone(), false));
+                ctx.flag_activated(&child, true)
+                    .map_err(|(id, reason)| ActivateError::Conflict(id, reason))?;
+            }
+        }
+        return Ok(None);
+    }
     let mut deps: Vec<ResolvedDep> = candidate
         .deps
         .iter()
         .filter(|dep| !dep.dev || candidate.local)
+        // Cargo locks every dependency of workspace members (optional and
+        // dev included) but only activated optional deps of registry
+        // packages: the lock mirrors the activated feature graph for
+        // registry deps (indexmap's `arbitrary`/`borsh` stay out) while
+        // member locks are complete (clap_builder's `anstream` appears
+        // even with `color` off).
         .filter(|dep| {
             !dep.optional || closure.enabled.contains(&dep.name) || closure.seen.contains(&dep.name)
         })
@@ -995,14 +1123,22 @@ fn activate(
         let summaries = queryer
             .query(&candidate, &dep)
             .map_err(ActivateError::Fatal)?;
-        infos.push((dep, summaries));
+        let expand = !dep.optional
+            || closure.enabled.contains(&dep.name)
+            || closure.seen.contains(&dep.name);
+        infos.push(DepInfo {
+            dep,
+            candidates: summaries,
+            expand,
+        });
     }
     // Most constrained first (fewest candidates) — deterministic ties by
     // name via the DepsFrame ordering.
     infos.sort_by(|a, b| {
-        a.1.len()
-            .cmp(&b.1.len())
-            .then_with(|| a.0.name.cmp(&b.0.name))
+        a.candidates
+            .len()
+            .cmp(&b.candidates.len())
+            .then_with(|| a.dep.name.cmp(&b.dep.name))
     });
     Ok(Some(DepsFrame {
         parent: candidate,
@@ -1015,6 +1151,9 @@ struct Queryer<'a> {
     crates: &'a dyn CrateSource,
     locked: &'a TongLock,
     locals: &'a BTreeMap<String, Summary>,
+    /// Crate names replaced by `[patch]` path/git entries: registry
+    /// requirements on these names resolve to the patched local package.
+    patched: &'a BTreeSet<String>,
     deps_cache: BTreeMap<(String, String, String), Rc<Vec<Summary>>>,
 }
 
@@ -1031,9 +1170,10 @@ impl Queryer<'_> {
         parent: &Summary,
         dep: &ResolvedDep,
     ) -> Result<Rc<Vec<Summary>>, ResolveError> {
+        let crate_name = dep.package.as_deref().unwrap_or(&dep.name);
         let cache_key = (
             parent.id.name.clone(),
-            dep.name.clone(),
+            crate_name.to_owned(),
             dep.req
                 .as_ref()
                 .map(|req| req.to_string())
@@ -1045,30 +1185,44 @@ impl Queryer<'_> {
         let summaries: Vec<Summary> = match &dep.req {
             None => {
                 // Local edge: the target must be a local package.
-                let Some(summary) = self.locals.get(&dep.name) else {
+                let Some(summary) = self.locals.get(crate_name) else {
                     return Err(ResolveError::Unresolvable {
                         chain: format!(
                             "local dependency `{}` of `{}` names no workspace/path package",
-                            dep.name, parent.id.name
+                            crate_name, parent.id.name
                         ),
                     });
                 };
                 vec![summary.clone()]
             }
             Some(req) => {
+                // `[patch]`-replaced crates resolve to the patched local
+                // package (serde's root patches `serde`/`serde_core`/
+                // `serde_derive` to the workspace members; registry
+                // packages' edges on those names must use the member).
+                if self.patched.contains(crate_name)
+                    && let Some(summary) = self
+                        .locals
+                        .get(crate_name)
+                        .filter(|summary| req.matches(&summary.id.version))
+                {
+                    let summaries = Rc::new(vec![summary.clone()]);
+                    self.deps_cache.insert(cache_key, Rc::clone(&summaries));
+                    return Ok(summaries);
+                }
                 // The lock preference: any locked version that satisfies
                 // the requirement — with several locked versions the
                 // highest is preferred. Name-only lookups are gone: two
                 // locked versions of one crate must not alias.
                 let locked_version = self
                     .locked
-                    .candidates(&dep.name)
+                    .candidates(crate_name)
                     .filter(|p| req.matches(&p.version))
                     .map(|p| p.version.clone())
                     .max();
                 let mut versions: Vec<Summary> = self
                     .crates
-                    .versions(&dep.name)?
+                    .versions(crate_name)?
                     .into_iter()
                     .filter(|entry| req.matches(&entry.vers))
                     .filter(|entry| !entry.yanked || locked_version.as_ref() == Some(&entry.vers))
@@ -1101,7 +1255,8 @@ fn summary_from_index(entry: &IndexVersion) -> Summary {
                 .deps
                 .iter()
                 .map(|dep| ResolvedDep {
-                    name: dep.package.clone().unwrap_or_else(|| dep.name.clone()),
+                    name: dep.name.clone(),
+                    package: dep.package.clone(),
                     req: Some(dep.req.clone()),
                     optional: dep.optional,
                     dev: dep.kind == IndexDepKind::Dev,
@@ -1204,23 +1359,27 @@ fn activation_error(
 ///
 /// Package identity here is `(name, version, source)`: a local `foo` and a
 /// registry `foo` are different nodes, so edges can never attach to the
-/// wrong one.
+/// wrong one. The walk follows only non-dev edges (see the caller): cargo
+/// permits cycles that close through a dev-dependency edge.
 type NodeId = (String, Version, Option<String>);
 
-fn check_cycles(packages: &[ResolvedPackage]) -> Result<(), ResolveError> {
+fn check_cycles(
+    packages: &[ResolvedPackage],
+    cycle_edges: &BTreeSet<(NodeId, NodeId)>,
+) -> Result<(), ResolveError> {
     let mut checked: BTreeSet<NodeId> = BTreeSet::new();
     let mut path: Vec<NodeId> = Vec::new();
     let mut visited: BTreeSet<NodeId> = BTreeSet::new();
     for pkg in packages {
         let id: NodeId = (pkg.name.clone(), pkg.version.clone(), pkg.source.clone());
         if !checked.contains(&id) {
-            visit(packages, &id, &mut visited, &mut path, &mut checked)?;
+            visit(cycle_edges, &id, &mut visited, &mut path, &mut checked)?;
         }
     }
     return Ok(());
 
     fn visit(
-        packages: &[ResolvedPackage],
+        cycle_edges: &BTreeSet<(NodeId, NodeId)>,
         id: &NodeId,
         visited: &mut BTreeSet<NodeId>,
         path: &mut Vec<NodeId>,
@@ -1244,21 +1403,18 @@ fn check_cycles(packages: &[ResolvedPackage]) -> Result<(), ResolveError> {
         }
         if checked.insert(id.clone()) {
             path.push(id.clone());
-            for (dep, version, source) in package_by_id(packages, id).dependencies.clone() {
-                visit(packages, &(dep, version, source), visited, path, checked)?;
+            for (dep, version, source) in cycle_edges
+                .iter()
+                .filter(|(parent, _)| parent == id)
+                .map(|(_, child)| child.clone())
+            {
+                visit(cycle_edges, &(dep, version, source), visited, path, checked)?;
             }
             path.pop();
         }
         visited.remove(id);
         Ok(())
     }
-}
-
-fn package_by_id<'a>(packages: &'a [ResolvedPackage], id: &NodeId) -> &'a ResolvedPackage {
-    packages
-        .iter()
-        .find(|p| p.name == id.0 && p.version == id.1 && p.source == id.2)
-        .expect("edge target is a resolved package")
 }
 
 #[cfg(test)]
@@ -1307,6 +1463,7 @@ mod tests {
     fn edge(name: &str, req: &str) -> ResolvedDep {
         ResolvedDep {
             name: name.to_owned(),
+            package: None,
             req: Some(VersionReq::parse(req).unwrap()),
             optional: false,
             dev: false,
@@ -1363,6 +1520,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("tokio-macros", "*"), edge("matchers", "*")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         let syn = names(&packages, "syn");
@@ -1414,6 +1572,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("a", "*"), edge("b", "*")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap_err();
         assert!(matches!(err, ResolveError::Unresolvable { .. }), "{err}");
@@ -1443,6 +1602,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("a", "*"), edge("b", "*")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         // a requires c ^2 → c 2.0.0; b requires c ^1 → c 1.0.0. Both
@@ -1477,7 +1637,13 @@ mod tests {
                 dependencies: Vec::new(),
             }],
         };
-        let packages = resolve(&fixture, &[root(vec![edge("alpha", "^1")])], &locked).unwrap();
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("alpha", "^1")])],
+            &locked,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
         assert_eq!(alpha.version.to_string(), "1.2.0");
     }
@@ -1497,6 +1663,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("gamma", "*")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(names(&packages, "gamma"), vec!["1.1.0"]);
@@ -1515,7 +1682,13 @@ mod tests {
                 dependencies: Vec::new(),
             }],
         };
-        let packages = resolve(&fixture, &[root(vec![edge("gamma", "*")])], &locked).unwrap();
+        let packages = resolve(
+            &fixture,
+            &[root(vec![edge("gamma", "*")])],
+            &locked,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(names(&packages, "gamma"), vec!["1.0.0"]);
     }
 
@@ -1550,6 +1723,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("u", "*"), edge("v", "*"), edge("w", "*")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         let z = names(&packages, "z");
@@ -1618,6 +1792,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("serde", "*"), edge("serde_derive", "^1")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(names(&packages, "serde"), vec!["1.0.229"]);
@@ -1649,6 +1824,7 @@ mod tests {
             &fixture,
             &[root(vec![edge("a", "*")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap_err();
         assert!(
@@ -1657,11 +1833,13 @@ mod tests {
         );
     }
 
-    /// Optional deps are locked only when the requested features enable
-    /// them (cargo's feature-aware lockfile): the lock covers the active
-    /// feature graph, not the full optional closure.
+    /// Registry packages lock only activated optional deps (the lock
+    /// mirrors the activated feature graph for registry deps — indexmap's
+    /// `arbitrary` stays out of Cargo.lock); workspace members lock every
+    /// dependency (clap_builder's `anstream` appears even with `color`
+    /// off). Weak-referenced deps activate like strong ones.
     #[test]
-    fn optional_deps_follow_requested_features() {
+    fn optional_deps_lock_semantics_match_cargo() {
         // A package with an optional dep enabled only by a non-default
         // feature, and a default-feature optional dep.
         let with_optional = IndexVersion {
@@ -1711,11 +1889,13 @@ mod tests {
             ),
         ]));
 
-        // Default features only: `extra` stays out of the lock.
+        // Default features only: `extra` (a registry package's inactive
+        // optional dep) stays out of the lock.
         let packages = resolve(
             &fixture,
             &[root(vec![edge("pkg", "^1")])],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         let pkg = packages.iter().find(|p| p.name == "pkg").unwrap();
@@ -1727,7 +1907,13 @@ mod tests {
         // The `extra` feature requested on the edge: `extra` is locked.
         let mut deps = vec![edge("pkg", "^1")];
         deps[0].features.push("extra".to_owned());
-        let packages = resolve(&fixture, &[root(deps)], &TongLock::default()).unwrap();
+        let packages = resolve(
+            &fixture,
+            &[root(deps)],
+            &TongLock::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let pkg = packages.iter().find(|p| p.name == "pkg").unwrap();
         assert_eq!(
             pkg.dependencies,
@@ -1735,6 +1921,101 @@ mod tests {
                 ("base".to_owned(), Version::new(1, 0, 0), None),
                 ("extra".to_owned(), Version::new(1, 0, 0), None),
             ]
+        );
+    }
+
+    /// A local (workspace member) package locks its dev-dependencies but
+    /// only feature-activated optional deps (clap_builder's default
+    /// `color` locks `anstream`; a non-default optional dep stays out —
+    /// the wgpu-resolver fixture's `extra` is absent from cargo's
+    /// resolve).
+    #[test]
+    fn local_package_lock_semantics_match_cargo() {
+        let with_optional = IndexVersion {
+            name: "pkg".to_owned(),
+            vers: Version::parse("1.0.0").unwrap(),
+            deps: vec![
+                IndexDep {
+                    name: "base".to_owned(),
+                    req: VersionReq::parse("^1").unwrap(),
+                    features: Vec::new(),
+                    optional: false,
+                    default_features: true,
+                    target: None,
+                    kind: IndexDepKind::Normal,
+                    package: None,
+                },
+                IndexDep {
+                    name: "extra".to_owned(),
+                    req: VersionReq::parse("^1").unwrap(),
+                    features: Vec::new(),
+                    optional: true,
+                    default_features: true,
+                    target: None,
+                    kind: IndexDepKind::Normal,
+                    package: None,
+                },
+            ],
+            cksum: "pkg-1.0.0".to_owned(),
+            features: BTreeMap::from([("default".to_owned(), vec!["base".to_owned()])]),
+            features2: None,
+            rust_version: None,
+            yanked: false,
+            v: 1,
+        };
+        let fixture = Fixture(BTreeMap::from([
+            ("pkg".to_owned(), vec![with_optional]),
+            (
+                "base".to_owned(),
+                vec![Fixture::entry("base", "1.0.0", &[], false)],
+            ),
+            (
+                "extra".to_owned(),
+                vec![Fixture::entry("extra", "1.0.0", &[], false)],
+            ),
+        ]));
+        // The local root's inactive optional `extra` stays out of the
+        // lock (optional deps lock only when feature-activated), while
+        // the local root's dev-dependency IS locked (members' dev-deps
+        // are part of the lock).
+        let mut root_deps = vec![edge("pkg", "^1")];
+        root_deps.push(ResolvedDep {
+            name: "extra".to_owned(),
+            package: None,
+            req: Some(VersionReq::parse("^1").unwrap()),
+            optional: true,
+            dev: false,
+            features: Vec::new(),
+            default_features: true,
+        });
+        root_deps.push(ResolvedDep {
+            name: "base".to_owned(),
+            package: None,
+            req: Some(VersionReq::parse("^1").unwrap()),
+            optional: false,
+            dev: true,
+            features: Vec::new(),
+            default_features: true,
+        });
+        let packages = resolve(
+            &fixture,
+            &[root(root_deps)],
+            &TongLock::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let root = packages.iter().find(|p| p.name == "root").unwrap();
+        assert_eq!(
+            root.dependencies,
+            vec![
+                ("base".to_owned(), Version::new(1, 0, 0), None),
+                ("pkg".to_owned(), Version::new(1, 0, 0), None),
+            ]
+        );
+        let pkg = packages.iter().find(|p| p.name == "pkg").unwrap();
+        assert_eq!(
+            pkg.dependencies,
+            vec![("base".to_owned(), Version::new(1, 0, 0), None)]
         );
     }
 
@@ -1752,6 +2033,7 @@ mod tests {
                     source: Some("path+crates/app".to_owned()),
                     deps: vec![ResolvedDep {
                         name: "core".to_owned(),
+                        package: None,
                         req: None,
                         optional: false,
                         dev: false,
@@ -1767,6 +2049,7 @@ mod tests {
                 },
             ],
             &TongLock::default(),
+            &BTreeSet::new(),
         )
         .unwrap();
         let app = packages.iter().find(|p| p.name == "app").unwrap();
@@ -1800,8 +2083,20 @@ mod tests {
             ),
         ]));
         let deps = vec![edge("a", "*"), edge("b", "*")];
-        let first = resolve(&fixture, &[root(deps.clone())], &TongLock::default()).unwrap();
-        let second = resolve(&fixture, &[root(deps)], &TongLock::default()).unwrap();
+        let first = resolve(
+            &fixture,
+            &[root(deps.clone())],
+            &TongLock::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let second = resolve(
+            &fixture,
+            &[root(deps)],
+            &TongLock::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(first, second);
     }
 }
