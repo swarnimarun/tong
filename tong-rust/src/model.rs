@@ -723,6 +723,9 @@ pub struct ProfileSpec {
     pub strip: Option<String>,
     /// Whether rpath is passed to the linker (None = rustc default).
     pub rpath: Option<bool>,
+    /// `-C split-debuginfo` value: `none`, `unpacked`, or `packed`
+    /// (None = rustc default).
+    pub split_debuginfo: Option<String>,
 }
 
 /// LTO mode.
@@ -764,6 +767,7 @@ impl ProfileSpec {
             debug_assertions: Some(true),
             strip: None,
             rpath: None,
+            split_debuginfo: None,
         }
     }
 
@@ -779,6 +783,7 @@ impl ProfileSpec {
             debug_assertions: Some(false),
             strip: None,
             rpath: None,
+            split_debuginfo: None,
         }
     }
 
@@ -832,6 +837,10 @@ impl ProfileSpec {
         if let Some(units) = self.codegen_units {
             flags.push("-C".to_owned());
             flags.push(format!("codegen-units={units}"));
+        }
+        if let Some(split) = &self.split_debuginfo {
+            flags.push("-C".to_owned());
+            flags.push(format!("split-debuginfo={split}"));
         }
         flags
     }

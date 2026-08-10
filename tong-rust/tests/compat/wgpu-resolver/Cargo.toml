@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/*"]
+default-members = ["crates/app"]
+
+[workspace.dependencies]
+alpha = "=1.0.0"

@@ -1,0 +1,10 @@
+[package]
+name = "profiles"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+inherits = "dev"
+opt-level = 2
+split-debuginfo = "unpacked"
+incremental = true

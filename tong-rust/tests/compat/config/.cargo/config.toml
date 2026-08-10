@@ -1,0 +1,9 @@
+[env]
+APP_GREETING = { value = "hello", force = true }
+
+[build]
+rustflags = ["--cfg", "from_build_config"]
+
+[target.'cfg(unix)']
+rustflags = ["--cfg", "from_target_config"]
+linker = "cc"
