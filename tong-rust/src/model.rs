@@ -214,6 +214,9 @@ pub struct RustModel {
     pub feature_map: crate::features::FeatureMap,
     /// Cargo resolver semantics for feature resolution.
     pub resolver: ResolverVersion,
+    /// Workspace packages built by default (`[workspace] default_members`;
+    /// empty = every member).
+    pub default_members: Vec<PackageId>,
 }
 
 impl Default for RustModel {
@@ -227,6 +230,7 @@ impl Default for RustModel {
             global_env: BTreeMap::new(),
             feature_map: crate::features::FeatureMap::default(),
             resolver: ResolverVersion::V2,
+            default_members: Vec::new(),
         }
     }
 }
@@ -313,8 +317,12 @@ pub struct LibTarget {
 pub struct BinTarget {
     /// Output name.
     pub name: String,
+    /// rustc `--crate-name` (defaults to the sanitized target name).
+    pub crate_name: String,
     /// Crate root, relative to `dir`.
     pub path: PathBuf,
+    /// Features that must all be active for this target to build.
+    pub required_features: Vec<String>,
 }
 
 /// A test target (`[[test]]`, `[[bench]]`, or the auto-derived lib unit
@@ -327,6 +335,14 @@ pub struct TestTarget {
     pub path: PathBuf,
     /// Whether the target uses the libtest harness (`--test`).
     pub harness: bool,
+    /// Whether the target is a doc test (run via rustdoc; the run action
+    /// is planned in the action-parity wave).
+    pub doc: bool,
+    /// `true` makes the test-run action cacheable (native
+    /// `cache-test-result = true`); Cargo-imported runs stay uncached.
+    pub cache_test_result: bool,
+    /// Features that must all be active for this target to build.
+    pub required_features: Vec<String>,
 }
 
 /// A dependency edge on another package in the graph.
@@ -453,6 +469,117 @@ pub fn lib_crate_name(pkg: &Package) -> String {
 /// Sanitizes a package/target name for rustc (`--crate-name`).
 pub fn crate_name(name: &str) -> String {
     name.replace('-', "_")
+}
+
+impl Package {
+    /// A deterministic, label-independent rendering of the package's
+    /// manifest contribution.
+    ///
+    /// Native `Tong.toml` targets capture this instead of the raw manifest
+    /// file: renaming a `[target.<key>]` table (the graph label) never
+    /// changes the canonical form as long as the stable fields
+    /// (`package_name`, `version`, `crate_name`, `output_name`, deps,
+    /// features, …) stay unchanged — label renames stay digest-neutral.
+    /// Dependency edges are rendered as their resolved identities
+    /// (extern name + package name/version), never as label strings.
+    pub fn canonical_manifest(&self) -> String {
+        // Paths render relative to the package dir: absolute host paths
+        // never enter a digest (the backend resolves crate roots to
+        // absolute paths at model-build time).
+        let relative = |path: &Path| -> String {
+            path.strip_prefix(&self.dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut out = String::new();
+        out.push_str(&format!("[package]\nname = {}\n", toml_quote(&self.name)));
+        out.push_str(&format!("version = {}\n", toml_quote(&self.version)));
+        out.push_str(&format!(
+            "edition = {}\n",
+            toml_quote(self.edition.to_rustc())
+        ));
+        if let Some(script) = &self.build_script {
+            out.push_str(&format!(
+                "build_script = {}\n",
+                toml_quote(&relative(script))
+            ));
+        }
+        out.push_str(&format!("rustflags = {:?}\n", self.rustflags));
+        if !self.env.is_empty() {
+            out.push_str("env = [\n");
+            for (key, value) in &self.env {
+                out.push_str(&format!("  {} = {}\n", toml_quote(key), toml_quote(value)));
+            }
+            out.push_str("]\n");
+        }
+        out.push_str(&format!(
+            "features = [\n{}\n]\n",
+            self.features
+                .iter()
+                .map(|(name, refs)| format!("  {} = {:?}", toml_quote(name), refs))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        if let Some(lib) = &self.lib {
+            out.push_str("lib = {\n");
+            out.push_str(&format!(
+                "  crate_name = {},\n",
+                toml_quote(lib.name.as_deref().unwrap_or(""))
+            ));
+            out.push_str(&format!(
+                "  crate_types = {:?},\n",
+                lib.crate_types
+                    .iter()
+                    .map(|t| t.to_rustc())
+                    .collect::<Vec<_>>()
+            ));
+            out.push_str(&format!("  proc_macro = {},\n", lib.proc_macro));
+            out.push_str(&format!("  path = {},\n", toml_quote(&relative(&lib.path))));
+            out.push_str("}\n");
+        }
+        for bin in &self.bins {
+            out.push_str(&format!(
+                "bin = {{ name = {}, crate_name = {}, path = {}, required_features = {:?} }}\n",
+                toml_quote(&bin.name),
+                toml_quote(&bin.crate_name),
+                toml_quote(&relative(&bin.path)),
+                bin.required_features
+            ));
+        }
+        for test in &self.tests {
+            out.push_str(&format!(
+                "test = {{ name = {}, path = {}, harness = {}, doc = {}, cache_test_result = {}, required_features = {:?} }}\n",
+                toml_quote(&test.name),
+                toml_quote(&relative(&test.path)),
+                test.harness,
+                test.doc,
+                test.cache_test_result,
+                test.required_features
+            ));
+        }
+        for dep in self
+            .deps
+            .iter()
+            .chain(self.build_deps.iter())
+            .chain(self.dev_deps.iter())
+        {
+            out.push_str(&format!(
+                "dep = {{ extern = {}, package = {}, version = {}, optional = {}, default_features = {}, features = {:?} }}\n",
+                toml_quote(&dep.extern_name),
+                toml_quote(&dep.package.name),
+                toml_quote(&dep.package.version.to_string()),
+                dep.optional,
+                dep.default_features,
+                dep.features
+            ));
+        }
+        out
+    }
+}
+
+fn toml_quote(text: &str) -> String {
+    format!("{text:?}")
 }
 
 #[cfg(test)]

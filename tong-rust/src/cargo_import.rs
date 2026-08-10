@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use crate::model::{
     BinTarget, Dep, Edition, LibTarget, Lto, Package, PackageId, PanicStrategy, ProfileSpec,
-    RegistryEdge, ResolverVersion, RustModel, SourceId, TestTarget, lib_crate_name,
+    RegistryEdge, ResolverVersion, RustModel, SourceId, TestTarget, crate_name, lib_crate_name,
     source_rel_path,
 };
 
@@ -707,7 +707,9 @@ fn import_package(
         if manifest.bin.is_empty() && pkg.dir.join("src/main.rs").is_file() {
             pkg.bins.push(BinTarget {
                 name: package.name.clone(),
+                crate_name: crate_name(&package.name),
                 path: PathBuf::from("src/main.rs"),
+                required_features: Vec::new(),
             });
         }
         for bin in &manifest.bin {
@@ -724,7 +726,12 @@ fn import_package(
                 .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("src/bin/{name}.rs")));
-            pkg.bins.push(BinTarget { name, path });
+            pkg.bins.push(BinTarget {
+                name: name.clone(),
+                crate_name: crate_name(&name),
+                path,
+                required_features: Vec::new(),
+            });
         }
 
         // Test targets: [[test]] / [[bench]] entries whose source exists
@@ -759,6 +766,9 @@ fn import_package(
                     name,
                     path,
                     harness: target.harness.unwrap_or(true),
+                    doc: false,
+                    cache_test_result: false,
+                    required_features: Vec::new(),
                 });
                 let _ = kind;
             }
@@ -769,6 +779,9 @@ fn import_package(
                 name: lib_crate_name(&pkg),
                 path: lib.path.clone(),
                 harness: true,
+                doc: false,
+                cache_test_result: false,
+                required_features: Vec::new(),
             });
         }
 

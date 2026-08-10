@@ -354,7 +354,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(
             &tmp.path().join("Tong.toml"),
-            "[toolchain.rust]\nkind = \"dist\"\nversion = \"1.90.0\"\n\n[target.app]\nrule = \"rust_binary\"\n",
+            "schema = 1\n\n[toolchain.rust]\nkind = \"dist\"\nversion = \"1.90.0\"\n\n[target.app]\nrule = \"rust_binary\"\n",
         );
         let generated = generate(
             tmp.path(),
@@ -379,7 +379,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write(
             &tmp.path().join("Tong.toml"),
-            "[target.app]\nrule = \"rust_binary\"\n",
+            "schema = 1\n\n[target.app]\nrule = \"rust_binary\"\n",
         );
         let err = generate(
             tmp.path(),

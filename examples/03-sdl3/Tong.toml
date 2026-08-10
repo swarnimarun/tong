@@ -5,6 +5,8 @@
 # fingerprinted, and marked non-portable — this manifest points at this
 # machine's brew prefix.
 
+schema = 1
+
 [workspace]
 name = "sdl3-demo"
 
@@ -25,7 +27,8 @@ link_name = "SDL3.0"
 # Hand-written FFI bindings over SDL3 (a "simple bindings layer").
 [target.sdl3_sys]
 rule = "rust_library"
-crate_root = "crates/sdl3-sys/src/lib.rs"
+package_root = "crates/sdl3-sys"
+crate_root = "src/lib.rs"
 edition = "2021"
 deps = [":sdl3"]
 

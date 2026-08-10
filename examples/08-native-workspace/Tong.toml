@@ -1,7 +1,8 @@
 schema = 1
 
 [workspace]
-name = "hello"
+name = "native-workspace"
+members = ["crates/*", "tests"]
 
 [toolchain.rust]
 kind = "system"
@@ -9,8 +10,3 @@ kind = "system"
 [profile.dev]
 opt_level = 0
 debug = true
-
-[target.hello]
-rule = "rust_binary"
-crate_root = "src/main.rs"
-edition = "2021"

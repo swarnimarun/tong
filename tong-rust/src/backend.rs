@@ -92,6 +92,9 @@ struct Ctx {
     pkg_env: BTreeMap<String, String>,
     cc: Vec<(String, TreeDigest, String)>,
     profile_flags: Vec<String>,
+    /// `[policy] network = "allow"`: run actions may reach the network
+    /// and are uncacheable.
+    network_allow: bool,
 }
 
 enum CtxKind {
@@ -147,6 +150,8 @@ struct TestRunSpec {
     binary: String,
     harness: bool,
     args: Vec<String>,
+    /// `cache-test-result = true` (native) makes the run cacheable.
+    cache_test_result: bool,
 }
 
 /// The Rust backend: plans actions from a [`RustModel`].
@@ -166,6 +171,9 @@ pub struct RustBackend<'a> {
     planned_ids: BTreeMap<String, ActionId>,
     /// Whether test targets are planned and run (`tong test`).
     tests_enabled: bool,
+    /// `[policy] network = "allow"`: run actions may reach the network
+    /// and are uncacheable.
+    network_allow: bool,
     /// Arguments passed to the test binaries (after `--`).
     test_args: Vec<String>,
     /// Build-state store, for rerun-if-changed input narrowing (the
@@ -205,6 +213,7 @@ impl<'a> RustBackend<'a> {
             &[],
             state,
             project_hash,
+            false,
         )
     }
 
@@ -227,6 +236,7 @@ impl<'a> RustBackend<'a> {
             test_args,
             None,
             None,
+            false,
         )
     }
 
@@ -241,6 +251,7 @@ impl<'a> RustBackend<'a> {
         test_args: &[String],
         state: Option<tong_store::StateStore>,
         project_hash: Option<tong_core::digest::Digest>,
+        network_allow: bool,
     ) -> Result<Self, PlanError> {
         let profile = model
             .profiles
@@ -259,6 +270,7 @@ impl<'a> RustBackend<'a> {
             cc_closure: BTreeMap::new(),
             planned_ids: BTreeMap::new(),
             tests_enabled,
+            network_allow,
             test_args: test_args.to_vec(),
             state,
             project_hash,
@@ -270,8 +282,35 @@ impl<'a> RustBackend<'a> {
         // 1. Capture package source trees once (PLAN.md section 8.3: whole
         //    package tree, excluding known output directories).
         for pkg in &self.model.packages {
-            let excludes = CAPTURE_EXCLUDES.iter().copied().collect();
+            let mut excludes = CAPTURE_EXCLUDES.iter().copied().collect();
             let mut tree = self.cas.capture_dir_filtered(&pkg.dir, &excludes)?;
+
+            // Native packages replace the raw `Tong.toml` with its
+            // canonical, label-independent rendering: `[target.<key>]`
+            // table renames (graph labels) are digest-neutral as long as
+            // the stable fields stay unchanged.
+            if pkg.dir.join("Tong.toml").is_file() {
+                excludes.insert("Tong.toml");
+                tree = self.cas.capture_dir_filtered(&pkg.dir, &excludes)?;
+                let blob = self.cas.put_blob(pkg.canonical_manifest().as_bytes())?;
+                let manifest_tree = Tree::new(
+                    [(
+                        "Tong.toml".to_owned(),
+                        TreeEntry::File {
+                            digest: blob,
+                            executable: false,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
+                .map_err(|err| PlanError::Message(format!("invalid tree: {err}")))?;
+                let manifest_tree = self.cas.put_tree(&manifest_tree)?;
+                tree = self.cas.assemble(&[
+                    (RelativePath::new(".").unwrap(), tree),
+                    (RelativePath::new("Tong.toml").unwrap(), manifest_tree),
+                ])?;
+            }
 
             // Tong.toml targets may reference crate roots outside the
             // package dir (e.g. a shared bindings crate in another
@@ -421,6 +460,9 @@ impl<'a> RustBackend<'a> {
             .cloned();
 
         for target in &pkg.tests {
+            if !self.required_features_active(pkg, &target.required_features) {
+                continue;
+            }
             // deps + dev-deps + the package's own library.
             let mut deps = pkg.deps.clone();
             deps.extend(pkg.dev_deps.iter().cloned());
@@ -468,6 +510,7 @@ impl<'a> RustBackend<'a> {
                     binary: target.name.clone(),
                     harness: target.harness,
                     args: self.test_args.clone(),
+                    cache_test_result: target.cache_test_result,
                 }),
                 source_tree,
                 rustc: self.toolchain.rustc_blob,
@@ -477,6 +520,7 @@ impl<'a> RustBackend<'a> {
                 pkg_env: pkg.env.clone(),
                 cc: Vec::new(),
                 profile_flags: Vec::new(),
+                network_allow: self.network_allow,
             };
             actions.push(self.boxed(run_ctx));
             let _ = &run_id;
@@ -698,6 +742,7 @@ impl<'a> RustBackend<'a> {
                 },
                 cc: Vec::new(),
                 profile_flags: self.profile.rustc_flags(),
+                network_allow: self.network_allow,
             };
             self.planned_ids
                 .insert(format!("bs-run:{}", self.pkg_key(pkg)), run_id.clone());
@@ -770,6 +815,9 @@ impl<'a> RustBackend<'a> {
             .cloned();
 
         for bin in &pkg.bins {
+            if !self.required_features_active(pkg, &bin.required_features) {
+                continue;
+            }
             let mut deps = pkg.deps.clone();
             if pkg.lib.is_some() {
                 deps.insert(
@@ -792,7 +840,7 @@ impl<'a> RustBackend<'a> {
                 pkg,
                 source_tree,
                 cc.clone(),
-                crate_name(&bin.name),
+                bin.crate_name.clone(),
                 "bin",
                 Some(bin.name.clone()),
                 &deps,
@@ -967,11 +1015,23 @@ impl<'a> RustBackend<'a> {
             },
             cc,
             profile_flags: profile_flags.clone(),
+            network_allow: self.network_allow,
         };
         let id = ctx.logical_id.clone();
         self.planned_ids.insert(key.to_owned(), id.clone());
         actions.push(self.boxed(ctx));
         Ok(id)
+    }
+
+    /// Whether every feature in `required` is active on the package
+    /// (Cargo `required-features`: targets with unmet requirements are not
+    /// built).
+    fn required_features_active(&self, pkg: &Package, required: &[String]) -> bool {
+        if required.is_empty() {
+            return true;
+        }
+        let active = self.model.feature_map.features_for(&pkg.id, false);
+        required.iter().all(|feature| active.contains(feature))
     }
 
     /// Whether a package belongs to the workspace (`model.members`);
@@ -1652,9 +1712,13 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             })?],
             CtxKind::BuildScriptRun(_) | CtxKind::TestRun(_) => Vec::new(),
         };
-    // Test runs are never cached (test-result caching is PLAN Phase 8).
+    // Test runs are never cached unless the native manifest opted in via
+    // `cache-test-result = true`. Run actions under `[policy] network =
+    // "allow"` may reach the network and are therefore uncacheable.
     let cache_policy = match &ctx.kind {
+        CtxKind::TestRun(spec) if spec.cache_test_result => CachePolicy::Enabled,
         CtxKind::TestRun(_) => CachePolicy::NoCache,
+        _ if ctx.network_allow => CachePolicy::NoCache,
         _ => CachePolicy::Enabled,
     };
 
@@ -1672,7 +1736,11 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
         execution_platform: host_platform(),
         target_platform: None,
         timeout: None,
-        network_policy: NetworkPolicy::Deny,
+        network_policy: if ctx.network_allow {
+            NetworkPolicy::Allow
+        } else {
+            NetworkPolicy::Deny
+        },
         cache_policy,
         resource_requirements: ResourceRequirements::default(),
         properties: ctx.properties.clone(),

@@ -1,0 +1,10 @@
+schema = 1
+
+[target.integration]
+rule = "rust_test"
+package_name = "integration"
+crate_root = "integration.rs"
+version = "0.1.0"
+edition = "2021"
+deps = ["//crates/core:core"]
+dev_deps = ["//crates/extra:extra"]

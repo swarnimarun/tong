@@ -1,0 +1,9 @@
+schema = 1
+
+[target.core]
+rule = "rust_library"
+package_name = "core"
+version = "0.1.0"
+edition = "2021"
+features = { extra = ["dep:extra"] }
+deps = [{ label = "//crates/extra:extra", alias = "extra", optional = true }]

@@ -1,0 +1,7 @@
+schema = 1
+
+[target.extra]
+rule = "rust_library"
+package_name = "extra"
+version = "0.1.0"
+edition = "2021"

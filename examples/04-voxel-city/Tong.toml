@@ -5,6 +5,8 @@
 # Prerequisite: SDL3 installed via Homebrew (`brew install sdl3`); the
 # library is system-captured and non-portable (PLAN.md section 5).
 
+schema = 1
+
 [workspace]
 name = "voxel-city"
 
@@ -25,7 +27,8 @@ link_name = "SDL3.0"
 # exec root and compiles it from there.
 [target.sdl3_sys]
 rule = "rust_library"
-crate_root = "../03-sdl3/crates/sdl3-sys/src/lib.rs"
+package_root = "../03-sdl3/crates/sdl3-sys"
+crate_root = "src/lib.rs"
 edition = "2021"
 deps = [":sdl3"]
 

@@ -149,7 +149,7 @@ fn dockerfile_command_native_pinned_version_defaults_base() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         &tmp.path().join("Tong.toml"),
-        "[toolchain.rust]\nkind = \"dist\"\nversion = \"1.90.0\"\n\n[target.app]\nrule = \"rust_binary\"\n",
+        "schema = 1\n\n[toolchain.rust]\nkind = \"dist\"\nversion = \"1.90.0\"\n\n[target.app]\nrule = \"rust_binary\"\n",
     );
     let out = tmp.path().join("docker");
     let output = run_tong(
@@ -173,7 +173,7 @@ fn dockerfile_command_requires_base_without_pinned_version() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         &tmp.path().join("Tong.toml"),
-        "[target.app]\nrule = \"rust_binary\"\n",
+        "schema = 1\n\n[target.app]\nrule = \"rust_binary\"\n",
     );
     let output = run_tong(tmp.path(), &["dockerfile"]);
     assert!(!output.status.success());

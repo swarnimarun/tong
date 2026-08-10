@@ -1,9 +1,11 @@
 //! `Tong.toml` manifest loading.
 //!
-//! The canonical build description (PLAN.md section 6.1). Version 1 carries
-//! the workspace, the (system-captured) toolchain, named profiles, and
-//! named targets. Target rules are interpreted by backends; the graph layer
-//! only models the file.
+//! The canonical build description (PLAN.md section 6.1). Version 1
+//! (`schema = 1`, required) carries the workspace (root package plus
+//! member manifests with glob lists), the toolchain, named profiles, and
+//! named targets. Target rules are interpreted by backends; the graph
+//! layer only models the file. A missing or unsupported schema is an
+//! error — never guessed.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,11 +14,16 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+/// The supported manifest schema version.
+pub const MANIFEST_SCHEMA: u32 = 1;
+
 /// A parsed `Tong.toml`.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// Workspace metadata.
+    /// Required schema version (`schema = 1`).
+    pub schema: Option<u32>,
+    /// Workspace metadata: members and default members (globs).
     #[serde(default)]
     pub workspace: Workspace,
     /// Toolchain configuration.
@@ -34,7 +41,7 @@ pub struct Manifest {
     /// Registry configuration (`[registry]`): the index URL.
     #[serde(default)]
     pub registry: Option<RegistryConfig>,
-    /// Execution policy (`[policy]`): sandbox level.
+    /// Execution policy (`[policy]`): sandbox level, network access.
     #[serde(default)]
     pub policy: Option<PolicyConfig>,
 }
@@ -42,12 +49,16 @@ pub struct Manifest {
 /// Execution policy configuration (`[policy]`).
 ///
 /// Sandboxing is opt-in (default `l1` — clean environment) until certified
-/// per platform (PLAN.md section 11).
+/// per platform (PLAN.md section 11). Network access is denied by default;
+/// `network = "allow"` lets run actions reach the network and makes them
+/// uncacheable.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Sandbox level: `l1`, `l2`, `l3`, or `l4`.
     pub sandbox: Option<String>,
+    /// Network access for run actions: `"deny"` (default) or `"allow"`.
+    pub network: Option<String>,
 }
 
 /// Registry configuration (`[registry]`).
@@ -68,12 +79,30 @@ impl Manifest {
         let path = dir.join("Tong.toml");
         let text = fs::read_to_string(&path)
             .map_err(|err| ManifestError::Io(path.display().to_string(), err))?;
-        Self::parse(&text).map_err(|err| ManifestError::Parse(path.display().to_string(), err))
+        let manifest: Manifest = toml::from_str(&text)
+            .map_err(|err| ManifestError::Parse(path.display().to_string(), err))?;
+        Self::validate(manifest).map_err(ManifestError::Schema)
     }
 
-    /// Parses manifest text.
-    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
+    /// Parses manifest text (pathless; used by tests).
+    pub fn parse(text: &str) -> Result<Self, ManifestError> {
+        let manifest: Manifest =
+            toml::from_str(text).map_err(|err| ManifestError::Parse(String::new(), err))?;
+        Self::validate(manifest).map_err(ManifestError::Schema)
+    }
+
+    /// Enforces the required schema version — never guessed.
+    fn validate(manifest: Manifest) -> Result<Self, String> {
+        if manifest.schema != Some(MANIFEST_SCHEMA) {
+            return Err(match manifest.schema {
+                Some(schema) => format!(
+                    "Tong.toml schema {schema} is not supported (this Tong speaks \
+                     schema = {MANIFEST_SCHEMA})"
+                ),
+                None => format!("Tong.toml requires schema = {MANIFEST_SCHEMA}"),
+            });
+        }
+        Ok(manifest)
     }
 }
 
@@ -83,6 +112,13 @@ impl Manifest {
 pub struct Workspace {
     /// Workspace display name.
     pub name: Option<String>,
+    /// Member directories (globs like `crates/*`); each member has its
+    /// own `Tong.toml` with package-local targets.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Members built by default; absent = all members.
+    #[serde(default)]
+    pub default_members: Vec<String>,
 }
 
 /// Toolchain configuration.
@@ -103,6 +139,11 @@ pub struct RustToolchain {
     pub kind: String,
     /// Dist toolchain version (e.g. `1.90.0`); required for `dist`.
     pub version: Option<String>,
+    /// Additional rustup target triples the workspace builds for. The
+    /// host triple is always available; a missing listed target fails
+    /// before planning with the `tong toolchain fetch rust` remedy.
+    #[serde(default)]
+    pub targets: Vec<String>,
 }
 
 impl Default for RustToolchain {
@@ -110,6 +151,7 @@ impl Default for RustToolchain {
         Self {
             kind: "system".to_owned(),
             version: None,
+            targets: Vec::new(),
         }
     }
 }
@@ -187,42 +229,94 @@ pub struct StoreConfig {
     pub max_size: Option<String>,
 }
 
+/// A target dependency: a bare label string, or a table with an alias,
+/// feature selection, and optionality.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TargetDepConfig {
+    /// `deps = [":core"]` — non-optional, default features.
+    Label(String),
+    /// `deps = [{ label = "//crates/core:core", alias = "core",
+    /// optional = true, default_features = false, features = ["serde"] }]`.
+    Table {
+        /// The target label (`:local`, `//member/path:name`,
+        /// `//member/path`).
+        label: String,
+        /// `--extern` name (defaults to the target name).
+        alias: Option<String>,
+        /// Optional dependency (activated via features).
+        optional: Option<bool>,
+        /// Disable the dependency's default feature (Cargo's
+        /// `default-features` is accepted as an alias).
+        #[serde(alias = "default-features")]
+        default_features: Option<bool>,
+        /// Features requested on the dependency.
+        features: Option<Vec<String>>,
+    },
+}
+
 /// A named target.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
-    /// Backend rule name, e.g. `rust_binary`, `rust_library`,
-    /// `rust_proc_macro`, `cc_import`.
+    /// Backend rule name: `rust_binary`, `rust_library`, `rust_proc_macro`,
+    /// `rust_test`, `rust_example`, `rust_bench`, `rust_doc_test`, or
+    /// `cc_import`. Unknown rules are hard errors.
     pub rule: String,
-    /// Crate root source file, relative to the workspace root.
+    /// Stable package presentation name (defaults to the target key).
+    /// Renaming the table key is digest-neutral when these stable fields
+    /// stay unchanged.
+    pub package_name: Option<String>,
+    /// Package version (defaults to `0.0.0`).
+    pub version: Option<String>,
+    /// rustc `--crate-name` (defaults to the sanitized package name).
+    pub crate_name: Option<String>,
+    /// Assembled binary name (defaults to the target key).
+    pub output_name: Option<String>,
+    /// Crate root source file, resolved beneath `package_root`.
     pub crate_root: Option<String>,
     /// Rust edition: `2015`, `2018`, `2021`, or `2024`.
     pub edition: Option<String>,
-    /// Dependencies as labels (`:name`).
+    /// Package root directory (defaults to the containing manifest's
+    /// directory); `crate_root`, `build_script`, and `cc_import.shared`
+    /// resolve beneath it.
+    pub package_root: Option<String>,
+    /// Dependencies as labels or structured tables.
     #[serde(default)]
-    pub deps: Vec<String>,
-    /// Dev-dependencies as labels (`:name`) — used by `rust_test` targets.
+    pub deps: Vec<TargetDepConfig>,
+    /// Dev-dependencies (used by test/example targets).
     #[serde(default)]
-    pub dev_deps: Vec<String>,
+    pub dev_deps: Vec<TargetDepConfig>,
     /// Extra rustc flags.
     #[serde(default)]
     pub rustflags: Vec<String>,
     /// Per-target environment variables.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Features to activate on this target.
+    /// Declared features: feature name → references (`dep:x`, `x/feat`,
+    /// `x?/feat`, plain names).
     #[serde(default)]
-    pub features: Vec<String>,
-    /// Whether the target's default feature is enabled.
-    pub default_features: Option<bool>,
-    /// Build-script source, relative to the workspace root.
+    pub features: BTreeMap<String, Vec<String>>,
+    /// Build-script source, resolved beneath `package_root`.
     pub build_script: Option<String>,
     /// Crate types for a library target.
     #[serde(default)]
     pub crate_types: Vec<String>,
     /// Compile as a proc macro.
     pub proc_macro: Option<bool>,
-    /// `cc_import`: path to the shared library to import.
+    /// Features that must all be active for this target to build (Cargo's
+    /// `required-features` is accepted as an alias).
+    #[serde(alias = "required-features")]
+    pub required_features: Option<Vec<String>>,
+    /// Whether a test/bench target uses the libtest harness.
+    pub harness: Option<bool>,
+    /// `true` makes a test-run action cacheable (default `false`: test
+    /// runs re-execute every time; Cargo's `cache-test-result` is accepted
+    /// as an alias).
+    #[serde(alias = "cache-test-result")]
+    pub cache_test_result: Option<bool>,
+    /// `cc_import`: path to the shared library to import (resolved
+    /// beneath `package_root`).
     pub shared: Option<String>,
     /// `cc_import`: `-l` link name.
     pub link_name: Option<String>,
@@ -233,15 +327,24 @@ pub struct TargetConfig {
 pub enum ManifestError {
     /// The file could not be read.
     Io(String, io::Error),
-    /// The file was not valid TOML or failed schema validation.
+    /// The file was not valid TOML.
     Parse(String, toml::de::Error),
+    /// The schema version is missing or unsupported.
+    Schema(String),
 }
 
 impl std::fmt::Display for ManifestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(path, err) => write!(f, "cannot read {path}: {err}"),
-            Self::Parse(path, err) => write!(f, "cannot parse {path}: {err}"),
+            Self::Parse(path, err) => {
+                if path.is_empty() {
+                    write!(f, "cannot parse Tong.toml: {err}")
+                } else {
+                    write!(f, "cannot parse {path}: {err}")
+                }
+            }
+            Self::Schema(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -253,11 +356,14 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"
+schema = 1
+
 [workspace]
 name = "hello"
 
 [toolchain.rust]
 kind = "system"
+targets = ["aarch64-apple-darwin"]
 
 [profile.release]
 opt_level = 3
@@ -268,38 +374,100 @@ overflow_checks = false
 
 [target.hello]
 rule = "rust_binary"
+package_name = "hello-app"
+version = "1.2.3"
+crate_name = "hello_app"
+output_name = "hello-bin"
 crate_root = "src/main.rs"
 edition = "2021"
-deps = [":greet"]
+deps = [
+  { label = ":greet", alias = "greet", features = ["serde"] },
+]
 rustflags = ["-D", "warnings"]
 env = { GREETING = "hello" }
+
+[target.greet]
+rule = "rust_library"
 "#;
 
     #[test]
     fn parses_valid_manifest() {
         let manifest = Manifest::parse(VALID).unwrap();
+        assert_eq!(manifest.schema, Some(1));
         assert_eq!(manifest.workspace.name.as_deref(), Some("hello"));
         assert_eq!(manifest.toolchain.rust.kind, "system");
+        assert_eq!(
+            manifest.toolchain.rust.targets,
+            vec!["aarch64-apple-darwin".to_owned()]
+        );
         let release = manifest.profile.get("release").unwrap();
         assert_eq!(release.opt_level.as_ref().unwrap().to_rustc(), "3");
         assert_eq!(release.lto, Some(Lto::Str("thin".to_owned())));
         assert_eq!(release.panic.as_deref(), Some("abort"));
         let hello = manifest.target.get("hello").unwrap();
         assert_eq!(hello.rule, "rust_binary");
-        assert_eq!(hello.deps, vec![":greet"]);
+        assert_eq!(hello.package_name.as_deref(), Some("hello-app"));
+        assert_eq!(hello.crate_name.as_deref(), Some("hello_app"));
+        assert_eq!(hello.output_name.as_deref(), Some("hello-bin"));
+        match &hello.deps[0] {
+            TargetDepConfig::Table {
+                label,
+                alias,
+                features,
+                ..
+            } => {
+                assert_eq!(label, ":greet");
+                assert_eq!(alias.as_deref(), Some("greet"));
+                assert_eq!(
+                    features.as_deref(),
+                    Some(vec!["serde".to_owned()].as_slice())
+                );
+            }
+            _ => panic!("structured dep"),
+        }
         assert_eq!(hello.rustflags, vec!["-D", "warnings"]);
         assert_eq!(hello.env.get("GREETING").unwrap(), "hello");
     }
 
     #[test]
+    fn requires_schema() {
+        let err = Manifest::parse("[workspace]\nname = \"x\"\n").unwrap_err();
+        assert!(err.to_string().contains("requires schema = 1"), "{err}");
+        let err = Manifest::parse("schema = 2\n").unwrap_err();
+        assert!(err.to_string().contains("schema 2"), "{err}");
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
-        let err = Manifest::parse("[workspace]\nname = \"x\"\nunknown = 1\n").unwrap_err();
+        let err =
+            Manifest::parse("schema = 1\n[workspace]\nname = \"x\"\nunknown = 1\n").unwrap_err();
         assert!(err.to_string().contains("unknown"), "{err}");
     }
 
     #[test]
-    fn unknown_target_rules_are_a_backend_concern() {
-        let manifest = Manifest::parse("[target.x]\nrule = \"future_rule\"\n").unwrap();
-        assert_eq!(manifest.target["x"].rule, "future_rule");
+    fn parses_members_and_policy() {
+        let manifest = Manifest::parse(
+            r#"
+schema = 1
+
+[workspace]
+name = "ws"
+members = ["crates/*", "apps/cli"]
+
+[policy]
+sandbox = "l2"
+network = "allow"
+"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.workspace.members, vec!["crates/*", "apps/cli"]);
+        assert_eq!(
+            manifest.policy.as_ref().unwrap().network.as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            manifest.policy.as_ref().unwrap().sandbox.as_deref(),
+            Some("l2")
+        );
     }
 }

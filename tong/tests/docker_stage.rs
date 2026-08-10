@@ -305,7 +305,7 @@ fn deps_only_native_mode_skips_everything_then_full_build_works() {
     let dir = tmp.path();
     fs::write(
         dir.join("Tong.toml"),
-        "[target.app]\nrule = \"rust_binary\"\n",
+        "schema = 1\n\n[target.app]\nrule = \"rust_binary\"\n",
     )
     .unwrap();
     fs::create_dir_all(dir.join("src")).unwrap();

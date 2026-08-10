@@ -775,6 +775,36 @@ fn prepare(
     executor.register_system_tool(toolchain.rustc_blob, toolchain.rustc.clone());
     executor.register_bundle_root(toolchain.bundle.digest(), toolchain.root.clone());
 
+    // `[policy] network = "allow"`: run actions may reach the network and
+    // are uncacheable.
+    let network_allow = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.policy.as_ref())
+        .and_then(|policy| policy.network.as_deref())
+        .is_some_and(|network| network == "allow");
+
+    // `[toolchain.rust] targets`: the host is always available; a listed
+    // non-host target needs the dist toolchain for that triple before
+    // planning (cross-target planning lands with the action-parity wave).
+    if let Some(manifest) = &manifest {
+        for target in &manifest.toolchain.rust.targets {
+            if target != &toolchain.host_triple {
+                let version = manifest
+                    .toolchain
+                    .rust
+                    .version
+                    .as_deref()
+                    .unwrap_or("(system toolchain)");
+                return Err(BuildError::Toolchain(ToolchainError::Missing(format!(
+                    "toolchain target {target} is not available; run \
+                     `tong toolchain fetch rust --version {version} --target {target}` \
+                     and pin `[toolchain.rust] version` (cross-target planning is \
+                     not supported yet)"
+                ))));
+            }
+        }
+    }
+
     // Plan.
     let state = tong_store::StateStore::open(&store)?;
     let project_hash = tong_store::project_hash(root).ok();
@@ -787,6 +817,7 @@ fn prepare(
         test_args,
         Some(state),
         project_hash,
+        network_allow,
     )?;
     let planned = backend.plan()?;
     let artifacts = backend.final_artifacts();
@@ -991,15 +1022,11 @@ fn feature_requests(
                         "target {name:?} produced no feature-bearing package"
                     ))
                 })?;
-            let mut features = target.features.clone();
-            features.extend(options.features.features.iter().cloned());
-            let default_features = if options.features.all_features {
-                true
-            } else if options.features.no_default_features {
-                false
-            } else {
-                target.default_features.unwrap_or(true)
-            };
+            let mut features = options.features.features.clone();
+            if options.features.all_features {
+                features.extend(target.features.keys().cloned());
+            }
+            let default_features = !options.features.no_default_features;
             requests.push(tong_rust::FeatureRequest {
                 package: id,
                 features,
@@ -1031,15 +1058,19 @@ fn feature_requests(
     }
     if requests.is_empty() {
         // No selection matched (or an empty native manifest): fall back to
-        // all members so the feature map still covers the graph.
-        for package in &model.packages {
-            if model.members.contains(&package.id) {
-                requests.push(tong_rust::FeatureRequest {
-                    package: package.id.clone(),
-                    features: Vec::new(),
-                    default_features: true,
-                });
-            }
+        // all members so the feature map still covers the graph
+        // (`[workspace] default_members` narrows the set when declared).
+        let fallback: Vec<&tong_rust::PackageId> = if !model.default_members.is_empty() {
+            model.default_members.iter().collect()
+        } else {
+            model.members.iter().collect()
+        };
+        for id in fallback {
+            requests.push(tong_rust::FeatureRequest {
+                package: id.clone(),
+                features: Vec::new(),
+                default_features: true,
+            });
         }
     }
     Ok(requests)
@@ -1062,7 +1093,7 @@ pub fn load_model(
     sources: &dyn tong_rust::LockedSourceProvider,
 ) -> Result<tong_rust::RustModel, BuildError> {
     if let Some(manifest) = manifest {
-        Ok(manifest_to_model(manifest, root))
+        manifest_to_model(manifest, root).map_err(BuildError::Manifest)
     } else if root.join("Cargo.toml").exists() {
         // Target-specific deps need the host triple; a single `rustc -vV`
         // query is far cheaper than the full toolchain capture.

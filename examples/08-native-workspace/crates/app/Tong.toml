@@ -1,0 +1,12 @@
+schema = 1
+
+[target.app]
+rule = "rust_binary"
+package_name = "web-app"
+version = "0.1.0"
+crate_name = "web_app"
+output_name = "web-app"
+edition = "2021"
+# The dep table activates core's optional `extra` feature across members:
+# core then compiles and links the optional `extra` dependency.
+deps = [{ label = "//crates/core:core", alias = "core", features = ["extra"] }]

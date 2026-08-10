@@ -299,7 +299,7 @@ fn offline_build_rejects_missing_pinned_toolchain() {
     let ws = native.path();
     fs::write(
         ws.join("Tong.toml"),
-        "[workspace]\nname = \"app\"\n\n[toolchain.rust]\nkind = \"dist\"\nversion = \"9.9.9\"\n",
+        "schema = 1\n\n[workspace]\nname = \"app\"\n\n[toolchain.rust]\nkind = \"dist\"\nversion = \"9.9.9\"\n",
     )
     .unwrap();
     fs::create_dir_all(ws.join("src")).unwrap();
