@@ -269,9 +269,13 @@ struct Report {
 struct EntryReport {
     tier: String,
     rev: String,
+    #[serde(default)]
     resolver: Option<GateResult>,
+    #[serde(default)]
     build: Option<GateResult>,
+    #[serde(default)]
     skip: Option<String>,
+    #[serde(default)]
     divergence: Option<String>,
 }
 
@@ -849,6 +853,20 @@ mod tests {
             normalize_source("git+https://github.com/tokio-rs/tokio#abc123"),
             "git+https://github.com/tokio-rs/tokio#abc123"
         );
+    }
+
+    #[test]
+    fn older_reports_without_divergence_still_load() {
+        // A report written before the `divergence` field existed must
+        // deserialize (all optional fields default) instead of resetting
+        // the accumulated report on the next run.
+        let text = r#"{"schema":1,"generated":"","platform":"x","entries":{"entry":{"tier":"required","rev":"abc","resolver":{"status":"fail","detail":"x","duration_ms":1}}}}"#;
+        let report: Report = serde_json::from_str(text).expect("old report loads");
+        let entry = &report.entries["entry"];
+        assert_eq!(entry.tier, "required");
+        assert!(entry.divergence.is_none());
+        assert!(entry.skip.is_none());
+        assert!(entry.build.is_none());
     }
 
     #[test]
