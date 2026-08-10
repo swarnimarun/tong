@@ -30,7 +30,8 @@ use tong_store::{CAPTURE_EXCLUDES, Cas};
 
 use crate::build_directives::{Directives, parse_directives};
 use crate::model::{
-    CrateType, Dep, Edition, Package, PackageId, ProfileSpec, RustModel, crate_name, lib_crate_name,
+    CrateType, Dep, Edition, Package, PackageId, ProfileSpec, RustModel, TestTarget, crate_name,
+    lib_crate_name,
 };
 use crate::toolchain::{SystemRust, dll_extension, host_platform};
 
@@ -95,6 +96,9 @@ struct Ctx {
     /// `[policy] network = "allow"`: run actions may reach the network
     /// and are uncacheable.
     network_allow: bool,
+    /// Configured target triple for target units (`--target`); `None`
+    /// keeps everything host.
+    target_triple: Option<String>,
 }
 
 enum CtxKind {
@@ -125,10 +129,20 @@ struct CompileSpec {
     /// The package's library is a proc macro (test compiles need
     /// `--extern proc_macro` too).
     is_proc_macro: bool,
+    /// Host unit (build script / proc macro): never `--target`, uses the
+    /// execution triple.
+    host_unit: bool,
+    /// Workspace member (sets `CARGO_PRIMARY_PACKAGE`).
+    primary: bool,
+    /// `--check` build: rustc emits metadata only.
+    check: bool,
 }
 
 struct BuildScriptRunSpec {
     compile: ActionId,
+    /// Direct dependencies' `links` values → their build-script run ids;
+    /// their metadata is exported as `DEP_<LINKS>_<KEY>` to this script.
+    dep_links: Vec<(String, ActionId)>,
     binary: String,
     pkg_name: String,
     pkg_version: String,
@@ -152,6 +166,13 @@ struct TestRunSpec {
     args: Vec<String>,
     /// `cache-test-result = true` (native) makes the run cacheable.
     cache_test_result: bool,
+    /// Doc test: executed by rustdoc (`rustdoc --test`), no separate
+    /// compile; `deps` are the linked crates and `crate_root`/`edition`
+    /// the doctest inputs.
+    doc: bool,
+    deps: Vec<DepSpec>,
+    crate_root: PathBuf,
+    edition: Edition,
 }
 
 /// The Rust backend: plans actions from a [`RustModel`].
@@ -171,9 +192,21 @@ pub struct RustBackend<'a> {
     planned_ids: BTreeMap<String, ActionId>,
     /// Whether test targets are planned and run (`tong test`).
     tests_enabled: bool,
+    /// Also plan examples, benches, and doc tests (test/`--all-targets`
+    /// builds; plain `tong build` skips them like cargo).
+    all_targets: bool,
+    /// `--no-run`: plan test compiles without their run actions.
+    no_run: bool,
+    /// `--check`-style builds: rustc emits metadata only.
+    check: bool,
     /// `[policy] network = "allow"`: run actions may reach the network
     /// and are uncacheable.
     network_allow: bool,
+    /// Captured rustdoc blob (doc tests), captured on first use.
+    rustdoc_blob: Option<BlobDigest>,
+    /// Configured target triple for target units (`--target`); `None`
+    /// keeps everything host.
+    target_triple: Option<String>,
     /// Arguments passed to the test binaries (after `--`).
     test_args: Vec<String>,
     /// Build-state store, for rerun-if-changed input narrowing (the
@@ -214,6 +247,10 @@ impl<'a> RustBackend<'a> {
             state,
             project_hash,
             false,
+            false,
+            false,
+            false,
+            None,
         )
     }
 
@@ -237,10 +274,15 @@ impl<'a> RustBackend<'a> {
             None,
             None,
             false,
+            tests_enabled,
+            false,
+            false,
+            None,
         )
     }
 
     /// Full constructor.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn with_tests_state(
         cas: Cas,
@@ -252,6 +294,10 @@ impl<'a> RustBackend<'a> {
         state: Option<tong_store::StateStore>,
         project_hash: Option<tong_core::digest::Digest>,
         network_allow: bool,
+        all_targets: bool,
+        no_run: bool,
+        check: bool,
+        target_triple: Option<String>,
     ) -> Result<Self, PlanError> {
         let profile = model
             .profiles
@@ -270,7 +316,12 @@ impl<'a> RustBackend<'a> {
             cc_closure: BTreeMap::new(),
             planned_ids: BTreeMap::new(),
             tests_enabled,
+            all_targets,
+            no_run,
+            check,
             network_allow,
+            rustdoc_blob: None,
+            target_triple,
             test_args: test_args.to_vec(),
             state,
             project_hash,
@@ -435,6 +486,11 @@ impl<'a> RustBackend<'a> {
         for pkg in &self.model.packages {
             self.plan_package_bins(&mut actions, pkg)?;
         }
+        if self.all_targets {
+            for pkg in &self.model.packages {
+                self.plan_package_examples(&mut actions, pkg)?;
+            }
+        }
         if self.tests_enabled {
             for pkg in &self.model.packages {
                 self.plan_package_tests(&mut actions, pkg)?;
@@ -461,6 +517,15 @@ impl<'a> RustBackend<'a> {
 
         for target in &pkg.tests {
             if !self.required_features_active(pkg, &target.required_features) {
+                continue;
+            }
+            if target.doc {
+                // Doc tests: one rustdoc --test run action; rustdoc
+                // compiles the crate itself, so no separate compile.
+                if self.no_run || self.check {
+                    continue;
+                }
+                self.plan_doc_test(actions, pkg, target, source_tree, cc.clone())?;
                 continue;
             }
             // deps + dev-deps + the package's own library.
@@ -494,8 +559,12 @@ impl<'a> RustBackend<'a> {
                 &deps,
                 bs_run.clone(),
                 self.crate_root_for(&pkg.id, &target.path),
+                false,
             )?;
 
+            if self.no_run || self.check {
+                continue;
+            }
             let run_id = ActionId(format!(
                 "rust:test-run:{}:{}",
                 self.pkg_label(pkg),
@@ -511,6 +580,10 @@ impl<'a> RustBackend<'a> {
                     harness: target.harness,
                     args: self.test_args.clone(),
                     cache_test_result: target.cache_test_result,
+                    doc: false,
+                    deps: Vec::new(),
+                    crate_root: PathBuf::new(),
+                    edition: pkg.edition,
                 }),
                 source_tree,
                 rustc: self.toolchain.rustc_blob,
@@ -521,11 +594,136 @@ impl<'a> RustBackend<'a> {
                 cc: Vec::new(),
                 profile_flags: Vec::new(),
                 network_allow: self.network_allow,
+                target_triple: self.target_triple.clone(),
             };
             actions.push(self.boxed(run_ctx));
             let _ = &run_id;
         }
         Ok(())
+    }
+
+    /// Plans a doc-test run: `rustdoc --test <crate-root>` with the
+    /// package's library and dependencies linked.
+    fn plan_doc_test(
+        &mut self,
+        actions: &mut Vec<PlannedAction>,
+        pkg: &Package,
+        target: &TestTarget,
+        source_tree: TreeDigest,
+        _cc: Vec<(String, TreeDigest, String)>,
+    ) -> Result<(), PlanError> {
+        let rustdoc = self
+            .toolchain
+            .rustc
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("rustdoc");
+        if !rustdoc.is_file() {
+            return Err(PlanError::Message(format!(
+                "doc test `{}` requires rustdoc, which this toolchain does not ship",
+                target.name
+            )));
+        }
+        let rustdoc_blob = match self.rustdoc_blob {
+            Some(blob) => blob,
+            None => {
+                let blob = self.cas.put_file(&rustdoc)?;
+                self.rustdoc_blob = Some(blob);
+                blob
+            }
+        };
+        // deps + dev-deps + the package's own library.
+        let mut deps = pkg.deps.clone();
+        deps.extend(pkg.dev_deps.iter().cloned());
+        if pkg.lib.is_some() {
+            deps.insert(
+                0,
+                Dep {
+                    extern_name: lib_crate_name(pkg),
+                    package: pkg.id.clone(),
+                    optional: false,
+                    default_features: true,
+                    features: Vec::new(),
+                    target: None,
+                },
+            );
+        }
+        let dep_specs = self.resolve_deps(&pkg.id, &deps)?;
+        let transitive = self.transitive_dep_specs(&pkg.id, &deps)?;
+        let run_id = ActionId(format!(
+            "rust:doc-test:{}:{}",
+            self.pkg_label(pkg),
+            target.name
+        ));
+        let run_ctx = Ctx {
+            logical_id: run_id.clone(),
+            mnemonic: "RustDocTest".to_owned(),
+            external: self.pkg_external(pkg),
+            kind: CtxKind::TestRun(TestRunSpec {
+                compile: ActionId(String::new()),
+                binary: target.name.clone(),
+                harness: false,
+                args: self.test_args.clone(),
+                cache_test_result: false,
+                doc: true,
+                deps: dep_specs,
+                crate_root: self.crate_root_for(&pkg.id, &target.path),
+                edition: pkg.edition,
+            }),
+            source_tree,
+            rustc: rustdoc_blob,
+            bundle: Some(self.toolchain.bundle_ref()),
+            properties: self.base_properties(),
+            global_env: self.model.global_env.clone(),
+            pkg_env: pkg.env.clone(),
+            cc: Vec::new(),
+            profile_flags: Vec::new(),
+            network_allow: self.network_allow,
+            target_triple: self.target_triple.clone(),
+        };
+        // The run depends on the transitive closure (rlibs at deps/).
+        let mut all_deps: Vec<ActionId> = transitive
+            .iter()
+            .filter_map(|dep| match dep {
+                DepSpec::Rust { action, .. } => Some(action.clone()),
+                DepSpec::Native => None,
+            })
+            .collect();
+        all_deps.sort();
+        all_deps.dedup();
+        let mut action = self.boxed(run_ctx);
+        action.deps = all_deps;
+        actions.push(action);
+        Ok(())
+    }
+
+    /// The previous build's dep-info inputs for a compile action: the
+    /// `.d` file in its recorded output tree, relativized to the package
+    /// dir. `None` when there is no previous record, the dep-info is
+    /// missing or malformed, or it names a path outside the package
+    /// (keeping the conservative whole-tree input).
+    fn previous_dep_info(&self, logical_id: &str, pkg: &Package) -> Option<Vec<PathBuf>> {
+        let state = self.state.as_ref()?;
+        let project_hash = self.project_hash?;
+        let manifest = state.latest(&project_hash)?;
+        let action = manifest
+            .actions
+            .iter()
+            .find(|action| action.logical_id == logical_id)?;
+        let tree = self.cas.get_tree(action.outputs).ok().flatten()?;
+        let dep_text = find_dep_blob(&tree, &self.cas)?;
+        let text = String::from_utf8_lossy(&dep_text);
+        let pkg_dir = fs::canonicalize(&pkg.dir).ok()?;
+        let mut paths = Vec::new();
+        for path in parse_dep_info(&text) {
+            let Ok(relative) = path.strip_prefix(&pkg_dir) else {
+                return None;
+            };
+            if !relative.as_os_str().is_empty() {
+                paths.push(relative.to_path_buf());
+            }
+        }
+        (!paths.is_empty()).then_some(paths)
     }
 
     /// The previous successful run's directives for a package's build
@@ -559,7 +757,6 @@ impl<'a> RustBackend<'a> {
         if directives.rerun_if_changed.is_empty() {
             return Ok(full);
         }
-        let pkg_dir = fs::canonicalize(&pkg.dir)?;
         let mut paths: Vec<PathBuf> = directives
             .rerun_if_changed
             .iter()
@@ -572,6 +769,18 @@ impl<'a> RustBackend<'a> {
                 paths.push(script.clone());
             }
         }
+        self.mount_package_paths(pkg, paths, "rerun-if-changed")
+    }
+
+    /// Builds a source tree containing exactly the given package-relative
+    /// paths (files and directories), plus the package manifest.
+    fn mount_package_paths(
+        &self,
+        pkg: &Package,
+        paths: Vec<PathBuf>,
+        what: &str,
+    ) -> Result<TreeDigest, PlanError> {
+        let pkg_dir = fs::canonicalize(&pkg.dir)?;
         let excludes: std::collections::BTreeSet<&str> = CAPTURE_EXCLUDES.iter().copied().collect();
         let mut mounts: Vec<(RelativePath, TreeDigest)> = Vec::new();
         let mut mounted: std::collections::BTreeSet<PathBuf> = Default::default();
@@ -579,23 +788,22 @@ impl<'a> RustBackend<'a> {
             let full_path = pkg.dir.join(&path);
             if !full_path.exists() {
                 return Err(PlanError::Message(format!(
-                    "build script for {} emitted rerun-if-changed={:?} but no such \
-                     file or directory exists",
-                    pkg.name,
-                    path.display()
+                    "{what} path {:?} of package {} no longer exists",
+                    path.display(),
+                    pkg.name
                 )));
             }
             let canonical = fs::canonicalize(&full_path)?;
             let relative = canonical.strip_prefix(&pkg_dir).map_err(|_| {
                 PlanError::Message(format!(
-                    "build script for {} declares rerun-if-changed={:?} outside the \
-                     package directory; only in-package paths are supported",
-                    pkg.name,
-                    path.display()
+                    "{what} path {:?} of package {} lies outside the package \
+                     directory; only in-package paths are supported",
+                    path.display(),
+                    pkg.name
                 ))
             })?;
             let mount_path = RelativePath::new(&relative.to_string_lossy()).map_err(|err| {
-                PlanError::Message(format!("invalid rerun-if-changed path {:?}: {err}", path))
+                PlanError::Message(format!("invalid {what} path {:?}: {err}", path))
             })?;
             if canonical.is_dir() {
                 if mounted.insert(relative.to_path_buf()) {
@@ -607,9 +815,7 @@ impl<'a> RustBackend<'a> {
                 let name = relative
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .ok_or_else(|| {
-                        PlanError::Message("invalid rerun-if-changed path".to_owned())
-                    })?;
+                    .ok_or_else(|| PlanError::Message(format!("invalid {what} path")))?;
                 let blob = self.cas.put_file(&canonical)?;
                 let tree = Tree::new(
                     [(
@@ -628,10 +834,7 @@ impl<'a> RustBackend<'a> {
                     RelativePath::new(".").unwrap()
                 } else {
                     RelativePath::new(&parent.to_string_lossy()).map_err(|err| {
-                        PlanError::Message(format!(
-                            "invalid rerun-if-changed path {:?}: {err}",
-                            path
-                        ))
+                        PlanError::Message(format!("invalid {what} path {:?}: {err}", path))
                     })?
                 };
                 mounts.push((mount_path, tree));
@@ -639,8 +842,7 @@ impl<'a> RustBackend<'a> {
         }
         if mounts.is_empty() {
             return Err(PlanError::Message(format!(
-                "build script for {} emitted rerun-if-changed paths that could not \
-                 be captured",
+                "{what} paths of package {} could not be captured",
                 pkg.name
             )));
         }
@@ -699,6 +901,7 @@ impl<'a> RustBackend<'a> {
                 &pkg.build_deps,
                 None,
                 script.clone(),
+                true,
             )?;
 
             if previous.is_some() {
@@ -706,12 +909,31 @@ impl<'a> RustBackend<'a> {
             }
 
             let run_id = ActionId(format!("rust:bs-run:{}", self.pkg_label(pkg)));
+            // Direct dependencies with a `links` value export their build
+            // metadata to this script as `DEP_<LINKS>_<KEY>`.
+            let mut dep_links: Vec<(String, ActionId)> = Vec::new();
+            for dep in &pkg.deps {
+                let Some(dep_pkg) = self.model.packages.iter().find(|p| p.id == dep.package) else {
+                    continue;
+                };
+                let Some(links) = &dep_pkg.links else {
+                    continue;
+                };
+                let bs_id = self
+                    .planned_ids
+                    .get(&format!("bs-run:{}", self.pkg_key(dep_pkg)));
+                if let Some(bs_id) = bs_id {
+                    dep_links.push((links.clone(), bs_id.clone()));
+                }
+            }
+            dep_links.sort_by(|a, b| a.0.cmp(&b.0));
             let run_ctx = Ctx {
                 logical_id: run_id.clone(),
                 mnemonic: "RustBuildScriptRun".to_owned(),
                 external: self.pkg_external(pkg),
                 kind: CtxKind::BuildScriptRun(BuildScriptRunSpec {
                     compile: compile_id.clone(),
+                    dep_links,
                     binary: binary.clone(),
                     pkg_name: pkg.name.clone(),
                     pkg_version: pkg.version.clone(),
@@ -736,6 +958,8 @@ impl<'a> RustBackend<'a> {
                 global_env: self.model.global_env.clone(),
                 pkg_env: {
                     let mut env = pkg.env.clone();
+                    env.insert("CARGO_PKG_NAME".to_owned(), pkg.name.clone());
+                    env.insert("CARGO_PKG_VERSION".to_owned(), pkg.version.clone());
                     env.extend(self.pkg_version_env(pkg));
                     env.extend(run_env);
                     env
@@ -743,6 +967,7 @@ impl<'a> RustBackend<'a> {
                 cc: Vec::new(),
                 profile_flags: self.profile.rustc_flags(),
                 network_allow: self.network_allow,
+                target_triple: self.target_triple.clone(),
             };
             self.planned_ids
                 .insert(format!("bs-run:{}", self.pkg_key(pkg)), run_id.clone());
@@ -769,6 +994,7 @@ impl<'a> RustBackend<'a> {
                     &pkg.deps,
                     bs_run.clone(),
                     self.crate_root_for(&pkg.id, &lib.path),
+                    false,
                 )?;
             } else {
                 let types: Vec<CrateType> = if lib.crate_types.is_empty() {
@@ -792,6 +1018,7 @@ impl<'a> RustBackend<'a> {
                         &pkg.deps,
                         bs_run.clone(),
                         lib_root.clone(),
+                        false,
                     )?;
                 }
             }
@@ -846,6 +1073,60 @@ impl<'a> RustBackend<'a> {
                 &deps,
                 bs_run.clone(),
                 self.crate_root_for(&pkg.id, &bin.path),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Plans a package's example compiles (built in test/`--all-targets`
+    /// builds, like cargo; `tong build` skips them). Examples link the
+    /// package's library, its deps, and its dev-deps.
+    fn plan_package_examples(
+        &mut self,
+        actions: &mut Vec<PlannedAction>,
+        pkg: &Package,
+    ) -> Result<(), PlanError> {
+        let source_tree = self.source_trees[&pkg.id];
+        let cc = self.cc_for(&pkg.id);
+        let bs_run: Option<ActionId> = self
+            .planned_ids
+            .get(&format!("bs-run:{}", self.pkg_key(pkg)))
+            .cloned();
+        for example in &pkg.examples {
+            if !self.required_features_active(pkg, &example.required_features) {
+                continue;
+            }
+            let mut deps = pkg.deps.clone();
+            deps.extend(pkg.dev_deps.iter().cloned());
+            if pkg.lib.is_some() {
+                deps.insert(
+                    0,
+                    Dep {
+                        extern_name: lib_crate_name(pkg),
+                        package: pkg.id.clone(),
+                        optional: false,
+                        default_features: true,
+                        features: Vec::new(),
+                        target: None,
+                    },
+                );
+            }
+            self.plan_compile(
+                actions,
+                &format!("example:{}:{}", self.pkg_key(pkg), example.name),
+                &format!("rust:example:{}:{}", self.pkg_label(pkg), example.name),
+                "RustExample",
+                pkg,
+                source_tree,
+                cc.clone(),
+                example.crate_name.clone(),
+                "bin",
+                Some(example.name.clone()),
+                &deps,
+                bs_run.clone(),
+                self.crate_root_for(&pkg.id, &example.path),
+                false,
             )?;
         }
         Ok(())
@@ -899,6 +1180,7 @@ impl<'a> RustBackend<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn plan_compile(
         &mut self,
         actions: &mut Vec<PlannedAction>,
@@ -914,12 +1196,31 @@ impl<'a> RustBackend<'a> {
         deps: &[Dep],
         build_script: Option<ActionId>,
         crate_root: PathBuf,
+        host_unit: bool,
     ) -> Result<ActionId, PlanError> {
+        let mut source_tree = source_tree;
+        // Narrow the input tree to the files the previous build's rustc
+        // actually read (dep-info). First builds stay conservative; a
+        // malformed or out-of-package dep-info also keeps the whole tree
+        // (never cache under an incomplete key).
+        if let Some(paths) = self.previous_dep_info(logical_id, pkg) {
+            source_tree = self.mount_package_paths(pkg, paths, "dep-info")?;
+        }
+        // `--check` builds emit metadata only (cargo check); build
+        // scripts always compile fully (they run even in check builds).
+        let check = self.check && !host_unit;
         let meta = self.metadata(pkg, &crate_name, crate_type);
+        let check_output = |output: String| {
+            if check {
+                format!("{output}.rmeta")
+            } else {
+                output
+            }
+        };
         let output = if let Some(name) = output_name {
-            name
+            check_output(name)
         } else if crate_type == "bin" {
-            crate_name.clone()
+            check_output(crate_name.clone())
         } else {
             let ext = if crate_type == "proc-macro" {
                 dll_extension()
@@ -930,7 +1231,7 @@ impl<'a> RustBackend<'a> {
                     _ => dll_extension(),
                 }
             };
-            format!("lib{crate_name}-{meta}.{ext}")
+            check_output(format!("lib{crate_name}-{meta}.{ext}"))
         };
         let dep_specs = self.resolve_deps(&pkg.id, deps)?;
         // Transitive closure of the direct deps: rustc resolves transitive
@@ -1002,6 +1303,9 @@ impl<'a> RustBackend<'a> {
                 feature_cfgs,
                 transitive_deps,
                 is_proc_macro: pkg.lib.as_ref().is_some_and(|lib| lib.proc_macro),
+                host_unit,
+                primary: !self.pkg_external(pkg),
+                check,
             }),
             source_tree,
             rustc: self.toolchain.rustc_blob,
@@ -1010,12 +1314,15 @@ impl<'a> RustBackend<'a> {
             global_env: self.model.global_env.clone(),
             pkg_env: {
                 let mut env = pkg.env.clone();
+                env.insert("CARGO_PKG_NAME".to_owned(), pkg.name.clone());
+                env.insert("CARGO_PKG_VERSION".to_owned(), pkg.version.clone());
                 env.extend(self.pkg_version_env(pkg));
                 env
             },
             cc,
             profile_flags: profile_flags.clone(),
             network_allow: self.network_allow,
+            target_triple: self.target_triple.clone(),
         };
         let id = ctx.logical_id.clone();
         self.planned_ids.insert(key.to_owned(), id.clone());
@@ -1435,6 +1742,7 @@ impl Ctx {
     fn executable(&self, completed: &dyn Completed) -> Result<ArtifactRef, PlanError> {
         match &self.kind {
             CtxKind::Compile(_) => Ok(ArtifactRef::Blob(self.rustc)),
+            CtxKind::TestRun(spec) if spec.doc => Ok(ArtifactRef::Blob(self.rustc)),
             CtxKind::BuildScriptRun(spec) => {
                 let tree = completed
                     .output_tree(&spec.compile)
@@ -1524,6 +1832,23 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                     value.clone(),
                 );
             }
+            // DEP_<LINKS>_<KEY>: metadata exported by direct dependencies'
+            // build scripts (Cargo namespaces metadata by the `links`
+            // value of the exporting package).
+            for (links, bs_id) in &spec.dep_links {
+                let Some(stdout) = completed.stdout(bs_id) else {
+                    continue;
+                };
+                let bytes = cas.read_blob(stdout)?;
+                let directives = parse_directives(&String::from_utf8_lossy(&bytes));
+                let prefix = format!("DEP_{}_", links.to_ascii_uppercase().replace('-', "_"));
+                for (key, value) in &directives.env {
+                    env.insert(
+                        format!("{prefix}{}", key.to_ascii_uppercase().replace('-', "_")),
+                        value.clone(),
+                    );
+                }
+            }
             for feature in &spec.features {
                 let key = format!(
                     "CARGO_FEATURE_{}",
@@ -1548,15 +1873,45 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             }
         }
         CtxKind::TestRun(spec) => {
-            // The test binary runs with the package source tree as its
-            // working directory (relative test data paths behave like
-            // Cargo). The binary itself is resolved from the compile
-            // action's output tree at execution time.
-            args.extend(spec.args.iter().cloned());
-            if !spec.harness {
-                // Custom harness: the binary is a plain program; it gets
-                // the source tree as working directory.
-                let _ = &spec.binary;
+            if spec.doc {
+                // Doc test: rustdoc compiles the crate from its root and
+                // runs the doctests; dependencies are linked like a
+                // compile unit.
+                args.push("--test".to_owned());
+                args.push(spec.crate_root.to_string_lossy().into_owned());
+                args.push("--edition".to_owned());
+                args.push(spec.edition.to_rustc().to_owned());
+                args.push("-L".to_owned());
+                args.push(format!("dependency={EXEC_ROOT_VAR}/in/deps"));
+                for dep in &spec.deps {
+                    match dep {
+                        DepSpec::Rust {
+                            extern_name,
+                            action,
+                            file,
+                        } => {
+                            let tree = completed
+                                .output_tree(action)
+                                .ok_or_else(|| PlanError::MissingDependency(action.clone()))?;
+                            mounts.push((RelativePath::new("deps").unwrap(), tree));
+                            args.push("--extern".to_owned());
+                            args.push(format!("{extern_name}={EXEC_ROOT_VAR}/in/deps/{file}"));
+                        }
+                        DepSpec::Native => {}
+                    }
+                }
+                args.extend(spec.args.iter().cloned());
+            } else {
+                // The test binary runs with the package source tree as its
+                // working directory (relative test data paths behave like
+                // Cargo). The binary itself is resolved from the compile
+                // action's output tree at execution time.
+                args.extend(spec.args.iter().cloned());
+                if !spec.harness {
+                    // Custom harness: the binary is a plain program; it
+                    // gets the source tree as working directory.
+                    let _ = &spec.binary;
+                }
             }
         }
         CtxKind::Compile(spec) => {
@@ -1584,6 +1939,10 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                     format!("{EXEC_ROOT_VAR}/in/build_out"),
                 );
             }
+            env.insert(
+                "CARGO_MANIFEST_DIR".to_owned(),
+                format!("{EXEC_ROOT_VAR}/in"),
+            );
             for dep in &spec.deps {
                 match dep {
                     DepSpec::Rust {
@@ -1698,9 +2057,36 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             args.push(format!("{EXEC_ROOT_VAR}/out/{}", spec.output));
             args.push("-L".to_owned());
             args.push(format!("dependency={EXEC_ROOT_VAR}/in/deps"));
+            // Dep-info emission with an explicit output path: combining
+            // emit types would make rustc adapt (rename) the `-o` target.
+            // The `.d` file lands in the output tree and lets later builds
+            // narrow their inputs to the files rustc actually read.
+            args.push("--emit".to_owned());
+            args.push(if spec.check {
+                "metadata".to_owned()
+            } else {
+                "link".to_owned()
+            });
+            args.push("--emit".to_owned());
+            args.push(format!("dep-info={EXEC_ROOT_VAR}/out/{}.d", spec.output));
+            if !spec.host_unit
+                && let Some(triple) = &ctx.target_triple
+            {
+                args.push("--target".to_owned());
+                args.push(triple.clone());
+            }
             args.extend(spec.extra_flags.iter().cloned());
             args.extend(spec.feature_cfgs.iter().cloned());
             args.push(spec.crate_root.to_string_lossy().into_owned());
+            // Compile-time Cargo environment (crates read these with
+            // `env!` / `option_env!`).
+            env.insert("CARGO_CRATE_NAME".to_owned(), spec.crate_name.clone());
+            if spec.crate_type == "bin" {
+                env.insert("CARGO_BIN_NAME".to_owned(), spec.output.clone());
+            }
+            if spec.primary {
+                env.insert("CARGO_PRIMARY_PACKAGE".to_owned(), "1".to_owned());
+            }
         }
     }
 
@@ -1745,6 +2131,58 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
         resource_requirements: ResourceRequirements::default(),
         properties: ctx.properties.clone(),
     })
+}
+
+/// Finds a `.d` dep-info blob inside a captured output tree.
+fn find_dep_blob(tree: &Tree, cas: &Cas) -> Option<Vec<u8>> {
+    for (name, entry) in tree.entries() {
+        match entry {
+            TreeEntry::File { digest, .. } => {
+                if name.ends_with(".d") && name.len() > 2 {
+                    return cas.read_blob(*digest).ok();
+                }
+            }
+            TreeEntry::Directory(digest) => {
+                if let Some(sub) = cas.get_tree(*digest).ok().flatten()
+                    && let Some(found) = find_dep_blob(&sub, cas)
+                {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parses rustc's makefile-format dep-info: `target: dep1 dep2 \\` with
+/// escaped spaces and line continuations.
+fn parse_dep_info(text: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\\').trim();
+        let line = line.split_once(':').map(|(_, rest)| rest).unwrap_or(line);
+        let mut current = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    current.push(next);
+                    chars.next();
+                }
+            } else if c.is_whitespace() {
+                if !current.is_empty() {
+                    out.push(PathBuf::from(std::mem::take(&mut current)));
+                }
+            } else {
+                current.push(c);
+            }
+        }
+        if !current.is_empty() {
+            out.push(PathBuf::from(std::mem::take(&mut current)));
+        }
+    }
+    out
 }
 
 /// Dedup state for directive application across transitive scripts.

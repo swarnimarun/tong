@@ -641,11 +641,12 @@ fn check_pass(fixture: &Fixture) {
             }
             let provider = LockedSource::new(lock, store.clone());
             let _ = dl_root;
-            let model = import_cargo_workspace(dir, &host, &provider).expect("registry import");
+            let model =
+                import_cargo_workspace(dir, &host, &provider, None).expect("registry import");
             (model, cargo)
         }
         _ => (
-            import_cargo_workspace(dir, &host, &NoLock).expect("import"),
+            import_cargo_workspace(dir, &host, &NoLock, None).expect("import"),
             cargo_view(&cargo_metadata(dir)),
         ),
     };

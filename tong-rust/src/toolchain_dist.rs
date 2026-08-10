@@ -290,6 +290,8 @@ fn capture_dist(cas: &Cas, version: &str, root: &Path) -> Result<SystemRust, Too
         host_triple,
         version_verbose: version_verbose.trim().to_owned(),
         rustc_blob,
+        rustdoc: None,
+        rustdoc_blob: None,
         sysroot_tree,
         bundle,
     })

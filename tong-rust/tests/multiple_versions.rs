@@ -248,7 +248,7 @@ fn host_triple() -> String {
 fn import_model(workspace: &Path, store: &Path) -> RustModel {
     let lock = tong_fetch::TongLock::load(workspace).unwrap();
     let provider = LockedFixture::new(lock, store.to_path_buf());
-    import_cargo_workspace(workspace, &host_triple(), &provider).unwrap()
+    import_cargo_workspace(workspace, &host_triple(), &provider, None).unwrap()
 }
 
 #[test]

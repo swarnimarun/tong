@@ -818,6 +818,10 @@ fn prepare(
         Some(state),
         project_hash,
         network_allow,
+        tests_enabled,
+        false,
+        false,
+        None,
     )?;
     let planned = backend.plan()?;
     let artifacts = backend.final_artifacts();
@@ -1098,8 +1102,13 @@ pub fn load_model(
         // Target-specific deps need the host triple; a single `rustc -vV`
         // query is far cheaper than the full toolchain capture.
         let host_triple = tong_rust::host_triple()?;
-        import_cargo_workspace(root, &host_triple, sources)
-            .map_err(|err| BuildError::Manifest(err.to_string()))
+        import_cargo_workspace(
+            root,
+            &host_triple,
+            sources,
+            std::env::var("CARGO_ENCODED_RUSTFLAGS").ok().as_deref(),
+        )
+        .map_err(|err| BuildError::Manifest(err.to_string()))
     } else {
         Err(BuildError::NoManifest)
     }

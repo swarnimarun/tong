@@ -104,6 +104,24 @@ struct CargoPackage {
     /// Cargo resolver version: `"1"`, `"2"`, or `"3"`.
     #[serde(default)]
     resolver: Option<String>,
+    /// Disable auto-discovery of `src/lib.rs`.
+    #[serde(default)]
+    autolib: Option<bool>,
+    /// Disable auto-discovery of `src/bin/*`.
+    #[serde(default)]
+    autobins: Option<bool>,
+    /// Disable auto-discovery of `examples/*`.
+    #[serde(default)]
+    autoexamples: Option<bool>,
+    /// Disable auto-discovery of `tests/*`.
+    #[serde(default)]
+    autotests: Option<bool>,
+    /// Disable auto-discovery of `benches/*`.
+    #[serde(default)]
+    autobenches: Option<bool>,
+    /// Native library name this package links (Cargo: one package per
+    /// value; the build script exports `DEP_<LINKS>_<KEY>` metadata).
+    links: Option<String>,
 }
 
 /// `build = "build.rs"` or `build = false` (Cargo's opt-out from build.rs
@@ -213,6 +231,8 @@ struct CargoLib {
 struct CargoBin {
     name: Option<String>,
     path: Option<String>,
+    #[serde(default)]
+    required_features: Option<Vec<String>>,
 }
 
 /// `[[test]]` / `[[bench]]` entry. Cargo defaults: path is
@@ -223,6 +243,8 @@ struct CargoTest {
     name: Option<String>,
     path: Option<String>,
     harness: Option<bool>,
+    #[serde(default)]
+    required_features: Option<Vec<String>>,
 }
 
 /// `[[example]]` entry — parsed and ignored: tong does not build examples
@@ -409,6 +431,7 @@ pub fn import_cargo_workspace(
     workspace_root: &Path,
     host_triple: &str,
     sources: &dyn LockedSourceProvider,
+    encoded_rustflags: Option<&str>,
 ) -> Result<RustModel, CargoImportError> {
     let root_manifest = read_manifest(workspace_root)?;
 
@@ -522,6 +545,19 @@ pub fn import_cargo_workspace(
 
     model.packages = packages.into_values().collect();
     model.members = member_ids;
+    // Cargo: at most one package per `links` value.
+    let mut links_owners: BTreeMap<&str, &str> = BTreeMap::new();
+    for pkg in &model.packages {
+        if let Some(links) = &pkg.links
+            && let Some(previous) = links_owners.insert(links, &pkg.name)
+        {
+            return Err(CargoImportError::Unsupported(format!(
+                "the `links` key {links:?} is declared by both {previous} and {}; \
+                 Cargo requires exactly one package per links value",
+                pkg.name
+            )));
+        }
+    }
     if !default_members.is_empty() {
         let default_canonical: Vec<PathBuf> = default_members
             .iter()
@@ -583,7 +619,7 @@ pub fn import_cargo_workspace(
         ));
     }
     let mut global_rustflags: Vec<String> = Vec::new();
-    if let Ok(encoded) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+    if let Some(encoded) = encoded_rustflags {
         global_rustflags = encoded.split(' ').map(str::to_owned).collect();
     }
     if let Some(build) = &config.build
@@ -850,8 +886,10 @@ fn import_package(
             edition: parse_edition(&edition)?,
             lib: None,
             bins: Vec::new(),
+            examples: Vec::new(),
             tests: Vec::new(),
             build_script: None,
+            links: package.links.clone(),
             deps: Vec::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),
@@ -893,7 +931,7 @@ fn import_package(
                 proc_macro: lib.proc_macro,
                 path: lib_path,
             });
-        } else if lib_present {
+        } else if lib_present && package.autolib.unwrap_or(true) {
             pkg.lib = Some(LibTarget {
                 name: None,
                 crate_types: Vec::new(),
@@ -903,7 +941,10 @@ fn import_package(
         }
 
         // Binaries: explicit [[bin]] or auto-detected src/main.rs.
-        if manifest.bin.is_empty() && pkg.dir.join("src/main.rs").is_file() {
+        if manifest.bin.is_empty()
+            && package.autobins.unwrap_or(true)
+            && pkg.dir.join("src/main.rs").is_file()
+        {
             pkg.bins.push(BinTarget {
                 name: package.name.clone(),
                 crate_name: crate_name(&package.name),
@@ -929,17 +970,87 @@ fn import_package(
                 name: name.clone(),
                 crate_name: crate_name(&name),
                 path,
-                required_features: Vec::new(),
+                required_features: bin.required_features.clone().unwrap_or_default(),
+            });
+        }
+
+        // Examples: [[example]] entries whose source exists, plus
+        // auto-discovered `examples/*.rs` (Cargo conventions; tong plans
+        // example compiles in test/`--all-targets` builds).
+        let mut example_entries: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+        for example in &manifest.example {
+            let name = example.name.clone().unwrap_or_else(|| {
+                example
+                    .path
+                    .as_ref()
+                    .and_then(|p| Path::new(p).file_stem())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&package.name)
+                    .to_owned()
+            });
+            let path = example
+                .path
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("examples/{name}.rs")));
+            if pkg.dir.join(&path).is_file() {
+                example_entries.push((
+                    name,
+                    path,
+                    example.required_features.clone().unwrap_or_default(),
+                ));
+            }
+        }
+        if package.autoexamples.unwrap_or(true)
+            && let Ok(entries) = fs::read_dir(pkg.dir.join("examples"))
+        {
+            let mut names: Vec<String> =
+                example_entries.iter().map(|(n, _, _)| n.clone()).collect();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "rs") {
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    if !names.contains(&name) {
+                        example_entries.push((
+                            name.clone(),
+                            PathBuf::from(format!("examples/{name}.rs")),
+                            Vec::new(),
+                        ));
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        for (name, path, required_features) in example_entries {
+            pkg.examples.push(crate::model::ExampleTarget {
+                name: name.clone(),
+                crate_name: crate_name(&name),
+                path,
+                required_features,
             });
         }
 
         // Test targets: [[test]] / [[bench]] entries whose source exists
-        // (Cargo drops targets without source files), plus the auto-derived
-        // lib unit test. [[example]] targets are ignored (tong does not
-        // build examples; cargo builds them only on demand).
-        for (entry, default_dir, kind) in [
-            (&manifest.test, "tests", "test"),
-            (&manifest.bench, "benches", "bench"),
+        // (Cargo drops targets without source files), auto-discovered
+        // `tests/*.rs` / `benches/*.rs`, plus the auto-derived lib unit
+        // test. [[example]] targets are handled above.
+        for (entry, default_dir, kind, auto) in [
+            (
+                &manifest.test,
+                "tests",
+                "test",
+                package.autotests.unwrap_or(true),
+            ),
+            (
+                &manifest.bench,
+                "benches",
+                "bench",
+                package.autobenches.unwrap_or(true),
+            ),
         ] {
             for target in entry {
                 let name = target.name.clone().unwrap_or_else(|| {
@@ -967,9 +1078,34 @@ fn import_package(
                     harness: target.harness.unwrap_or(true),
                     doc: false,
                     cache_test_result: false,
-                    required_features: Vec::new(),
+                    required_features: target.required_features.clone().unwrap_or_default(),
                 });
                 let _ = kind;
+            }
+            // Auto-discovery: `tests/*.rs` / `benches/*.rs` when no
+            // explicit entries exist (Cargo conventions).
+            if entry.is_empty()
+                && auto
+                && let Ok(entries) = fs::read_dir(pkg.dir.join(default_dir))
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "rs") {
+                        let name = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                            .to_owned();
+                        pkg.tests.push(TestTarget {
+                            name: name.clone(),
+                            path: PathBuf::from(format!("{default_dir}/{name}.rs")),
+                            harness: true,
+                            doc: false,
+                            cache_test_result: false,
+                            required_features: Vec::new(),
+                        });
+                    }
+                }
             }
         }
         // The package's own library unit test (Cargo: `--test` on the lib).
@@ -1962,9 +2098,13 @@ calc-core = { path = "../calc-core" }
             ),
             ("crates/calc-cli/src/main.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.packages.len(), 2);
         let cli = model
             .packages
@@ -2003,8 +2143,13 @@ serde = "1"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-            .unwrap_err();
+        let err = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("registry dependency"), "{err}");
     }
 
@@ -2032,9 +2177,13 @@ APP_GREETING = "hello"
 "#,
             ),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.global_rustflags, vec!["--cfg", "advanced_mode"]);
         assert_eq!(model.global_env.get("APP_GREETING").unwrap(), "hello");
     }
@@ -2064,9 +2213,13 @@ sdl3-sys = { path = "../../shared/sdl3-sys" }
             ),
             ("shared/sdl3-sys/src/lib.rs", "pub fn init() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.packages.len(), 2);
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 1);
@@ -2115,8 +2268,13 @@ a = { path = "../a" }
             ),
             ("b/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-            .unwrap_err();
+        let err = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("cyclic"), "{err}");
     }
 
@@ -2145,9 +2303,13 @@ edition.workspace = true
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.version, "1.2.3");
         assert_eq!(app.edition, Edition::E2021);
@@ -2167,8 +2329,13 @@ version.workspace = true
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-            .unwrap_err();
+        let err = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("inherits version"), "{err}");
     }
 
@@ -2196,9 +2363,13 @@ name = "app_core"
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.lib.as_ref().unwrap().name.as_deref(), Some("app_core"));
     }
@@ -2220,9 +2391,13 @@ members = ["app"]
             ("app/src/lib.rs", ""),
             ("app/build.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(
             app.build_script.as_deref(),
@@ -2248,9 +2423,13 @@ members = ["app"]
             // A build.rs exists, but the manifest opts out (Cargo semantics).
             ("app/build.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert!(app.build_script.is_none());
     }
@@ -2271,8 +2450,13 @@ members = ["app"]
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-            .unwrap_err();
+        let err = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("build = true"), "{err}");
     }
 
@@ -2297,9 +2481,13 @@ overflow-checks = false
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let release = model.profiles.get("release").unwrap();
         assert_eq!(release.opt_level, "2");
         assert_eq!(release.lto, Lto::Thin);
@@ -2349,9 +2537,13 @@ win-only = { path = "../win-only" }
             ),
             ("../win-only/src/lib.rs", ""),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         // Target-specific deps stay in the model with their target
         // recorded (cargo locks all targets); the backend filters them at
         // plan time.
@@ -2377,9 +2569,13 @@ win-only = { path = "../win-only" }
         );
 
         // The Windows import keeps the same model shape (targets recorded).
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "x86_64-pc-windows-msvc", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "x86_64-pc-windows-msvc",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         let names: Vec<&str> = app.deps.iter().map(|d| d.package.name.as_str()).collect();
         assert!(names.contains(&"unix-only"));
@@ -2414,9 +2610,13 @@ win-only = { path = "../win-only", target = "cfg(windows)" }
             ),
             ("../win-only/src/lib.rs", ""),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         // Both target-keyed deps are in the model with their targets; the
         // backend filters at plan time.
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
@@ -2451,9 +2651,13 @@ foo = { path = "../foo" }
         // An unknown predicate is never set by the compiler: the import
         // records it as the dep's target (no error); the backend filters
         // it out at plan time.
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.deps.len(), 1);
         assert_eq!(
@@ -2479,8 +2683,13 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-            .unwrap_err();
+        let err = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("strip"), "{err}");
     }
 
@@ -2498,9 +2707,13 @@ strip = "everything"
             ),
             ("app/src/lib.rs", ""),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.resolver, ResolverVersion::V3);
 
         // A package-level resolver wins over the edition default.
@@ -2511,9 +2724,13 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.resolver, ResolverVersion::V1);
 
         // Edition 2024 defaults to resolver 3; 2021 to 2.
@@ -2524,9 +2741,13 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.resolver, ResolverVersion::V3);
         let dir = write_tree(&[
             (
@@ -2535,9 +2756,13 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model =
-            import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-                .unwrap();
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.resolver, ResolverVersion::V2);
 
         // Unsupported resolver values are targeted errors.
@@ -2548,8 +2773,13 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let err = import_cargo_workspace(&dir.path().join("ws"), "aarch64-apple-darwin", &NO_LOCK)
-            .unwrap_err();
+        let err = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("resolver"), "{err}");
     }
 }

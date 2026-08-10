@@ -252,10 +252,17 @@ pub struct Package {
     pub lib: Option<LibTarget>,
     /// Binary targets.
     pub bins: Vec<BinTarget>,
+    /// Example targets (compiled like binaries; built in test/`--all-
+    /// targets` builds).
+    pub examples: Vec<ExampleTarget>,
     /// Test targets (`[[test]]`, `[[bench]]`, auto lib unit test).
     pub tests: Vec<TestTarget>,
     /// Build script, relative to `dir`.
     pub build_script: Option<PathBuf>,
+    /// `links` value of the native library this package links (Cargo:
+    /// one package per value; the build script's metadata is exported to
+    /// direct dependents as `DEP_<LINKS>_<KEY>`).
+    pub links: Option<String>,
     /// Normal dependencies.
     pub deps: Vec<Dep>,
     /// Build-script-only dependencies.
@@ -318,6 +325,19 @@ pub struct BinTarget {
     /// Output name.
     pub name: String,
     /// rustc `--crate-name` (defaults to the sanitized target name).
+    pub crate_name: String,
+    /// Crate root, relative to `dir`.
+    pub path: PathBuf,
+    /// Features that must all be active for this target to build.
+    pub required_features: Vec<String>,
+}
+
+/// An example target (`[[example]]` or auto-discovered `examples/*`).
+#[derive(Clone, Debug)]
+pub struct ExampleTarget {
+    /// Output name.
+    pub name: String,
+    /// rustc `--crate-name`.
     pub crate_name: String,
     /// Crate root, relative to `dir`.
     pub path: PathBuf,
@@ -605,8 +625,10 @@ mod tests {
             edition: Edition::E2021,
             lib: None,
             bins: Vec::new(),
+            examples: Vec::new(),
             tests: Vec::new(),
             build_script: None,
+            links: None,
             deps: Vec::new(),
             build_deps: Vec::new(),
             dev_deps: Vec::new(),

@@ -37,6 +37,11 @@ pub struct SystemRust {
     pub version_verbose: String,
     /// Digest of the rustc binary itself.
     pub rustc_blob: BlobDigest,
+    /// The real rustdoc binary (never a rustup shim); `None` when the
+    /// toolchain ships no rustdoc (doc tests then fail before planning).
+    pub rustdoc: Option<PathBuf>,
+    /// Digest of the rustdoc binary, when captured.
+    pub rustdoc_blob: Option<BlobDigest>,
     /// Fingerprint of the sysroot's `bin/` and `lib/` trees.
     pub sysroot_tree: TreeDigest,
     /// The non-portable environment bundle.
@@ -157,6 +162,8 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
                     host_triple: captured.host_triple,
                     version_verbose: captured.version_verbose,
                     rustc_blob: captured.rustc_blob,
+                    rustdoc: None,
+                    rustdoc_blob: None,
                     sysroot_tree: captured.sysroot_tree,
                     bundle: captured.bundle,
                 });
@@ -275,6 +282,8 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
         host_triple: host_triple.trim().to_owned(),
         version_verbose: version_verbose.trim().to_owned(),
         rustc_blob,
+        rustdoc: None,
+        rustdoc_blob: None,
         sysroot_tree,
         bundle,
     })
