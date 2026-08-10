@@ -354,6 +354,7 @@ mod tests {
             index_url: "file:///nonexistent".to_owned(),
             dl: String::new(),
             api: None,
+            configured: false,
         };
         let client = IndexClient::new(dir.path().join("index"), config);
         (dir, client)
@@ -383,6 +384,7 @@ mod tests {
             index_url: url.trim_end_matches("/3/f/foo").to_owned(),
             dl: String::new(),
             api: None,
+            configured: false,
         };
         let client = IndexClient::new(dir.path().join("index"), config);
         let versions = client.versions("foo").unwrap();
@@ -402,6 +404,7 @@ mod tests {
             index_url: url.trim_end_matches("/3/f/foo").to_owned(),
             dl: String::new(),
             api: None,
+            configured: false,
         };
         let client = IndexClient::new(dir.path().join("index"), config);
         let versions = client.versions("foo").unwrap();
@@ -419,6 +422,7 @@ mod tests {
             index_url: url.trim_end_matches("/3/f/foo").to_owned(),
             dl: String::new(),
             api: None,
+            configured: false,
         };
         let client = IndexClient::new(dir.path().join("index"), config);
         let versions = client.versions("foo").unwrap();
@@ -490,6 +494,7 @@ mod tests {
             index_url: format!("http://{}", server.addr),
             dl: String::new(),
             api: None,
+            configured: false,
         };
         let client = IndexClient::new(dir.path().join("index"), config);
 

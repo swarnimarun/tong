@@ -159,10 +159,18 @@ struct Inherited {
 enum DepValue {
     /// `name = "0.1"` — registry dependency.
     Version(String),
-    /// A table: path/version/workspace deps (and renames).
+    /// A table: path/version/workspace/git deps (and renames).
     Table {
         version: Option<String>,
         path: Option<String>,
+        /// `git = "<url>"` — fixed git dependency.
+        git: Option<String>,
+        /// `rev = "<commit-ish>"` — exact lock resolution.
+        rev: Option<String>,
+        /// `tag = "<tag>"` — resolved only by `tong lock`.
+        tag: Option<String>,
+        /// `branch = "<branch>"` — resolved only by `tong lock`.
+        branch: Option<String>,
         #[serde(rename = "workspace")]
         workspace: Option<bool>,
         /// Optional `package = "real-name"` rename for path deps.
@@ -295,6 +303,11 @@ pub struct LockedSource {
     pub id: crate::model::PackageId,
     /// Extracted source directory (materialized from the store).
     pub source_dir: PathBuf,
+    /// Whether the source identity propagates to every package inside the
+    /// checkout (git dependencies: all packages from one repository share
+    /// the `git+<url>#<commit>` identity). Registry checkouts never
+    /// propagate.
+    pub propagate_source: bool,
 }
 
 /// A source of locked registry packages: exact edge resolution and
@@ -489,18 +502,30 @@ fn expand_members(
     Ok(out)
 }
 
+/// How a package's identity is forced during import.
+#[derive(Clone, Debug)]
+enum ForcedIdentity {
+    /// The exact locked identity: name and version must match the manifest
+    /// (registry packages).
+    Exact(crate::model::PackageId),
+    /// Only the source is forced; name/version come from the manifest
+    /// (git dependencies — the source propagates to every package in the
+    /// checkout).
+    Source(crate::model::SourceId),
+}
+
 /// Imports the package at `dir` (a workspace member or a path dependency)
 /// into `packages`, recursing into its path dependencies. Returns the
 /// package's exact identity. Cycles are rejected, matching Cargo.
 ///
-/// `forced_id` overrides the derived identity: registry and git checkouts
-/// imported from the lock keep the lock's exact `(name, version, source)`
-/// instead of a path-derived source.
+/// `forced` overrides the derived identity: registry checkouts imported
+/// from the lock keep the lock's exact `(name, version, source)`, and git
+/// checkouts keep the git source (propagated to nested path dependencies).
 #[allow(clippy::too_many_arguments)]
 fn import_package(
     dir: &Path,
     is_member: bool,
-    forced_id: Option<PackageId>,
+    forced: Option<ForcedIdentity>,
     packages: &mut BTreeMap<PathBuf, Package>,
     visiting: &mut Vec<PathBuf>,
     inherited: &Inherited,
@@ -561,8 +586,8 @@ fn import_package(
         // workspace members and path deps derive it from the lexical path
         // relative to the workspace root (never the canonical absolute
         // path, so digests are host-independent).
-        let id = match forced_id {
-            Some(locked) => {
+        let id = match &forced {
+            Some(ForcedIdentity::Exact(locked)) => {
                 let parsed = semver::Version::parse(&version).ok();
                 if locked.name != package.name || parsed.as_ref() != Some(&locked.version) {
                     return Err(CargoImportError::Unsupported(format!(
@@ -578,7 +603,22 @@ fn import_package(
                         package.name,
                     )));
                 }
-                locked
+                locked.clone()
+            }
+            Some(ForcedIdentity::Source(source)) => {
+                let version = semver::Version::parse(&version).map_err(|err| {
+                    CargoImportError::Unsupported(format!(
+                        "package {} in {} has invalid version {:?}: {err}",
+                        package.name,
+                        canonical.display(),
+                        version
+                    ))
+                })?;
+                PackageId {
+                    name: package.name.clone(),
+                    version,
+                    source: source.clone(),
+                }
             }
             None => {
                 let version = semver::Version::parse(&version).map_err(|err| {
@@ -780,10 +820,19 @@ fn import_package(
             for dep in resolved {
                 let package_id = match dep.path {
                     Some(path) => {
+                        // A path dependency of a git checkout inherits the
+                        // checkout's source identity (all packages from one
+                        // repository share the git source).
+                        let forced = match &forced {
+                            Some(ForcedIdentity::Source(source)) => {
+                                Some(ForcedIdentity::Source(source.clone()))
+                            }
+                            _ => None,
+                        };
                         let imported = import_package(
                             &path,
                             false,
-                            None,
+                            forced,
                             packages,
                             visiting,
                             &inherited,
@@ -804,17 +853,22 @@ fn import_package(
                         imported
                     }
                     None => {
-                        // Registry dependency: resolved through the
+                        // Registry/git dependency: resolved through the
                         // lockfile-backed source provider (which validated
                         // the requirement); in collecting mode the edge was
                         // recorded and nothing is imported.
                         let Some(locked) = dep.locked else {
                             continue;
                         };
+                        let forced = if locked.propagate_source {
+                            ForcedIdentity::Source(locked.id.source.clone())
+                        } else {
+                            ForcedIdentity::Exact(locked.id.clone())
+                        };
                         import_package(
                             &locked.source_dir,
                             false,
-                            Some(locked.id),
+                            Some(forced),
                             packages,
                             visiting,
                             &inherited,
@@ -920,6 +974,7 @@ fn resolve_deps(
                     extern_name: name.replace('-', "_"),
                     package: name.clone(),
                     req: version.clone(),
+                    git: None,
                     optional: false,
                     default_features: true,
                     features: Vec::new(),
@@ -930,6 +985,10 @@ fn resolve_deps(
             DepValue::Table {
                 path,
                 version,
+                git,
+                rev,
+                tag,
+                branch,
                 workspace,
                 package,
                 optional,
@@ -944,7 +1003,64 @@ fn resolve_deps(
                 let optional = optional.unwrap_or(false);
                 let default_features = default_features.unwrap_or(true);
                 let features = features.clone().unwrap_or_default();
-                if let Some(path) = path {
+                if let Some(git) = git {
+                    // A git dependency: fixed-revision source, never a
+                    // registry or path dep. Conflicting combinations are
+                    // targeted errors.
+                    if path.is_some() {
+                        return Err(CargoImportError::Unsupported(format!(
+                            "dependency {name:?} combines `git` with `path`; \
+                             Cargo requires exactly one source kind"
+                        )));
+                    }
+                    if version.is_some() || *workspace == Some(true) {
+                        return Err(CargoImportError::Unsupported(format!(
+                            "dependency {name:?} combines `git` with {}; \
+                             Cargo requires exactly one source kind",
+                            if version.is_some() {
+                                "`version` (registry)"
+                            } else {
+                                "`workspace = true`"
+                            }
+                        )));
+                    }
+                    let selectors = [&rev, &tag, &branch]
+                        .into_iter()
+                        .filter(|selector| selector.is_some())
+                        .count();
+                    if selectors > 1 {
+                        return Err(CargoImportError::Unsupported(format!(
+                            "dependency {name:?} sets more than one of `rev`, `tag`, \
+                             and `branch`; Cargo requires exactly one"
+                        )));
+                    }
+                    let selector = crate::model::GitSelector {
+                        url: crate::model::GitSelector::canonical_url(git),
+                        rev: rev.clone(),
+                        tag: tag.clone(),
+                        branch: branch.clone(),
+                    };
+                    let edge = RegistryEdge {
+                        parent: parent.id.clone(),
+                        extern_name: name.replace('-', "_"),
+                        package: package.clone().unwrap_or_else(|| name.clone()),
+                        req: "*".to_owned(),
+                        git: Some(selector),
+                        optional,
+                        default_features,
+                        features: features.clone(),
+                    };
+                    let locked = sources.locked_package(&edge)?;
+                    (
+                        None,
+                        package.clone().unwrap_or_else(|| name.clone()),
+                        optional,
+                        default_features,
+                        features,
+                        target.clone(),
+                        locked,
+                    )
+                } else if let Some(path) = path {
                     // Path deps resolve relative to the declaring manifest.
                     (
                         Some(member.join(path)),
@@ -991,6 +1107,7 @@ fn resolve_deps(
                                 extern_name: name.replace('-', "_"),
                                 package: name.clone(),
                                 req: version.clone(),
+                                git: None,
                                 optional,
                                 default_features,
                                 features: features.clone(),
@@ -1015,6 +1132,7 @@ fn resolve_deps(
                                 extern_name: name.replace('-', "_"),
                                 package: package.clone().unwrap_or_else(|| name.clone()),
                                 req: version.clone(),
+                                git: None,
                                 optional,
                                 default_features,
                                 features: features.clone(),
@@ -1044,6 +1162,7 @@ fn resolve_deps(
                         extern_name: name.replace('-', "_"),
                         package: package.clone().unwrap_or_else(|| name.clone()),
                         req: version.clone(),
+                        git: None,
                         optional,
                         default_features,
                         features: features.clone(),

@@ -29,38 +29,56 @@ pub struct RegistryConfig {
     pub dl: String,
     /// Optional API base URL (unused by tong itself).
     pub api: Option<String>,
+    /// Whether `<index>/config.json` has been fetched (lazily, when a
+    /// download is actually needed — `tong lock` and builds never touch
+    /// the network for it).
+    pub(crate) configured: bool,
 }
 
 impl RegistryConfig {
     /// The default crates.io registry. The `dl` template is fetched from
-    /// the index's `config.json` on first use.
+    /// the index's `config.json` lazily, on first download.
     pub fn crates_io() -> Self {
         Self {
             index_url: "https://index.crates.io/".to_owned(),
             dl: String::new(),
             api: None,
+            configured: false,
         }
     }
 
     /// Builds a registry from an index URL (`sparse+https://…`,
-    /// `https://…`, or `file://…`), fetching `<index>/config.json` for the
-    /// download template.
+    /// `https://…`, or `file://…`). The download template is fetched
+    /// lazily from `<index>/config.json` on first download; resolution
+    /// and locking never need it.
     pub fn from_url(index: &str) -> Result<Self, FetchError> {
         let index_url = index
             .strip_prefix("sparse+")
             .unwrap_or(index)
             .trim_end_matches('/')
             .to_owned();
-        let config_url = format!("{index_url}/config.json");
+        Ok(Self {
+            index_url,
+            dl: String::new(),
+            api: None,
+            configured: false,
+        })
+    }
+
+    /// Fetches `<index>/config.json` for the download template, once.
+    pub fn ensure_configured(&mut self) -> Result<(), FetchError> {
+        if self.configured || !self.dl.is_empty() {
+            return Ok(());
+        }
+        let config_url = format!("{}/config.json", self.index_url.trim_end_matches('/'));
         let bytes = fetch_url(&config_url, INDEX_SIZE_LIMIT)
             .map_err(|err| FetchError::BadConfig(format!("{config_url}: {err}")))?;
         let config: IndexConfig = serde_json::from_slice(&bytes)
             .map_err(|err| FetchError::BadConfig(format!("{config_url}: {err}")))?;
-        Ok(Self {
-            index_url,
-            dl: config.dl.unwrap_or_default(),
-            api: config.api,
-        })
+        self.dl = config.dl.unwrap_or_default();
+        self.api = config.api;
+        self.configured = true;
+        Ok(())
     }
 
     /// Substitutes the download markers into the `dl` template; a
@@ -254,6 +272,7 @@ mod tests {
             index_url: "https://index.crates.io/".to_owned(),
             dl: "https://static.crates.io/crates/{crate}/{crate}-{version}.crate".to_owned(),
             api: None,
+            configured: false,
         };
         let version = semver::Version::new(1, 2, 3);
         assert_eq!(
@@ -268,6 +287,7 @@ mod tests {
             index_url: "https://index.crates.io/".to_owned(),
             dl: String::new(),
             api: None,
+            configured: false,
         };
         let version = semver::Version::new(1, 2, 3);
         assert_eq!(

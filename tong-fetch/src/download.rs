@@ -38,7 +38,7 @@ pub fn checkout_dir(store: &Path, name: &str, version: &Version, checksum: &str)
 /// present.
 pub fn fetch_crate(
     cas: &Cas,
-    config: &RegistryConfig,
+    config: &mut RegistryConfig,
     pkg: &ResolvedPackage,
 ) -> Result<TreeDigest, FetchError> {
     let checksum = pkg
@@ -47,6 +47,9 @@ pub fn fetch_crate(
         .expect("registry packages always carry a checksum");
     let blob_path = crate_blob_path(cas.root(), checksum);
     if !blob_path.is_file() {
+        // The download template comes from `<index>/config.json`; fetch
+        // it lazily, only when a download is actually needed.
+        config.ensure_configured()?;
         let url = config.download_url(&pkg.name, &pkg.version, checksum);
         let bytes = fetch_crate_bytes(&url)?;
         verify_crate_bytes(&bytes, checksum, &pkg.name)?;
@@ -217,13 +220,13 @@ mod tests {
             local: false,
             dependencies: Vec::new(),
         };
-        let config = RegistryConfig::crates_io();
-        let tree = fetch_crate(&cas, &config, &pkg).unwrap();
+        let mut config = RegistryConfig::crates_io();
+        let tree = fetch_crate(&cas, &mut config, &pkg).unwrap();
         let checkout = checkout_dir(&store, "foo", &pkg.version, checksum);
         assert!(checkout.join("Cargo.toml").is_file());
         assert!(checkout.join("src/lib.rs").is_file());
         // Idempotent: re-fetch reuses everything.
-        let again = fetch_crate(&cas, &config, &pkg).unwrap();
+        let again = fetch_crate(&cas, &mut config, &pkg).unwrap();
         assert_eq!(tree, again);
     }
 }

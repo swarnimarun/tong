@@ -220,6 +220,7 @@ fn resolve_prefers_locked_version() {
     let client = client(&registry);
     let mut locked = TongLock::default();
     locked.packages.push(tong_fetch::LockedPackage {
+        tree_digest: None,
         name: "alpha".to_owned(),
         version: semver::Version::new(1, 0, 0),
         source: "registry+file://fixture".to_owned(),
@@ -247,10 +248,11 @@ fn fetch_crate_verifies_and_rejects_corruption() {
     )
     .unwrap();
     let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
-    let tree = tong_fetch::fetch_crate(&cas, &registry.config, alpha).unwrap();
+    let mut config = registry.config.clone();
+    let tree = tong_fetch::fetch_crate(&cas, &mut config, alpha).unwrap();
     assert_eq!(
         tree,
-        tong_fetch::fetch_crate(&cas, &registry.config, alpha).unwrap()
+        tong_fetch::fetch_crate(&cas, &mut config, alpha).unwrap()
     );
 
     // Corrupt the stored blob: fetch must now reject it with Checksum.
@@ -258,7 +260,7 @@ fn fetch_crate_verifies_and_rejects_corruption() {
     let mut bytes = fs::read(&blob).unwrap();
     bytes[0] ^= 0xff;
     fs::write(&blob, &bytes).unwrap();
-    let err = tong_fetch::fetch_crate(&cas, &registry.config, alpha).unwrap_err();
+    let err = tong_fetch::fetch_crate(&cas, &mut config, alpha).unwrap_err();
     assert!(
         matches!(err, tong_fetch::FetchError::Checksum { .. }),
         "{err}"

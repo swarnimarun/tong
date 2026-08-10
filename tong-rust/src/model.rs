@@ -347,6 +347,35 @@ pub struct Dep {
     pub target: Option<String>,
 }
 
+/// A git dependency selector (Cargo `git = "url"` plus at most one of
+/// `rev`, `tag`, `branch`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitSelector {
+    /// Repository URL (canonicalized: trailing `.git` stripped for
+    /// HTTPS).
+    pub url: String,
+    /// Exact commit-ish (SHA or ref), resolved by `tong lock`; never
+    /// re-resolved against a moving ref.
+    pub rev: Option<String>,
+    /// Tag, resolved to a commit only by `tong lock`.
+    pub tag: Option<String>,
+    /// Branch, resolved to a commit only by `tong lock`.
+    pub branch: Option<String>,
+}
+
+impl GitSelector {
+    /// Canonicalizes a repository URL for identity: HTTPS URLs lose a
+    /// trailing `.git`; all other forms (file, ssh, scp-style) are
+    /// unchanged — hosts, SSH syntax, and credentials are never rewritten.
+    pub fn canonical_url(url: &str) -> String {
+        if url.starts_with("https://") && url.ends_with(".git") {
+            url[..url.len() - 4].to_owned()
+        } else {
+            url.to_owned()
+        }
+    }
+}
+
 /// An unresolved registry dependency edge, collected during import
 /// (`Tong.lock` roots for the version resolver).
 #[derive(Clone, Debug)]
@@ -357,8 +386,12 @@ pub struct RegistryEdge {
     pub extern_name: String,
     /// Real package name.
     pub package: String,
-    /// Version requirement, as written in the manifest.
+    /// Version requirement, as written in the manifest (`*` for git deps
+    /// without a version).
     pub req: String,
+    /// Git source selector; `Some` makes this a git edge (resolved
+    /// against the repository, never the index).
+    pub git: Option<GitSelector>,
     /// Optional dependency (feature-activated).
     pub optional: bool,
     /// Whether the dependency's default feature is enabled.

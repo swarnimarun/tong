@@ -152,6 +152,7 @@ impl tong_rust::LockedSourceProvider for LockedSource {
         let source = tong_rust::SourceId::parse_lock_source(&package.source)
             .map_err(tong_rust::CargoImportError::Unsupported)?;
         Ok(Some(tong_rust::LockedSource {
+            propagate_source: false,
             id: tong_rust::PackageId {
                 name: package.name.clone(),
                 version: package.version.clone(),
@@ -452,7 +453,7 @@ fn check_pass(fixture: &Fixture) {
             let store = dir.join(".tong").join("store");
             let cas = Cas::open(&store).unwrap();
             let _cache = ActionCache::open(&cas).unwrap();
-            let config =
+            let mut config =
                 tong_fetch::RegistryConfig::from_url(&format!("file://{}", index.display()))
                     .unwrap();
             let index_client = tong_fetch::IndexClient::new(store.join("index"), config.clone());
@@ -499,12 +500,13 @@ fn check_pass(fixture: &Fixture) {
                     source: "registry+file".to_owned(),
                     checksum: package.checksum.clone(),
                     manifest_checksum: None,
+                    tree_digest: None,
                     yanked: package.yanked,
                     publish_time: None,
                     dependencies: deps,
                 });
                 if !package.local {
-                    tong_fetch::fetch_crate(&cas, &config, package).expect("fetch crate");
+                    tong_fetch::fetch_crate(&cas, &mut config, package).expect("fetch crate");
                 }
             }
             let provider = LockedSource::new(lock, store.clone());

@@ -37,6 +37,9 @@ pub struct LockedPackage {
     pub checksum: Option<String>,
     /// SHA-256 of the normalized `Cargo.toml` (path packages).
     pub manifest_checksum: Option<String>,
+    /// Canonical source-tree digest (git packages; captured at lock time).
+    #[serde(default)]
+    pub tree_digest: Option<String>,
     /// Whether the version is yanked on the registry.
     #[serde(default)]
     pub yanked: bool,
@@ -239,6 +242,7 @@ mod tests {
                     source: "path+crates/app".to_owned(),
                     checksum: None,
                     manifest_checksum: Some("def".to_owned()),
+                    tree_digest: None,
                     yanked: false,
                     publish_time: None,
                     dependencies: Vec::new(),
@@ -249,6 +253,7 @@ mod tests {
                     source: "registry+https://index.crates.io".to_owned(),
                     checksum: Some("abc".to_owned()),
                     manifest_checksum: None,
+                    tree_digest: None,
                     yanked: false,
                     publish_time: None,
                     dependencies: vec![

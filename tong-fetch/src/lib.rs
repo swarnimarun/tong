@@ -7,12 +7,14 @@
 //! plain, mutable cache (not CAS content).
 
 pub mod download;
+pub mod git;
 pub mod lockfile;
 pub mod registry;
 pub mod resolve;
 pub mod sparse_index;
 
 pub use download::{crate_blob_path, fetch_crate, materialize_source, verify_crate_bytes};
+pub use git::{GitError, LockedGit, ResolvedGit, materialize_tree, resolve_and_capture};
 pub use lockfile::{LOCKFILE_VERSION, LockedPackage, TongLock};
 pub use registry::{FetchError, RegistryConfig, fetch_url};
 pub use resolve::{CrateSource, LocalPackage, ResolveError, ResolvedDep, ResolvedPackage, resolve};

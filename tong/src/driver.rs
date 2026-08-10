@@ -638,22 +638,34 @@ fn prepare(
         lock(root, false)?;
     }
     let store = store_dir(root, manifest.as_ref())?;
+    let exec = tong_dir.join("exec");
+    let cas = Cas::open(&store)?;
     // Auto-fetch (cargo downloads sources as needed; tong does the same):
-    // when a locked registry archive is missing from the source store,
-    // fetch first and say so. `--offline` forbids the download — fail
-    // naming every missing source instead.
+    // when a locked registry archive or git source tree is missing from
+    // the store, fetch first and say so. `--offline` forbids the download
+    // — fail naming every missing source instead.
     let missing_sources: Vec<String> = tong_fetch::TongLock::load(root)
         .ok()
         .into_iter()
         .flat_map(|lock| lock.packages)
         .filter(|pkg| {
-            pkg.source.starts_with("registry+")
-                && pkg.checksum.as_deref().is_some_and(|checksum| {
+            if pkg.source.starts_with("registry+") {
+                pkg.checksum.as_deref().is_some_and(|checksum| {
                     !store
                         .join("sources")
                         .join(format!("{checksum}.crate"))
                         .is_file()
                 })
+            } else if pkg.source.starts_with("git+") {
+                pkg.tree_digest.as_deref().is_some_and(|tree| {
+                    tong_core::digest::Digest::from_hex(tree)
+                        .ok()
+                        .and_then(|digest| cas.get_tree(TreeDigest::new(digest)).ok().flatten())
+                        .is_none()
+                })
+            } else {
+                false
+            }
         })
         .map(|pkg| format!("{} {}", pkg.name, pkg.version))
         .collect();
@@ -668,8 +680,6 @@ fn prepare(
         println!("tong: sources not fetched — running `tong fetch` first");
         fetch(root, false)?;
     }
-    let exec = tong_dir.join("exec");
-    let cas = Cas::open(&store)?;
     let cache = ActionCache::open(&cas)?;
     tracing::debug!(
         target: "tong::perf",
@@ -686,14 +696,22 @@ fn prepare(
     let dist_version = manifest
         .as_ref()
         .and_then(|manifest| manifest.toolchain.rust.version.as_deref());
-    let (mut model, feature_map, toolchain) = std::thread::scope(
-        |scope| -> Result<(tong_rust::RustModel, tong_rust::FeatureMap, SystemRust), BuildError> {
+    let (mut model, feature_map, toolchain, sources) = std::thread::scope(
+        |scope| -> Result<
+            (
+                tong_rust::RustModel,
+                tong_rust::FeatureMap,
+                SystemRust,
+                LockfileSource,
+            ),
+            BuildError,
+        > {
             let capture = dist_version.is_none().then(|| {
                 let cas_clone = cas.clone();
                 scope.spawn(move || capture_system_rust(&cas_clone))
             });
 
-            let sources = LockfileSource::new(root, &store);
+            let sources = LockfileSource::new(root, &store, cas.clone());
             let model = load_model(root, manifest.as_ref(), &sources)?;
             tracing::debug!(
                 target: "tong::perf",
@@ -730,7 +748,7 @@ fn prepare(
                         .map_err(BuildError::Toolchain)
                 }
             }?;
-            Ok((model, feature_map, toolchain))
+            Ok((model, feature_map, toolchain, sources))
         },
     )?;
     model.feature_map = feature_map;
@@ -798,6 +816,14 @@ fn prepare(
         actions = planned.len(),
         duration_ms = t_prep.elapsed().as_millis() as u64,
     );
+
+    // Transient git checkouts: every package tree was captured into the
+    // CAS during plan(); drop the working trees (PLAN: the importer must
+    // not retain extracted checkout directories after their tree is
+    // captured).
+    for checkout in sources.take_materialized() {
+        let _ = fs::remove_dir_all(checkout);
+    }
 
     Ok(Prepared {
         tong_dir,
@@ -1056,7 +1082,7 @@ pub(crate) fn load_model_unlocked(
     root: &Path,
     manifest: Option<&Manifest>,
 ) -> Result<tong_rust::RustModel, BuildError> {
-    load_model(root, manifest, &CollectProvider::default())
+    load_model(root, manifest, &CollectProvider::recording_only())
 }
 
 /// Runs a built binary target with the given arguments.
@@ -1217,15 +1243,27 @@ struct CompletedMap(BTreeMap<ActionId, CachedResult>);
 struct LockfileSource {
     lock: Option<tong_fetch::TongLock>,
     store: PathBuf,
+    cas: Cas,
+    /// Transient checkouts materialized during this build (removed by the
+    /// driver after the source trees are captured).
+    materialized: std::cell::RefCell<Vec<PathBuf>>,
 }
 
 impl LockfileSource {
-    fn new(root: &Path, store: &Path) -> Self {
+    fn new(root: &Path, store: &Path, cas: Cas) -> Self {
         let lock = tong_fetch::TongLock::load(root).ok();
         Self {
             lock,
             store: store.to_path_buf(),
+            cas,
+            materialized: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Checkouts materialized during this build; the driver removes them
+    /// once the package trees are captured.
+    fn take_materialized(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.materialized.borrow_mut())
     }
 
     /// The exact locked package for a registry edge.
@@ -1346,6 +1384,55 @@ impl tong_rust::LockedSourceProvider for LockfileSource {
                 return Err(tong_rust::CargoImportError::Unsupported(err.to_string()));
             }
         };
+        if edge.git.is_some() {
+            // Git edge: materialize the locked tree from the CAS and
+            // verify its digest (never the network).
+            let Some(source) = package.source.strip_prefix("git+") else {
+                return Err(tong_rust::CargoImportError::Unsupported(format!(
+                    "`{} {}` is locked with source {:?}, not a git source",
+                    package.name, package.version, package.source
+                )));
+            };
+            let (url, commit) = source.split_once('#').ok_or_else(|| {
+                tong_rust::CargoImportError::Unsupported(format!(
+                    "git source {source:?} has no locked commit"
+                ))
+            })?;
+            let tree_digest = package.tree_digest.as_deref().ok_or_else(|| {
+                tong_rust::CargoImportError::Unsupported(format!(
+                    "`{} {}` has no locked source tree; run `tong lock`",
+                    package.name, package.version
+                ))
+            })?;
+            let tree_digest = tong_core::digest::Digest::from_hex(tree_digest).map_err(|err| {
+                tong_rust::CargoImportError::Unsupported(format!(
+                    "invalid tree digest {tree_digest:?}: {err}"
+                ))
+            })?;
+            let source_dir = tong_fetch::materialize_tree(
+                &self.cas,
+                tong_core::artifact::TreeDigest::new(tree_digest),
+                &self.store,
+                url,
+                commit,
+            )
+            .map_err(|err| {
+                tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong lock`"))
+            })?;
+            self.materialized.borrow_mut().push(source_dir.clone());
+            return Ok(Some(tong_rust::LockedSource {
+                id: tong_rust::model::PackageId {
+                    name: package.name,
+                    version: package.version,
+                    source: tong_rust::model::SourceId::Git {
+                        url: url.to_owned(),
+                        rev: commit.to_owned(),
+                    },
+                },
+                source_dir,
+                propagate_source: true,
+            }));
+        }
         let checksum = package.checksum.as_deref().ok_or_else(|| {
             tong_rust::CargoImportError::Unsupported(format!(
                 "`{} {}` is not a registry package",
@@ -1366,20 +1453,98 @@ impl tong_rust::LockedSourceProvider for LockfileSource {
                 source,
             },
             source_dir,
+            propagate_source: false,
         }))
     }
 }
 
 /// Collecting provider used by `tong lock`: records registry edges for the
-/// version resolver instead of resolving them.
-#[derive(Default)]
+/// version resolver instead of resolving them. Git edges ARE resolved when
+/// `resolve_git` is set (the lock must pin their commits, capture their
+/// trees, and import their packages so feature resolution and the
+/// resolution graph see them); the dockerfile path records them like
+/// registry edges.
 struct CollectProvider {
     edges: std::cell::RefCell<Vec<tong_rust::RegistryEdge>>,
+    store: Option<PathBuf>,
+    cas: Option<Cas>,
+    offline: bool,
+    /// The existing lock (preferences for git commits).
+    preferences: Option<tong_fetch::TongLock>,
+    /// `tong update <package>`: drop that package's locked git commit.
+    drop_preference: Option<String>,
+    /// git source string → captured tree digest hex (lock assembly).
+    git_trees: std::cell::RefCell<BTreeMap<String, String>>,
+    /// Transient git checkouts created during this lock run.
+    git_checkouts: std::cell::RefCell<Vec<PathBuf>>,
+    /// Resolve git edges (lock mode); `false` records them like registry
+    /// edges (dockerfile mode).
+    resolve_git: bool,
 }
 
 impl CollectProvider {
+    fn for_lock(
+        store: PathBuf,
+        cas: Cas,
+        offline: bool,
+        preferences: Option<tong_fetch::TongLock>,
+        drop_preference: Option<String>,
+    ) -> Self {
+        Self {
+            edges: std::cell::RefCell::new(Vec::new()),
+            store: Some(store),
+            cas: Some(cas),
+            offline,
+            preferences,
+            drop_preference,
+            git_trees: std::cell::RefCell::new(BTreeMap::new()),
+            git_checkouts: std::cell::RefCell::new(Vec::new()),
+            resolve_git: true,
+        }
+    }
+
+    /// Records every edge without resolving anything (dockerfile mode).
+    fn recording_only() -> Self {
+        Self {
+            edges: std::cell::RefCell::new(Vec::new()),
+            store: None,
+            cas: None,
+            offline: false,
+            preferences: None,
+            drop_preference: None,
+            git_trees: std::cell::RefCell::new(BTreeMap::new()),
+            git_checkouts: std::cell::RefCell::new(Vec::new()),
+            resolve_git: false,
+        }
+    }
+
     fn take_edges(&self) -> Vec<tong_rust::RegistryEdge> {
         std::mem::take(&mut *self.edges.borrow_mut())
+    }
+
+    fn take_git_trees(&self) -> BTreeMap<String, String> {
+        std::mem::take(&mut *self.git_trees.borrow_mut())
+    }
+
+    fn take_git_checkouts(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.git_checkouts.borrow_mut())
+    }
+
+    /// The locked git commit for a package from `url`, when the existing
+    /// lock pins one.
+    fn locked_git(&self, name: &str, url: &str) -> Option<tong_fetch::LockedGit> {
+        let prefix = format!("git+{url}#");
+        let lock = self.preferences.as_ref()?;
+        let package = lock
+            .candidates(name)
+            .find(|p| p.source.starts_with(&prefix))?;
+        let commit = package.source.strip_prefix(&prefix)?;
+        let tree_digest = package.tree_digest.as_deref()?;
+        let tree_digest = tong_core::digest::Digest::from_hex(tree_digest).ok()?;
+        Some(tong_fetch::LockedGit {
+            commit: commit.to_owned(),
+            tree_digest: tong_core::artifact::TreeDigest::new(tree_digest),
+        })
     }
 }
 
@@ -1395,8 +1560,73 @@ impl tong_rust::LockedSourceProvider for CollectProvider {
                 edge.req, edge.package
             ))
         })?;
-        self.edges.borrow_mut().push(edge.clone());
-        Ok(None)
+        let Some(selector) = &edge.git else {
+            self.edges.borrow_mut().push(edge.clone());
+            return Ok(None);
+        };
+        if !self.resolve_git {
+            // Dockerfile mode: the git edge is recorded like a registry
+            // edge; nothing is fetched or imported.
+            self.edges.borrow_mut().push(edge.clone());
+            return Ok(None);
+        }
+        // Git edge: resolve the selector now (network allowed at lock
+        // time), capture the tree, and import the checkout.
+        let (store, cas) = (
+            self.store.as_ref().expect("lock provider has a store"),
+            self.cas.as_ref().expect("lock provider has a cas"),
+        );
+        let prefer_locked = self.drop_preference.as_deref() != Some(edge.package.as_str());
+        let locked = self.locked_git(&edge.package, &selector.url);
+        if self.offline && prefer_locked && locked.is_none() {
+            return Err(tong_rust::CargoImportError::Unsupported(format!(
+                "git dependency `{}` from {} is not locked; run `tong lock` online once \
+                 (--offline forbids fetching repositories)",
+                edge.package, selector.url
+            )));
+        }
+        if self.offline && !prefer_locked {
+            return Err(tong_rust::CargoImportError::Unsupported(format!(
+                "cannot re-resolve git dependency `{}` from {} while offline; \
+                 run `tong update` online",
+                edge.package, selector.url
+            )));
+        }
+        let resolved = tong_fetch::resolve_and_capture(
+            store,
+            cas,
+            &selector.url,
+            selector.rev.as_deref(),
+            selector.tag.as_deref(),
+            selector.branch.as_deref(),
+            prefer_locked,
+            locked.as_ref(),
+        )
+        .map_err(|err| {
+            tong_rust::CargoImportError::Unsupported(format!(
+                "git dependency `{}` from {}: {err}",
+                edge.package, selector.url
+            ))
+        })?;
+        let source = tong_rust::SourceId::Git {
+            url: selector.url.clone(),
+            rev: resolved.commit.clone(),
+        };
+        self.git_trees
+            .borrow_mut()
+            .insert(source.lock_source(), resolved.tree_digest.digest().to_hex());
+        self.git_checkouts
+            .borrow_mut()
+            .push(resolved.checkout.clone());
+        Ok(Some(tong_rust::LockedSource {
+            id: tong_rust::PackageId {
+                name: edge.package.clone(),
+                version: semver::Version::new(0, 0, 0),
+                source,
+            },
+            source_dir: resolved.checkout,
+            propagate_source: true,
+        }))
     }
 }
 
@@ -1471,6 +1701,7 @@ fn seed_from_cargo_lock(
                 yanked: false,
                 publish_time: None,
                 manifest_checksum: None,
+                tree_digest: None,
                 dependencies: Vec::new(),
             });
         }
@@ -1481,35 +1712,48 @@ fn seed_from_cargo_lock(
 fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Result<(), BuildError> {
     let manifest = load_manifest(root)?;
     let store = store_dir(root, manifest.as_ref())?;
-    let _cas = Cas::open(&store)?;
-
-    // Collect registry edges via a collecting provider.
-    let provider = CollectProvider::default();
-    let model = load_model(root, manifest.as_ref(), &provider)?;
-    let edges = provider.take_edges();
-
-    // Feature resolution decides which optional edges are live.
-    let requests = feature_requests(&model, &BuildOptions::default(), manifest.as_ref())?;
-    let feature_map = tong_rust::resolve_features(&model, &requests, true)
-        .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    let cas = Cas::open(&store)?;
 
     // Index client (cached under <store>/index/).
     let registry = registry_config(manifest.as_ref())?;
     let mut index = tong_fetch::IndexClient::new(store.join("index"), registry.clone());
     index.set_offline(offline);
+
+    // Preferences: the existing lock pins registry versions and git
+    // commits. With no Tong.lock but a Cargo.lock, seed exact registry
+    // versions/checksums (Cargo semantics: `--locked` forbids creating or
+    // updating the lock — enforced by the build driver before any network
+    // request). `tong update <package>` drops that package's preference.
     let mut preferences = tong_fetch::TongLock::load(root).unwrap_or_default();
     if preferences.packages.is_empty() && root.join("Cargo.lock").is_file() {
-        // No Tong.lock yet: seed the resolver preference with the exact
-        // registry versions/checksums from an existing Cargo.lock, so
-        // `tong lock` stays stable against a Cargo-generated lock (Cargo
-        // semantics: `--locked` forbids creating or updating it, enforced
-        // by the build driver before any network request).
         let registry_source = format!("registry+{}", registry.index_url);
         preferences = seed_from_cargo_lock(root, &registry_source)?;
     }
     if let Some(package) = drop_preference {
         preferences.packages.retain(|p| p.name != package);
     }
+
+    // Collect registry edges via a collecting provider; git edges are
+    // resolved by the provider itself (commits pinned against the
+    // preferences, trees captured into the CAS, checkouts imported) so the
+    // git packages join the normal model and feature graph.
+    let provider = CollectProvider::for_lock(
+        store.clone(),
+        cas.clone(),
+        offline,
+        Some(preferences.clone()),
+        drop_preference.map(str::to_owned),
+    );
+    let model = load_model(root, manifest.as_ref(), &provider)?;
+    let edges = provider.take_edges();
+    let git_trees = provider.take_git_trees();
+    let git_checkouts = provider.take_git_checkouts();
+
+    // Feature resolution decides which optional edges are live (git
+    // packages are in the model now, so their optional deps gate too).
+    let requests = feature_requests(&model, &BuildOptions::default(), manifest.as_ref())?;
+    let feature_map = tong_rust::resolve_features(&model, &requests, true)
+        .map_err(|err| BuildError::Manifest(err.to_string()))?;
 
     // The version resolver keys local (workspace/path) packages by name.
     // Two local packages sharing a name would alias there; Cargo can
@@ -1648,7 +1892,9 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             p.id.name == name
                 && matches!(
                     p.id.source,
-                    tong_rust::model::SourceId::Workspace(_) | tong_rust::model::SourceId::Path(_)
+                    tong_rust::model::SourceId::Workspace(_)
+                        | tong_rust::model::SourceId::Path(_)
+                        | tong_rust::model::SourceId::Git { .. }
                 )
         })
     };
@@ -1669,6 +1915,11 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         } else {
             None
         };
+        // Git packages carry the canonical source-tree digest captured at
+        // lock time.
+        let tree_digest = source
+            .strip_prefix("git+")
+            .and_then(|_| git_trees.get(&source).cloned());
         let mut deps: Vec<String> = package
             .dependencies
             .iter()
@@ -1687,6 +1938,7 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             source,
             checksum: package.checksum.clone(),
             manifest_checksum,
+            tree_digest,
             yanked: package.yanked,
             publish_time: None,
             dependencies: deps,
@@ -1695,6 +1947,11 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     locked
         .save(root)
         .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    // Git checkouts are transient at lock time: their content lives in
+    // the CAS (the tree digests just recorded); drop the working trees.
+    for checkout in git_checkouts {
+        let _ = fs::remove_dir_all(checkout);
+    }
     println!("wrote Tong.lock ({} packages)", locked.packages.len());
     Ok(())
 }
@@ -1734,15 +1991,26 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
     let cas = Cas::open(&store)?;
     let lock =
         tong_fetch::TongLock::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
-    let registry = registry_config(manifest.as_ref())?;
+    let mut registry = registry_config(manifest.as_ref())?;
     let missing: Vec<&tong_fetch::LockedPackage> = lock
         .packages
         .iter()
         .filter(|package| {
-            package.source.starts_with("registry+")
-                && package.checksum.as_deref().is_some_and(|checksum| {
+            if package.source.starts_with("registry+") {
+                package.checksum.as_deref().is_some_and(|checksum| {
                     !tong_fetch::crate_blob_path(&store, checksum).is_file()
                 })
+            } else if package.source.starts_with("git+") {
+                // The locked source tree must be present in the CAS.
+                package.tree_digest.as_deref().is_some_and(|tree| {
+                    tong_core::digest::Digest::from_hex(tree)
+                        .ok()
+                        .and_then(|digest| cas.get_tree(TreeDigest::new(digest)).ok().flatten())
+                        .is_none()
+                })
+            } else {
+                false
+            }
         })
         .collect();
     if offline && !missing.is_empty() {
@@ -1758,35 +2026,60 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
     let total = lock
         .packages
         .iter()
-        .filter(|package| package.source.starts_with("registry+") && package.checksum.is_some())
+        .filter(|package| {
+            (package.source.starts_with("registry+") && package.checksum.is_some())
+                || package.source.starts_with("git+")
+        })
         .count();
-    let mut fetched = 0;
+    let mut fetched = 0usize;
     for package in &lock.packages {
-        if !package.source.starts_with("registry+") {
-            continue;
+        if package.source.starts_with("registry+") {
+            let Some(checksum) = &package.checksum else {
+                continue;
+            };
+            println!(
+                "  downloading {}/{} {} {}",
+                fetched + 1,
+                total,
+                package.name,
+                package.version
+            );
+            let resolved = tong_fetch::ResolvedPackage {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: None,
+                checksum: Some(checksum.clone()),
+                yanked: package.yanked,
+                local: false,
+                dependencies: Vec::new(),
+            };
+            tong_fetch::fetch_crate(&cas, &mut registry, &resolved)
+                .map_err(|err| BuildError::Manifest(err.to_string()))?;
+            fetched += 1;
+        } else if let Some(rest) = package.source.strip_prefix("git+") {
+            // Materialize the locked tree from the CAS and verify it.
+            let Some((url, commit)) = rest.split_once('#') else {
+                continue;
+            };
+            let tree_digest = package.tree_digest.as_deref().ok_or_else(|| {
+                BuildError::Manifest(format!(
+                    "`{} {}` has no locked source tree; run `tong lock`",
+                    package.name, package.version
+                ))
+            })?;
+            let tree_digest = tong_core::digest::Digest::from_hex(tree_digest)
+                .map_err(|err| BuildError::Manifest(format!("invalid tree digest: {err}")))?;
+            println!(
+                "  materializing {}/{} {} {}",
+                fetched + 1,
+                total,
+                package.name,
+                package.version
+            );
+            tong_fetch::materialize_tree(&cas, TreeDigest::new(tree_digest), &store, url, commit)
+                .map_err(|err| BuildError::Manifest(format!("{err}; run `tong lock`")))?;
+            fetched += 1;
         }
-        let Some(checksum) = &package.checksum else {
-            continue;
-        };
-        println!(
-            "  downloading {}/{} {} {}",
-            fetched + 1,
-            total,
-            package.name,
-            package.version
-        );
-        let resolved = tong_fetch::ResolvedPackage {
-            name: package.name.clone(),
-            version: package.version.clone(),
-            source: None,
-            checksum: Some(checksum.clone()),
-            yanked: package.yanked,
-            local: false,
-            dependencies: Vec::new(),
-        };
-        tong_fetch::fetch_crate(&cas, &registry, &resolved)
-            .map_err(|err| BuildError::Manifest(err.to_string()))?;
-        fetched += 1;
     }
     println!("fetched {fetched} crates");
     Ok(())

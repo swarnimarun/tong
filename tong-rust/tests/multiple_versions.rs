@@ -111,7 +111,7 @@ alpha2 = { package = "alpha", version = "=2.0.0" }
     // fetch their checkouts into the store.
     let store = ws.join(".tong").join("store");
     let cas = Cas::open(&store).unwrap();
-    let config =
+    let mut config =
         tong_fetch::RegistryConfig::from_url(&format!("file://{}", root.join("index").display()))
             .unwrap();
     let index_client = tong_fetch::IndexClient::new(store.join("index"), config.clone());
@@ -165,12 +165,13 @@ alpha2 = { package = "alpha", version = "=2.0.0" }
                 .unwrap_or_else(|| "registry+fixture".to_owned()),
             checksum: package.checksum.clone(),
             manifest_checksum: None,
+            tree_digest: None,
             yanked: package.yanked,
             publish_time: None,
             dependencies: deps,
         });
         if !package.local {
-            tong_fetch::fetch_crate(&cas, &config, package).unwrap();
+            tong_fetch::fetch_crate(&cas, &mut config, package).unwrap();
         }
     }
     lock.save(ws).unwrap();
@@ -224,6 +225,7 @@ impl tong_rust::LockedSourceProvider for LockedFixture {
                     tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
                 })?;
         Ok(Some(tong_rust::LockedSource {
+            propagate_source: false,
             id: registry_id(&package.version.to_string()),
             source_dir,
         }))
