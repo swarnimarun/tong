@@ -4,9 +4,10 @@ Tong is a declarative, hermetic, multi-language build system for monorepos.
 It preserves familiar language workflows while lowering all build work into
 explicit, cacheable actions.
 
-Status: **experimental (0.1.0)**. Rust is the first certified backend; the
-Rust, C, and C++ coexistence goal and the remaining platform certification
-work are tracked in the [roadmap](https://swarnimarun.github.io/tong/roadmap.html).
+Status: **experimental (0.2.0-dev)**. Rust is the first backend under
+compatibility certification. The Rust, C, and C++ coexistence goal and
+remaining platform certification work are tracked in the
+[roadmap](https://swarnimarun.github.io/tong/roadmap.html).
 
 ## What makes Tong different
 

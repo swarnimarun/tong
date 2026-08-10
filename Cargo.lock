@@ -2791,7 +2791,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tong"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "flate2",
@@ -2813,14 +2813,14 @@ dependencies = [
 
 [[package]]
 name = "tong-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "tong-corpus-runner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "tong-exec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "tong-core",
@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "tong-fetch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "gix",
@@ -2861,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "tong-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "tong-rust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "lzma-rs",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "tong-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "tong-core",

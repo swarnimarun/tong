@@ -196,7 +196,7 @@ local dev store must never be copied over the image's store.
 
 **Template.** Member-manifest `COPY` lines, binary names, and the
 version pin are the only generated substitutions (`rust:1.97-bookworm`
-and `tong 0.1.0` are examples):
+and a published Tong version are examples):
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -205,7 +205,8 @@ and `tong 0.1.0` are examples):
 
 # Stage 0: tong toolchain (busts only when the tong version pin changes).
 FROM rust:1.97-bookworm AS toolchain
-RUN cargo install tong --version 0.1.0 --locked
+ARG TONG_VERSION
+RUN cargo install tong --version "${TONG_VERSION}" --locked
 
 # Stage 1: fetch + build deps. Busts only when manifests, Tong.lock, or
 # the toolchain change — never on source edits.
