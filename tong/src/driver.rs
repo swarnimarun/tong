@@ -32,6 +32,14 @@ pub const KIND_BENCH: u32 = 1 << 4;
 /// Every target kind.
 pub const KIND_ALL: u32 = KIND_LIB | KIND_BIN | KIND_TEST | KIND_EXAMPLE | KIND_BENCH;
 
+/// One Cargo-style singular target selector (`--bin`, `--example`,
+/// `--test`, or `--bench`).
+#[derive(Clone, Debug)]
+pub struct TargetSelection {
+    pub kind: &'static str,
+    pub name: String,
+}
+
 /// Default retention for unmarked cache objects (auto-GC after builds).
 pub const DEFAULT_RETENTION: &str = "7d";
 /// Default store size budget (auto-GC after builds).
@@ -100,6 +108,12 @@ pub struct BuildOptions {
     pub profile: String,
     /// Restrict materialized artifacts to these target names.
     pub targets: Vec<String>,
+    /// Select every workspace member instead of `default-members`.
+    pub workspace: bool,
+    /// Workspace package specs excluded from the selected roots.
+    pub excludes: Vec<String>,
+    /// Singular target selectors, kept separate from package selection.
+    pub target_selections: Vec<TargetSelection>,
     /// Feature selection (Cargo-style flags).
     pub features: FeatureOptions,
     /// Sandbox enforcement level (`[policy] sandbox`, default `l1`).
@@ -751,11 +765,12 @@ fn prepare(
     let dist_version = manifest
         .as_ref()
         .and_then(|manifest| manifest.toolchain.rust.version.as_deref());
-    let (mut model, feature_map, toolchain, sources) = std::thread::scope(
+    let (mut model, feature_map, configured_members, toolchain, sources) = std::thread::scope(
         |scope| -> Result<
             (
                 tong_rust::RustModel,
                 tong_rust::FeatureMap,
+                Vec<tong_rust::PackageId>,
                 SystemRust,
                 LockfileSource,
             ),
@@ -793,6 +808,10 @@ fn prepare(
             // are baked into the action graph. Test builds additionally
             // activate dev-dep edges.
             let requests = feature_requests(&model, options, manifest.as_ref())?;
+            let configured_members = requests
+                .iter()
+                .map(|request| request.package.clone())
+                .collect();
             let feature_map = tong_rust::resolve_features(&model, &requests, include_dev_deps)
                 .map_err(|err| BuildError::Manifest(err.to_string()))?;
 
@@ -817,10 +836,16 @@ fn prepare(
                         .map_err(BuildError::Toolchain)
                 }
             }?;
-            Ok((model, feature_map, toolchain, sources))
+            Ok((model, feature_map, configured_members, toolchain, sources))
         },
     )?;
     model.feature_map = feature_map;
+    model.configured_members = configured_members;
+    model.configured_targets = options
+        .target_selections
+        .iter()
+        .map(|selection| (selection.kind.to_owned(), selection.name.clone()))
+        .collect();
     tracing::debug!(
         target: "tong::perf",
         phase = "prepare.toolchain",
@@ -1125,47 +1150,86 @@ fn feature_requests(
     options: &BuildOptions,
     manifest: Option<&Manifest>,
 ) -> Result<Vec<tong_rust::FeatureRequest>, BuildError> {
-    let selected = |name: &str| {
-        options.targets.is_empty()
-            || options
-                .targets
-                .iter()
-                .any(|target| artifact_name_matches(target, name))
+    if !options.excludes.is_empty() && !options.workspace {
+        return Err(BuildError::Manifest(
+            "--exclude can only be used together with --workspace".to_owned(),
+        ));
+    }
+    let explicit = !options.targets.is_empty() || !options.target_selections.is_empty();
+    let roots: Vec<&tong_rust::PackageId> = if explicit {
+        model
+            .members
+            .iter()
+            .filter(|id| {
+                options.targets.iter().any(|target| {
+                    package_spec_matches(target, id)
+                        || manifest
+                            .is_some_and(|manifest| native_selection_matches(manifest, target, id))
+                }) || options.target_selections.iter().any(|selection| {
+                    model
+                        .packages
+                        .iter()
+                        .find(|package| &package.id == *id)
+                        .is_some_and(|package| target_selection_matches(selection, package))
+                })
+            })
+            .collect()
+    } else if options.workspace || model.default_members.is_empty() {
+        model.members.iter().collect()
+    } else {
+        model.default_members.iter().collect()
     };
+    let roots: Vec<&tong_rust::PackageId> = roots
+        .into_iter()
+        .filter(|id| {
+            !options
+                .excludes
+                .iter()
+                .any(|exclude| package_spec_matches(exclude, id))
+        })
+        .collect();
+    if roots.is_empty() && (explicit || !model.members.is_empty()) {
+        let detail = if explicit {
+            format!(
+                "no workspace package or target matches packages {:?}, targets {:?}",
+                options.targets,
+                options
+                    .target_selections
+                    .iter()
+                    .map(|selection| format!("{}:{}", selection.kind, selection.name))
+                    .collect::<Vec<_>>()
+            )
+        } else {
+            "workspace selection contains no packages".to_owned()
+        };
+        return Err(BuildError::Manifest(detail));
+    }
+
     let mut requests = Vec::new();
     if let Some(manifest) = manifest {
         // Native mode: one package per manifest target (cc_import targets
         // are native imports, not feature-bearing packages).
-        for (name, target) in &manifest.target {
-            if target.rule == "cc_import" || !selected(name) {
-                continue;
-            }
-            let id = model
-                .packages
-                .iter()
-                .find(|p| p.name == *name)
-                .map(|p| p.id.clone())
-                .ok_or_else(|| {
-                    BuildError::Manifest(format!(
-                        "target {name:?} produced no feature-bearing package"
-                    ))
-                })?;
+        for id in roots {
+            let target = manifest
+                .target
+                .values()
+                .find(|target| target.package_name.as_deref() == Some(&id.name))
+                .or_else(|| manifest.target.get(&id.name));
             let mut features = options.features.features.clone();
-            if options.features.all_features {
+            if options.features.all_features
+                && let Some(target) = target
+            {
                 features.extend(target.features.keys().cloned());
             }
             let default_features = !options.features.no_default_features;
             requests.push(tong_rust::FeatureRequest {
-                package: id,
+                package: id.clone(),
                 features,
                 default_features,
             });
         }
     } else {
-        for id in &model.members {
-            if !selected(&id.name) {
-                continue;
-            }
+        for id in roots {
             let mut features = options.features.features.clone();
             let default_features = if options.features.all_features {
                 true
@@ -1181,23 +1245,6 @@ fn feature_requests(
                 package: id.clone(),
                 features,
                 default_features,
-            });
-        }
-    }
-    if requests.is_empty() {
-        // No selection matched (or an empty native manifest): fall back to
-        // all members so the feature map still covers the graph
-        // (`[workspace] default_members` narrows the set when declared).
-        let fallback: Vec<&tong_rust::PackageId> = if !model.default_members.is_empty() {
-            model.default_members.iter().collect()
-        } else {
-            model.members.iter().collect()
-        };
-        for id in fallback {
-            requests.push(tong_rust::FeatureRequest {
-                package: id.clone(),
-                features: Vec::new(),
-                default_features: true,
             });
         }
     }
@@ -1770,6 +1817,70 @@ fn artifact_name_matches(label: &str, name: &str) -> bool {
         return true;
     }
     label.replace('_', "-") == name.replace('_', "-")
+}
+
+fn package_spec_matches(spec: &str, package: &tong_rust::PackageId) -> bool {
+    if artifact_name_matches(spec, &package.name) {
+        return true;
+    }
+    let (identity, source) = spec
+        .split_once('#')
+        .map_or((spec, None), |(identity, source)| (identity, Some(source)));
+    let Some((name, version)) = identity.rsplit_once('@') else {
+        return false;
+    };
+    artifact_name_matches(name, &package.name)
+        && version == package.version.to_string()
+        && source.is_none_or(|source| source == package.lock_source())
+}
+
+fn target_selection_matches(selection: &TargetSelection, package: &tong_rust::Package) -> bool {
+    match selection.kind {
+        "bin" => package
+            .bins
+            .iter()
+            .any(|target| target.name == selection.name),
+        "example" => package
+            .examples
+            .iter()
+            .any(|target| target.name == selection.name),
+        "test" => package
+            .tests
+            .iter()
+            .any(|target| !target.bench && target.name == selection.name),
+        "bench" => package
+            .tests
+            .iter()
+            .any(|target| target.bench && target.name == selection.name),
+        _ => false,
+    }
+}
+
+fn native_selection_matches(
+    manifest: &Manifest,
+    selection: &str,
+    package: &tong_rust::PackageId,
+) -> bool {
+    if let Some((member, _)) = selection
+        .strip_prefix("//")
+        .and_then(|rest| rest.rsplit_once(':'))
+        && let tong_rust::SourceId::Workspace(relative) = &package.source
+        && member == relative
+    {
+        return true;
+    }
+    let target_name = selection
+        .strip_prefix(':')
+        .or_else(|| {
+            selection
+                .strip_prefix("//")
+                .and_then(|rest| rest.rsplit_once(':').map(|(_, name)| name))
+        })
+        .unwrap_or(selection);
+    manifest
+        .target
+        .get(target_name)
+        .is_some_and(|target| target.package_name.as_deref().unwrap_or(target_name) == package.name)
 }
 
 /// Removes the project-local `.tong` directory, or — in shared-store mode —

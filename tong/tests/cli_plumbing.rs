@@ -62,7 +62,7 @@ fn cargo_workspace() -> tempfile::TempDir {
     let ws = dir.path();
     fs::write(
         ws.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\ndefault-members = [\"crates/core\"]\nresolver = \"2\"\n",
     )
     .unwrap();
     fs::create_dir_all(ws.join("crates/app/src")).unwrap();
@@ -76,6 +76,16 @@ fn cargo_workspace() -> tempfile::TempDir {
         "fn main() { println!(\"{}\", core::v()); }\n",
     )
     .unwrap();
+    fs::create_dir_all(ws.join("crates/app/tests")).unwrap();
+    fs::write(
+        ws.join("crates/app/tests/smoke.rs"),
+        "#[test] fn smoke() {}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(ws.join("crates/app/examples")).unwrap();
+    fs::write(ws.join("crates/app/examples/demo.rs"), "fn main() {}\n").unwrap();
+    fs::create_dir_all(ws.join("crates/app/benches")).unwrap();
+    fs::write(ws.join("crates/app/benches/simple.rs"), "fn main() {}\n").unwrap();
     fs::create_dir_all(ws.join("crates/core/src")).unwrap();
     fs::write(
         ws.join("crates/core/Cargo.toml"),
@@ -175,10 +185,43 @@ fn cargo_workflow_commands_cargo_workspace() {
 
     let output = run_tong(ws, &["build", "-p", "app"]);
     assert_success(&output, "build -p app");
+    let output = run_tong(ws, &["check"]);
+    assert_success(&output, "check default-members");
+    assert!(!stdout_of(&output).contains("rust:bin:app:app"));
     let output = run_tong(ws, &["check", "--workspace"]);
     assert_success(&output, "check --workspace");
-    let output = run_tong(ws, &["test"]);
-    assert_success(&output, "test");
+    let output = run_tong(ws, &["test", "--workspace", "--no-run"]);
+    assert_success(&output, "test --workspace --no-run");
+    let output = run_tong(ws, &["bench", "--workspace", "--no-run"]);
+    assert_success(&output, "bench --workspace --no-run");
+
+    let output = run_tong(ws, &["check", "--workspace", "--exclude", "app"]);
+    assert_success(&output, "check --workspace --exclude app");
+    assert!(!stdout_of(&output).contains("rust:bin:app:app"));
+
+    let runner = ws.join("runner");
+    fs::create_dir(&runner).unwrap();
+    let output = run_tong(
+        &runner,
+        &["check", "--manifest-path", "../Cargo.toml", "-p", "app"],
+    );
+    assert_success(&output, "check --manifest-path");
+    for (selector, name, action) in [
+        ("--bin", "app", "rust:bin:app:app"),
+        ("--example", "demo", "rust:example:app:demo"),
+        ("--test", "smoke", "rust:test-compile:app:smoke"),
+        ("--bench", "simple", "rust:test-compile:app:simple"),
+    ] {
+        let output = run_tong(ws, &["check", selector, name]);
+        assert_success(&output, &format!("check {selector} {name}"));
+        assert!(
+            stdout_of(&output).contains(action),
+            "{}",
+            stdout_of(&output)
+        );
+    }
+    let output = run_tong(ws, &["check", "--release", "-p", "app"]);
+    assert_success(&output, "check --release");
     let output = run_tong(ws, &["run", "-p", "app", "--bin", "app"]);
     assert_success(&output, "run -p app --bin app");
     assert!(stdout_of(&output).trim().ends_with("7"));

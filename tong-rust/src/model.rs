@@ -331,6 +331,11 @@ pub struct RustModel {
     /// Workspace packages built by default (`[workspace] default_members`;
     /// empty = every member).
     pub default_members: Vec<PackageId>,
+    /// Workspace roots selected for the configured command. Empty means
+    /// the backend was constructed directly and all members are selected.
+    pub configured_members: Vec<PackageId>,
+    /// Singular Cargo target selectors as `(kind, name)` pairs.
+    pub configured_targets: Vec<(String, String)>,
 }
 
 impl Default for RustModel {
@@ -346,6 +351,8 @@ impl Default for RustModel {
             feature_map: crate::features::FeatureMap::default(),
             resolver: ResolverVersion::V2,
             default_members: Vec::new(),
+            configured_members: Vec::new(),
+            configured_targets: Vec::new(),
         }
     }
 }

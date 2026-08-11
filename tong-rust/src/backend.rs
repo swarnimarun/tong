@@ -545,10 +545,14 @@ impl<'a> RustBackend<'a> {
             .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
 
-        if !self.is_member(pkg) {
+        if !self.is_selected_member(pkg) {
             return Ok(());
         }
         for target in &pkg.tests {
+            let kind = if target.bench { "bench" } else { "test" };
+            if !self.target_selected(kind, &target.name) {
+                continue;
+            }
             if !self.required_features_active(pkg, &target.required_features) {
                 continue;
             }
@@ -1137,10 +1141,13 @@ impl<'a> RustBackend<'a> {
             .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
 
-        if !self.is_member(pkg) {
+        if !self.is_selected_member(pkg) {
             return Ok(());
         }
         for bin in &pkg.bins {
+            if !self.target_selected("bin", &bin.name) {
+                continue;
+            }
             if !self.required_features_active(pkg, &bin.required_features) {
                 continue;
             }
@@ -1193,10 +1200,13 @@ impl<'a> RustBackend<'a> {
             .planned_ids
             .get(&format!("bs-run:{}", self.pkg_key(pkg)))
             .cloned();
-        if !self.is_member(pkg) {
+        if !self.is_selected_member(pkg) {
             return Ok(());
         }
         for example in &pkg.examples {
+            if !self.target_selected("example", &example.name) {
+                continue;
+            }
             if !self.required_features_active(pkg, &example.required_features) {
                 continue;
             }
@@ -1268,6 +1278,9 @@ impl<'a> RustBackend<'a> {
     pub fn final_artifacts(&self) -> Vec<FinalArtifact> {
         let mut out = Vec::new();
         for pkg in &self.model.packages {
+            if !self.is_selected_member(pkg) {
+                continue;
+            }
             let runtime: Vec<(BlobDigest, String)> = self
                 .cc_closure
                 .get(&pkg.id)
@@ -1279,6 +1292,9 @@ impl<'a> RustBackend<'a> {
                 })
                 .collect();
             for bin in &pkg.bins {
+                if !self.target_selected("bin", &bin.name) {
+                    continue;
+                }
                 let Some(action) =
                     self.planned_ids
                         .get(&format!("bin:{}:{}", self.pkg_key(pkg), bin.name))
@@ -1507,6 +1523,23 @@ impl<'a> RustBackend<'a> {
     /// non-members are never planned (`--all-targets` covers members).
     fn is_member(&self, pkg: &Package) -> bool {
         self.model.members.contains(&pkg.id)
+    }
+
+    fn is_selected_member(&self, pkg: &Package) -> bool {
+        self.is_member(pkg)
+            && (self.model.configured_members.is_empty()
+                || self.model.configured_members.contains(&pkg.id))
+    }
+
+    fn target_selected(&self, kind: &str, name: &str) -> bool {
+        self.model.configured_targets.is_empty()
+            || self
+                .model
+                .configured_targets
+                .iter()
+                .any(|(selected_kind, selected_name)| {
+                    selected_kind == kind && selected_name == name
+                })
     }
 
     /// The profile for `package_name`: an exact or glob-matching

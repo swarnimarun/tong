@@ -9,7 +9,7 @@ mod dockerfile;
 mod driver;
 mod manifest_mode;
 
-use driver::{BuildOptions, BuildOutcome};
+use driver::{BuildOptions, BuildOutcome, TargetSelection};
 
 #[derive(Parser)]
 #[command(
@@ -32,6 +32,18 @@ struct BuildFlags {
     /// Profile name (dev or release by default).
     #[arg(long, default_value = "dev")]
     profile: String,
+    /// Use the release profile.
+    #[arg(long, conflicts_with = "profile")]
+    release: bool,
+    /// Path to Cargo.toml or Tong.toml.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+    /// Select every workspace member.
+    #[arg(long)]
+    workspace: bool,
+    /// Exclude workspace packages (requires `--workspace`).
+    #[arg(long, value_delimiter = ',')]
+    exclude: Vec<String>,
     /// Select workspace packages by spec: `name`, `name@version`, or
     /// `name@version#source`.
     #[arg(short = 'p', long = "package", value_delimiter = ',')]
@@ -44,17 +56,17 @@ struct BuildFlags {
     #[arg(long)]
     lib: bool,
     /// Build the binary targets.
-    #[arg(long)]
-    bins: bool,
+    #[arg(long = "bins")]
+    all_bins: bool,
     /// Build the example targets.
-    #[arg(long)]
-    examples: bool,
+    #[arg(long = "examples")]
+    all_examples: bool,
     /// Build the test targets (and run them for `tong test`).
-    #[arg(long)]
-    tests: bool,
+    #[arg(long = "tests")]
+    all_tests: bool,
     /// Build the benchmark targets (and run them for `tong bench`).
-    #[arg(long)]
-    benches: bool,
+    #[arg(long = "benches")]
+    all_benches: bool,
     /// Build every target kind.
     #[arg(long)]
     all_targets: bool,
@@ -86,6 +98,59 @@ struct BuildFlags {
     frozen: bool,
 }
 
+#[derive(Args, Clone, Default)]
+struct NamedTargets {
+    #[arg(long = "bin", value_name = "NAME")]
+    bins: Vec<String>,
+    #[arg(long = "example", value_name = "NAME")]
+    examples: Vec<String>,
+    #[arg(long = "test", value_name = "NAME")]
+    tests: Vec<String>,
+    #[arg(long = "bench", value_name = "NAME")]
+    benches: Vec<String>,
+}
+
+impl NamedTargets {
+    fn apply(&self, options: &mut BuildOptions) {
+        options.target_selections.extend(
+            self.bins
+                .iter()
+                .cloned()
+                .map(|name| TargetSelection { kind: "bin", name }),
+        );
+        options
+            .target_selections
+            .extend(self.examples.iter().cloned().map(|name| TargetSelection {
+                kind: "example",
+                name,
+            }));
+        options.target_selections.extend(
+            self.tests
+                .iter()
+                .cloned()
+                .map(|name| TargetSelection { kind: "test", name }),
+        );
+        options
+            .target_selections
+            .extend(self.benches.iter().cloned().map(|name| TargetSelection {
+                kind: "bench",
+                name,
+            }));
+        if !self.bins.is_empty() {
+            options.kinds |= KIND_BIN;
+        }
+        if !self.examples.is_empty() {
+            options.kinds |= KIND_EXAMPLE;
+        }
+        if !self.tests.is_empty() {
+            options.kinds |= KIND_TEST;
+        }
+        if !self.benches.is_empty() {
+            options.kinds |= KIND_BENCH;
+        }
+    }
+}
+
 impl BuildFlags {
     /// The selected target kinds for this flag set.
     fn kinds(&self, default: u32) -> u32 {
@@ -96,16 +161,16 @@ impl BuildFlags {
             if self.lib {
                 kinds |= KIND_LIB;
             }
-            if self.bins {
+            if self.all_bins {
                 kinds |= KIND_BIN;
             }
-            if self.examples {
+            if self.all_examples {
                 kinds |= KIND_EXAMPLE;
             }
-            if self.tests {
+            if self.all_tests {
                 kinds |= KIND_TEST;
             }
-            if self.benches {
+            if self.all_benches {
                 kinds |= KIND_BENCH;
             }
             if kinds == 0 { default } else { kinds }
@@ -114,8 +179,15 @@ impl BuildFlags {
 
     fn options(&self, kinds: u32) -> BuildOptions {
         BuildOptions {
-            profile: self.profile.clone(),
+            profile: if self.release {
+                "release".to_owned()
+            } else {
+                self.profile.clone()
+            },
             targets: self.package.clone(),
+            workspace: self.workspace,
+            excludes: self.exclude.clone(),
+            target_selections: Vec::new(),
             features: driver::FeatureOptions {
                 features: self.features.clone(),
                 no_default_features: self.no_default_features,
@@ -141,9 +213,8 @@ enum Command {
         /// only, and exclusive with `-p`.
         #[arg(value_name = "LABEL")]
         labels: Vec<String>,
-        /// Build every workspace member.
-        #[arg(long)]
-        workspace: bool,
+        #[command(flatten)]
+        targets: NamedTargets,
         #[command(flatten)]
         flags: BuildFlags,
     },
@@ -151,8 +222,8 @@ enum Command {
     Check {
         #[arg(value_name = "LABEL")]
         labels: Vec<String>,
-        #[arg(long)]
-        workspace: bool,
+        #[command(flatten)]
+        targets: NamedTargets,
         #[command(flatten)]
         flags: BuildFlags,
     },
@@ -304,6 +375,28 @@ enum ToolchainCommand {
     },
 }
 
+fn command_root(cwd: &std::path::Path, flags: &BuildFlags) -> Result<PathBuf, String> {
+    let Some(path) = &flags.manifest_path else {
+        return Ok(cwd.to_path_buf());
+    };
+    let path = if path.is_absolute() {
+        path.clone()
+    } else {
+        cwd.join(path)
+    };
+    let name = path.file_name().and_then(|name| name.to_str());
+    if !matches!(name, Some("Cargo.toml" | "Tong.toml")) {
+        return Err(format!(
+            "--manifest-path must name Cargo.toml or Tong.toml, got {}",
+            path.display()
+        ));
+    }
+    if !path.is_file() {
+        return Err(format!("manifest does not exist: {}", path.display()));
+    }
+    Ok(path.parent().unwrap_or(cwd).to_path_buf())
+}
+
 fn main() -> ExitCode {
     // Perf and metrics events go through tracing (target `tong::perf`,
     // controlled by `RUST_LOG`, written to stderr) so they can be forwarded
@@ -322,15 +415,20 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Build {
             labels,
-            workspace: workspace_flag,
+            targets,
             flags,
         } => {
+            let workspace = match command_root(&workspace, &flags) {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("tong: error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let kinds = flags.kinds(KIND_LIB | KIND_BIN);
             let mut options = flags.options(kinds);
             options.targets.extend(labels);
-            if workspace_flag {
-                options.targets.clear();
-            }
+            targets.apply(&mut options);
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
                     print_summary(&outcome);
@@ -344,16 +442,21 @@ fn main() -> ExitCode {
         }
         Command::Check {
             labels,
-            workspace: workspace_flag,
+            targets,
             flags,
         } => {
+            let workspace = match command_root(&workspace, &flags) {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("tong: error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let kinds = flags.kinds(KIND_LIB | KIND_BIN);
             let mut options = flags.options(kinds);
             options.check = true;
             options.targets.extend(labels);
-            if workspace_flag {
-                options.targets.clear();
-            }
+            targets.apply(&mut options);
             match driver::build(&workspace, &options) {
                 Ok(outcome) => {
                     print_summary(&outcome);
@@ -371,6 +474,13 @@ fn main() -> ExitCode {
             args,
             flags,
         } => {
+            let workspace = match command_root(&workspace, &flags) {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("tong: error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let kinds = flags.kinds(KIND_LIB | KIND_BIN);
             let mut options = flags.options(kinds);
             let label = label.or(bin);
@@ -404,9 +514,16 @@ fn main() -> ExitCode {
             flags,
             args,
         } => {
+            let workspace = match command_root(&workspace, &flags) {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("tong: error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let kinds = flags.kinds(KIND_LIB | KIND_BIN | KIND_TEST | KIND_EXAMPLE);
             let options = flags.options(kinds);
-            let label = label.or(test).or_else(|| flags.tests.then(String::new));
+            let label = label.or(test).or_else(|| flags.all_tests.then(String::new));
             let _ = doc;
             match driver::test(&workspace, label.as_deref(), &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -422,9 +539,18 @@ fn main() -> ExitCode {
             flags,
             args,
         } => {
+            let workspace = match command_root(&workspace, &flags) {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("tong: error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let kinds = flags.kinds(KIND_LIB | KIND_BIN | KIND_BENCH);
             let options = flags.options(kinds);
-            let label = label.or(bench).or_else(|| flags.benches.then(String::new));
+            let label = label
+                .or(bench)
+                .or_else(|| flags.all_benches.then(String::new));
             match driver::bench(&workspace, label.as_deref(), &args, &options) {
                 Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
                 Err(err) => {
