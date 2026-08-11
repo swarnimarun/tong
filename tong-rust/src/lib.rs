@@ -20,7 +20,8 @@ pub use cargo_import::{
 pub use features::{FeatureError, FeatureMap, FeatureRequest, resolve_features};
 pub use model::{
     BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PackageId,
-    PanicStrategy, ProfileSpec, RegistryEdge, ResolverVersion, RustModel, SourceId, TestTarget,
+    PanicStrategy, ProfileSpec, RegistryEdge, ResolverVersion, RustModel, RustUnitDomain,
+    RustUnitId, RustUnitMode, SourceId, TestTarget,
 };
 pub use toolchain::{SystemRust, ToolchainError, capture_system_rust, host_triple};
 pub use toolchain_dist::{dist_available, fetch_dist_rust, load_dist_rust};

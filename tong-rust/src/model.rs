@@ -71,6 +71,98 @@ impl CanonicalEncode for PackageId {
     }
 }
 
+/// Whether a Rust compilation executes for the host or produces a target
+/// artifact. Build scripts and proc macros are host units even during
+/// cross-compilation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RustUnitDomain {
+    /// Executed by the build host.
+    Host,
+    /// Consumed by the configured target.
+    Target,
+}
+
+impl CanonicalEncode for RustUnitDomain {
+    fn encode(&self, enc: &mut Encoder) {
+        enc.write_u32(match self {
+            Self::Host => 0,
+            Self::Target => 1,
+        });
+    }
+}
+
+/// Code-generation mode of a Rust compilation unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RustUnitMode {
+    /// A fully code-generated unit.
+    Build,
+    /// A metadata-only `cargo check` unit.
+    Check,
+}
+
+impl CanonicalEncode for RustUnitMode {
+    fn encode(&self, enc: &mut Encoder) {
+        enc.write_u32(match self {
+            Self::Build => 0,
+            Self::Check => 1,
+        });
+    }
+}
+
+/// Canonical identity of one configured Rust compilation unit.
+///
+/// Cargo may compile one package several times: for host and target, with
+/// different feature domains, profiles, targets, or check/build modes. A
+/// package identity alone is therefore not sufficient for action lookup or
+/// artifact naming.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RustUnitId {
+    /// Exact package identity.
+    pub package: PackageId,
+    /// Logical package target (`lib`, `bin:name`, `test:name`, ...).
+    pub target: String,
+    /// rustc crate type.
+    pub crate_type: String,
+    /// Host or configured-target feature domain.
+    pub domain: RustUnitDomain,
+    /// Effective compilation triple.
+    pub target_triple: String,
+    /// Selected profile name.
+    pub profile: String,
+    /// Fully resolved profile flags, including package overrides.
+    pub profile_flags: Vec<String>,
+    /// Activated features in this unit's domain.
+    pub features: BTreeSet<String>,
+    /// Full code generation or metadata-only checking.
+    pub mode: RustUnitMode,
+}
+
+impl RustUnitId {
+    /// Stable short identifier used in rustc metadata and artifact names.
+    pub fn artifact_hash(&self) -> String {
+        let mut enc = Encoder::new();
+        self.encode(&mut enc);
+        enc.digest().to_hex()[..16].to_owned()
+    }
+}
+
+impl CanonicalEncode for RustUnitId {
+    fn encode(&self, enc: &mut Encoder) {
+        self.package.encode(enc);
+        enc.write_str(&self.target);
+        enc.write_str(&self.crate_type);
+        self.domain.encode(enc);
+        enc.write_str(&self.target_triple);
+        enc.write_str(&self.profile);
+        enc.write_seq(&self.profile_flags);
+        enc.write_u64(self.features.len() as u64);
+        for feature in &self.features {
+            enc.write_str(feature);
+        }
+        self.mode.encode(enc);
+    }
+}
+
 /// Canonical package source.
 ///
 /// `Workspace` and `Path` carry normalized forward-slash lexical paths
@@ -695,6 +787,35 @@ mod tests {
         assert_eq!(set.len(), 3);
         assert_eq!(a1.lock_source(), "registry+https://index.crates.io");
         assert_eq!(member.lock_source(), "path+crates/alpha");
+    }
+
+    #[test]
+    fn rust_unit_ids_distinguish_configured_variants() {
+        let package = PackageId {
+            name: "shared".to_owned(),
+            version: semver::Version::new(1, 0, 0),
+            source: SourceId::Registry("https://index.crates.io".to_owned()),
+        };
+        let base = RustUnitId {
+            package,
+            target: "lib".to_owned(),
+            crate_type: "rlib".to_owned(),
+            domain: RustUnitDomain::Target,
+            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            profile: "dev".to_owned(),
+            profile_flags: vec!["-C".to_owned(), "opt-level=0".to_owned()],
+            features: BTreeSet::from(["std".to_owned()]),
+            mode: RustUnitMode::Build,
+        };
+        let mut host = base.clone();
+        host.domain = RustUnitDomain::Host;
+        let mut checked = base.clone();
+        checked.mode = RustUnitMode::Check;
+        let mut featured = base.clone();
+        featured.features.insert("extra".to_owned());
+        assert_ne!(base.artifact_hash(), host.artifact_hash());
+        assert_ne!(base.artifact_hash(), checked.artifact_hash());
+        assert_ne!(base.artifact_hash(), featured.artifact_hash());
     }
 
     #[test]

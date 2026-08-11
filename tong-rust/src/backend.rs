@@ -21,7 +21,6 @@ use tong_core::action::{
 };
 use tong_core::artifact::{ArtifactRef, BlobDigest, TreeDigest};
 use tong_core::bundle::BundleRef;
-use tong_core::canonical::{CanonicalEncode, Encoder};
 use tong_core::paths::{OutputPath, RelativePath};
 use tong_core::tree::{Tree, TreeEntry};
 use tong_exec::EXEC_ROOT_VAR;
@@ -30,8 +29,8 @@ use tong_store::{CAPTURE_EXCLUDES, Cas};
 
 use crate::build_directives::{Directives, parse_directives};
 use crate::model::{
-    CrateType, Dep, Edition, Package, PackageId, ProfileSpec, RustModel, TestTarget, crate_name,
-    lib_crate_name,
+    CrateType, Dep, Edition, Package, PackageId, ProfileSpec, RustModel, RustUnitDomain,
+    RustUnitId, RustUnitMode, TestTarget, crate_name, lib_crate_name,
 };
 use crate::toolchain::{SystemRust, dll_extension, host_platform};
 
@@ -1021,7 +1020,7 @@ impl<'a> RustBackend<'a> {
                     &pkg.deps,
                     bs_run.clone(),
                     self.crate_root_for(&pkg.id, &lib.path),
-                    false,
+                    true,
                     true,
                 )?;
             } else {
@@ -1247,7 +1246,44 @@ impl<'a> RustBackend<'a> {
         // `--check` builds emit metadata only (cargo check); build
         // scripts always compile fully (they run even in check builds).
         let check = self.check && !host_unit && !self.full_codegen.contains(&pkg.id);
-        let meta = self.metadata(pkg, &crate_name, crate_type);
+        let mut profile_flags = self.effective_profile(&pkg.name).rustc_flags();
+        // LTO is not supported for proc-macro crate types; Cargo disables it
+        // automatically.
+        if crate_type == "proc-macro" {
+            let mut index = 0;
+            while index < profile_flags.len() {
+                if profile_flags[index] == "-C"
+                    && profile_flags
+                        .get(index + 1)
+                        .is_some_and(|flag| flag.starts_with("lto="))
+                {
+                    profile_flags.drain(index..index + 2);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        let target_name = match mnemonic {
+            "RustBuildScriptCompile" => "build-script".to_owned(),
+            "RustProcMacro" | "RustLibrary" => "lib".to_owned(),
+            "RustBinary" => format!("bin:{}", output_name.as_deref().unwrap_or(&crate_name)),
+            "RustExample" => {
+                format!("example:{}", output_name.as_deref().unwrap_or(&crate_name))
+            }
+            "RustTestCompile" => {
+                format!("test:{}", output_name.as_deref().unwrap_or(&crate_name))
+            }
+            _ => key.to_owned(),
+        };
+        let unit = self.unit_id(
+            pkg,
+            target_name,
+            crate_type,
+            host_unit,
+            check,
+            profile_flags.clone(),
+        );
+        let meta = unit.artifact_hash();
         let check_output = |output: String| {
             if check {
                 format!("{output}.rmeta")
@@ -1283,18 +1319,11 @@ impl<'a> RustBackend<'a> {
         let transitive_deps = self.transitive_dep_specs(&pkg.id, deps)?;
         // Per-crate feature cfgs: `--cfg feature="<name>"` for every
         // activated feature (sorted), mirroring Cargo.
-        let feature_cfgs: Vec<String> = self
-            .model
-            .feature_map
-            .packages
-            .get(&pkg.id)
-            .map(|features| {
-                features
-                    .iter()
-                    .flat_map(|feature| ["--cfg".to_owned(), format!("feature=\"{feature}\"")])
-                    .collect()
-            })
-            .unwrap_or_default();
+        let feature_cfgs: Vec<String> = unit
+            .features
+            .iter()
+            .flat_map(|feature| ["--cfg".to_owned(), format!("feature=\"{feature}\"")])
+            .collect();
         let mut extra_flags: Vec<String> = self
             .model
             .global_rustflags
@@ -1309,23 +1338,6 @@ impl<'a> RustBackend<'a> {
         if self.pkg_external(pkg) {
             extra_flags.push("--cap-lints".to_owned());
             extra_flags.push("allow".to_owned());
-        }
-        // LTO is not supported for proc-macro crate types; Cargo disables it
-        // automatically.
-        let mut profile_flags = self.effective_profile(&pkg.name).rustc_flags();
-        if crate_type == "proc-macro" {
-            let mut index = 0;
-            while index < profile_flags.len() {
-                if profile_flags[index] == "-C"
-                    && profile_flags
-                        .get(index + 1)
-                        .is_some_and(|flag| flag.starts_with("lto="))
-                {
-                    profile_flags.drain(index..index + 2);
-                } else {
-                    index += 1;
-                }
-            }
         }
         let ctx = Ctx {
             logical_id: ActionId(logical_id.to_owned()),
@@ -1492,25 +1504,44 @@ impl<'a> RustBackend<'a> {
         ])
     }
 
-    /// Deterministic per-crate metadata id; producers and consumers of an
-    /// artifact derive the same value. The package identity is part of the
-    /// hash: two versions of one crate must not collide on rlib filenames.
-    fn metadata(&self, pkg: &Package, crate_name: &str, kind: &str) -> String {
-        let mut enc = Encoder::new();
-        pkg.id.encode(&mut enc);
-        enc.write_str(crate_name);
-        enc.write_str(&self.profile_name);
-        enc.write_str(kind);
-        enc.write_str(&self.toolchain.host_triple);
-        // The activated feature set disambiguates output file names: the
-        // same package built with different feature sets (e.g. tokio as
-        // hyper's dep vs reqwest's) must not collide in the deps dir.
-        if let Some(features) = self.model.feature_map.packages.get(&pkg.id) {
-            for feature in features {
-                enc.write_str(feature);
-            }
+    fn unit_id(
+        &self,
+        pkg: &Package,
+        target: String,
+        crate_type: &str,
+        host_unit: bool,
+        check: bool,
+        profile_flags: Vec<String>,
+    ) -> RustUnitId {
+        RustUnitId {
+            package: pkg.id.clone(),
+            target,
+            crate_type: crate_type.to_owned(),
+            domain: if host_unit {
+                RustUnitDomain::Host
+            } else {
+                RustUnitDomain::Target
+            },
+            target_triple: if host_unit {
+                self.toolchain.host_triple.clone()
+            } else {
+                self.target_triple
+                    .clone()
+                    .unwrap_or_else(|| self.toolchain.host_triple.clone())
+            },
+            profile: self.profile_name.clone(),
+            profile_flags,
+            features: self
+                .model
+                .feature_map
+                .features_for(&pkg.id, host_unit)
+                .clone(),
+            mode: if check {
+                RustUnitMode::Check
+            } else {
+                RustUnitMode::Build
+            },
         }
-        enc.digest().to_hex()[..16].to_owned()
     }
 
     /// The compile-time crate root for a package-relative path, rewritten
@@ -1704,7 +1735,33 @@ impl<'a> RustBackend<'a> {
             .cloned()
             .ok_or_else(|| PlanError::Message(format!("no planned action for {key}")))?;
         let lib_name = lib_crate_name(pkg);
-        let meta = self.metadata(pkg, &lib_name, kind);
+        let host_unit = kind == "proc-macro";
+        let checked = self.check && !host_unit && !self.full_codegen.contains(&dep.package);
+        let mut profile_flags = self.effective_profile(&pkg.name).rustc_flags();
+        if host_unit {
+            let mut index = 0;
+            while index < profile_flags.len() {
+                if profile_flags[index] == "-C"
+                    && profile_flags
+                        .get(index + 1)
+                        .is_some_and(|flag| flag.starts_with("lto="))
+                {
+                    profile_flags.drain(index..index + 2);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        let meta = self
+            .unit_id(
+                pkg,
+                "lib".to_owned(),
+                kind,
+                host_unit,
+                checked,
+                profile_flags,
+            )
+            .artifact_hash();
         // Check builds produce `.rmeta` instead of `.rlib` (the producer
         // and every consumer must agree on the file name).
         // Check builds produce `.rmeta` instead of `.rlib` — but only
