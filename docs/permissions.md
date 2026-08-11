@@ -4,6 +4,12 @@ Build scripts and proc macros are executable dependency code. Tong's target is
 not merely to run them with a clean environment, but to make every capability
 visible, reviewable, and enforceable.
 
+Cargo import defaults to `compat` mode for migration. That mode may run
+unreviewed code with broader Cargo-like behavior, but marks affected actions
+as non-hermetic and local-only/uncacheable. `hermetic` mode is the explicit
+security choice and is required before those actions can participate in shared
+or remote cache publication.
+
 ## Workflow
 
 1. Run `tong audit permissions` for the selected package/target. The audit

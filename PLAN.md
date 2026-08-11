@@ -134,6 +134,24 @@ Remote eligibility: enabled
 
 Some hermetic actions may still be non-reproducible because the compiler embeds timestamps, paths, random values, or unstable ordering.
 
+Tong exposes two execution modes over the same action graph and CAS:
+
+* `compat` is the migration/performance mode. It aims to run ordinary Cargo
+  projects like Cargo, including build scripts and proc macros that have not
+  been audited yet. It may permit compatibility accesses, but reports
+  `Hermeticity: not enforced`; actions whose undeclared behavior can affect
+  outputs are local-only or uncacheable and are never uploaded to shared or
+  remote action caches.
+* `hermetic` is the security mode. It grants only declared capabilities from
+  the permission file and enforces the selected platform sandbox. Missing
+  permissions fail; they are never inferred during a normal build.
+
+Cargo import defaults to `compat` so adoption does not require rewriting every
+build script first. A workspace may opt into `hermetic` once permissions are
+reviewed. Both modes retain content-addressed source, toolchain, and declared
+input storage, so compatibility mode still benefits from shared worktrees and
+small `.tong` directories without making a security claim.
+
 ### 3.5 No embedded build language in the initial product
 
 Normal users should describe targets as data in TOML.
@@ -710,7 +728,7 @@ environment, process, and network attempts and emits a minimal candidate TOML
 plus a human-readable diff. Tracing is best-effort and reports what could not
 be observed.
 
-Normal builds are enforcement-only: they load the checked-in permission file,
+Hermetic-mode builds are enforcement-only: they load the checked-in permission file,
 grant exactly those capabilities, and fail with a targeted remediation when a
 new access is attempted. An interactive build may show the capability diff and
 ask the user to approve writing the companion file; it never silently broadens
@@ -718,6 +736,12 @@ the current action. Non-interactive builds and CI never prompt and print the
 exact TOML entry needed instead. Network-enabled permissions make the action
 uncacheable and are marked in build events. Permission changes are action
 inputs and invalidate affected actions.
+
+Compatibility mode remains available for projects that intentionally prioritize
+Cargo behavior over isolation. Its build-script and proc-macro actions carry a
+visible compatibility marker, default to local-only caching, and cannot make a
+hermetic or remote-cache claim. Users can migrate one package at a time by
+auditing it and moving its permissions into the hermetic mode file.
 
 Build-script and proc-macro access controls are particularly important because they execute as a prerequisite to compilation and can undermine deterministic caching. Reducing common build-script behavior to declarative rules should be a first-class Rust-backend objective.
 
@@ -1013,6 +1037,26 @@ separate interfaces and must have separate tests and documentation.
 ## 11. Sandboxing and Enforcement
 
 `env_clear` alone is not hermeticity. It only reduces environmental inputs.
+
+Sandbox selection is subordinate to the execution mode:
+
+```toml
+[policy]
+mode = "compat"   # default for Cargo import; broad Cargo behavior
+sandbox = "l1"    # compatibility baseline
+
+# Security-focused workspaces use:
+# mode = "hermetic"
+# sandbox = "auto" | "l3" | "l4"
+```
+
+`compat` may use a clean environment or a platform-specific compatibility
+wrapper, but reports that undeclared host access is possible. It is the
+general-purpose build path and its unsafe actions are not shared-cache
+eligible. `hermetic` selects the strongest requested/available enforcement,
+loads `Tong.permissions.toml`, and refuses to proceed when the platform cannot
+enforce the declared policy. The action schema remains language-neutral; mode,
+capabilities, and achieved enforcement are execution inputs and events.
 
 Tong must define enforcement levels:
 

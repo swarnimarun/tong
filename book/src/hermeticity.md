@@ -30,9 +30,21 @@ configuration, proxy variables, credentials, or user configuration.
 Only controlled values (`TMPDIR`, a sandbox `HOME`, locale, the
 deterministic working directory) are provided.
 
+## Execution modes
+
+Tong has a general compatibility mode and an opt-in security mode. Cargo
+import defaults to `compat`, so ordinary projects can migrate before their
+build scripts and proc macros have permission declarations. Compatibility mode
+prioritizes Cargo behavior, reports that hermeticity is not enforced, and
+keeps unsafe build-script/proc-macro results local-only or uncacheable. It
+still uses Tong's content-addressed storage and selected-output materialization.
+
+`hermetic` mode loads reviewed permissions and refuses undeclared access. It is
+the mode eligible for hermetic and shared/remote cache claims.
+
 ## Enforcement levels
 
-Sandboxing is **opt-in** (`[policy] sandbox`, default `l1`) until
+Sandboxing is **opt-in** (`[policy] mode = "hermetic"` plus `sandbox`) until
 certified per platform:
 
 | Level | Enforcement | Meaning |
