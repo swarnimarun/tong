@@ -45,7 +45,7 @@ fn fixture() -> tempfile::TempDir {
         &[
             (
                 "Cargo.toml",
-                "[workspace]\nmembers = [\"crates/native-lib\", \"crates/app\"]\n",
+                "[workspace]\nmembers = [\"crates/native-lib\", \"crates/app\"]\nresolver = \"2\"\n",
             ),
             // A library with `links`: its build script exports metadata the
             // app's build script reads as DEP_NATIVE_LIB_MYKEY.
@@ -378,7 +378,10 @@ fn action_parity_package_links_unique() {
     write_tree(
         root,
         &[
-            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+            ),
             (
                 "a/Cargo.toml",
                 "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"dup\"\n",

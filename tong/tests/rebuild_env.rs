@@ -44,7 +44,11 @@ fn unset_rerun_env_var_stays_absent_on_rebuild() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
     fs::create_dir_all(dir.join("app/src")).unwrap();
     fs::write(
         dir.join("app/Cargo.toml"),

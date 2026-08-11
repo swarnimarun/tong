@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/*"]
 default-members = ["crates/app"]
+resolver = "2"
 
 [workspace.dependencies]
 alpha = "=1.0.0"

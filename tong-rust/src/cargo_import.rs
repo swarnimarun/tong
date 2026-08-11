@@ -1431,7 +1431,7 @@ struct ResolvedDep {
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_deps(
-    deps: &BTreeMap<String, DepValue>,
+    deps: &[(String, DepValue)],
     parent: &Package,
     member: &Path,
     workspace_root: &Path,
@@ -1507,7 +1507,35 @@ fn resolve_deps(
                 let optional = optional.unwrap_or(false);
                 let default_features = default_features.unwrap_or(true);
                 let features = features.clone().unwrap_or_default();
-                if let Some(git) = git {
+                let package_name = package.clone().unwrap_or_else(|| name.clone());
+                if git.is_none()
+                    && path.is_none()
+                    && *workspace != Some(true)
+                    && version.is_some()
+                    && let Some(patch) = patches.get(&package_name)
+                {
+                    // `[patch]` selects the replacement source, while the
+                    // dependency declaration still controls edge features,
+                    // optionality, and target conditions.
+                    let (path, package, _, _, _, _, locked) = apply_patch(
+                        &package_name,
+                        patch,
+                        parent,
+                        member,
+                        workspace_root,
+                        inherited,
+                        sources,
+                    )?;
+                    (
+                        path,
+                        package,
+                        optional,
+                        default_features,
+                        features,
+                        target.clone(),
+                        locked,
+                    )
+                } else if let Some(git) = git {
                     // A git dependency: fixed-revision source, never a
                     // registry or path dep. Conflicting combinations are
                     // targeted errors.
@@ -1606,30 +1634,54 @@ fn resolve_deps(
                         }
                         Some(DepValue::Version(version)) => {
                             // Inherited registry dependency.
-                            let edge = RegistryEdge {
-                                parent: parent.id.clone(),
-                                extern_name: name.replace('-', "_"),
-                                package: name.clone(),
-                                req: version.clone(),
-                                git: None,
-                                optional,
-                                default_features,
-                                features: features.clone(),
-                            };
-                            let locked = sources.locked_package(&edge)?;
-                            (
-                                None,
-                                name.clone(),
-                                optional,
-                                default_features,
-                                features,
-                                target.clone(),
-                                locked,
-                            )
+                            if let Some(patch) = patches.get(name) {
+                                let (path, package, _, _, _, _, locked) = apply_patch(
+                                    name,
+                                    patch,
+                                    parent,
+                                    member,
+                                    workspace_root,
+                                    inherited,
+                                    sources,
+                                )?;
+                                (
+                                    path,
+                                    package,
+                                    optional,
+                                    default_features,
+                                    features,
+                                    target.clone(),
+                                    locked,
+                                )
+                            } else {
+                                let edge = RegistryEdge {
+                                    parent: parent.id.clone(),
+                                    extern_name: name.replace('-', "_"),
+                                    package: name.clone(),
+                                    req: version.clone(),
+                                    git: None,
+                                    optional,
+                                    default_features,
+                                    features: features.clone(),
+                                };
+                                let locked = sources.locked_package(&edge)?;
+                                (
+                                    None,
+                                    name.clone(),
+                                    optional,
+                                    default_features,
+                                    features,
+                                    target.clone(),
+                                    locked,
+                                )
+                            }
                         }
                         Some(DepValue::Table {
                             version: Some(version),
+                            package: inherited_package,
+                            optional: inherited_optional,
                             default_features: inherited_default_features,
+                            features: inherited_features,
                             ..
                         }) => {
                             // The workspace's `default-features = false`
@@ -1639,26 +1691,59 @@ fn resolve_deps(
                             // must not activate syn's defaults).
                             let default_features =
                                 default_features && inherited_default_features.unwrap_or(true);
-                            let edge = RegistryEdge {
-                                parent: parent.id.clone(),
-                                extern_name: name.replace('-', "_"),
-                                package: package.clone().unwrap_or_else(|| name.clone()),
-                                req: version.clone(),
-                                git: None,
-                                optional,
-                                default_features,
-                                features: features.clone(),
-                            };
-                            let locked = sources.locked_package(&edge)?;
-                            (
-                                None,
-                                package.clone().unwrap_or_else(|| name.clone()),
-                                optional,
-                                default_features,
-                                features,
-                                target.clone(),
-                                locked,
-                            )
+                            let optional = optional || inherited_optional.unwrap_or(false);
+                            let mut merged_features =
+                                inherited_features.clone().unwrap_or_default();
+                            for feature in &features {
+                                if !merged_features.contains(feature) {
+                                    merged_features.push(feature.clone());
+                                }
+                            }
+                            let package = package
+                                .clone()
+                                .or_else(|| inherited_package.clone())
+                                .unwrap_or_else(|| name.clone());
+                            if let Some(patch) = patches.get(&package) {
+                                let (path, package, _, _, _, _, locked) = apply_patch(
+                                    &package,
+                                    patch,
+                                    parent,
+                                    member,
+                                    workspace_root,
+                                    inherited,
+                                    sources,
+                                )?;
+                                (
+                                    path,
+                                    package,
+                                    optional,
+                                    default_features,
+                                    merged_features,
+                                    target.clone(),
+                                    locked,
+                                )
+                            } else {
+                                let edge = RegistryEdge {
+                                    parent: parent.id.clone(),
+                                    extern_name: name.replace('-', "_"),
+                                    package: package.clone(),
+                                    req: version.clone(),
+                                    git: None,
+                                    optional,
+                                    default_features,
+                                    features: merged_features.clone(),
+                                };
+                                let locked = sources.locked_package(&edge)?;
+                                (
+                                    None,
+                                    package,
+                                    optional,
+                                    default_features,
+                                    merged_features,
+                                    target.clone(),
+                                    locked,
+                                )
+                            }
                         }
                         _ => {
                             return Err(CargoImportError::Unsupported(format!(
@@ -1842,22 +1927,34 @@ fn apply_patch(
 /// the set of dependency names that are optional in at least one target
 /// table (cargo feature references validate against the union).
 type MergedTables = (
-    BTreeMap<String, DepValue>,
-    BTreeMap<String, DepValue>,
-    BTreeMap<String, DepValue>,
+    Vec<(String, DepValue)>,
+    Vec<(String, DepValue)>,
+    Vec<(String, DepValue)>,
     BTreeSet<String>,
 );
 
-/// Merges the manifest's dependency tables with its matching
-/// `[target.'cfg(...)'.dependencies]` tables (target-specific entries
-/// override same-name general entries, like Cargo).
+/// Collects the manifest's general and target-specific dependency tables.
+/// Every edge is retained because Cargo resolves and locks the union across
+/// all platforms; the configured unit graph filters targets later.
 fn merge_target_tables(
     manifest: &CargoManifest,
-    host_triple: &str,
+    _host_triple: &str,
 ) -> Result<MergedTables, CargoImportError> {
-    let mut dependencies = manifest.dependencies.clone();
-    let mut build_dependencies = manifest.build_dependencies.clone();
-    let mut dev_dependencies = manifest.dev_dependencies.clone();
+    let mut dependencies: Vec<(String, DepValue)> = manifest
+        .dependencies
+        .iter()
+        .map(|(name, dep)| (name.clone(), dep.clone()))
+        .collect();
+    let mut build_dependencies: Vec<(String, DepValue)> = manifest
+        .build_dependencies
+        .iter()
+        .map(|(name, dep)| (name.clone(), dep.clone()))
+        .collect();
+    let mut dev_dependencies: Vec<(String, DepValue)> = manifest
+        .dev_dependencies
+        .iter()
+        .map(|(name, dep)| (name.clone(), dep.clone()))
+        .collect();
     // Names optional in any table (union semantics, computed BEFORE the
     // host-specific merge: wgpu's `wgpu-hal` is optional in the wasm
     // target table but plain elsewhere, and cargo feature references
@@ -1888,14 +1985,12 @@ fn merge_target_tables(
                 optional_anywhere.insert(name.clone());
             }
         }
-        // Every target table's deps enter the model with the target key
-        // recorded (the backend filters at plan time), so the feature walk
-        // and the lock see all targets. Cargo's override semantics: a
-        // target-specific dep replaces the same-name general dep only when
-        // the target matches the host; on a non-matching host the general
-        // dep applies (tokio's `tokio_unstable`-gated mio must not shadow
-        // the real one).
-        let matching = target_matches(key, host_triple, &format!("target table {key:?}"))?;
+        // Validate every cfg now, but defer evaluation until configured
+        // units are built. This keeps the resolved graph host-independent.
+        if key.trim_start().starts_with("cfg(") {
+            let _ = tong_core::platform::eval_cfg(key, "x86_64-unknown-linux-gnu")
+                .map_err(|error| CargoImportError::Unsupported(error.to_string()))?;
+        }
         let with_target = |dep: &DepValue| -> DepValue {
             let mut dep = dep.clone();
             if let DepValue::Table { target, .. } = &mut dep {
@@ -1904,28 +1999,13 @@ fn merge_target_tables(
             dep
         };
         for (name, dep) in &table.dependencies {
-            let dep = with_target(dep);
-            if matching {
-                dependencies.insert(name.clone(), dep);
-            } else {
-                dependencies.entry(name.clone()).or_insert(dep);
-            }
+            dependencies.push((name.clone(), with_target(dep)));
         }
         for (name, dep) in &table.build_dependencies {
-            let dep = with_target(dep);
-            if matching {
-                build_dependencies.insert(name.clone(), dep);
-            } else {
-                build_dependencies.entry(name.clone()).or_insert(dep);
-            }
+            build_dependencies.push((name.clone(), with_target(dep)));
         }
         for (name, dep) in &table.dev_dependencies {
-            let dep = with_target(dep);
-            if matching {
-                dev_dependencies.insert(name.clone(), dep);
-            } else {
-                dev_dependencies.entry(name.clone()).or_insert(dep);
-            }
+            dev_dependencies.push((name.clone(), with_target(dep)));
         }
     }
     Ok((
@@ -2383,6 +2463,7 @@ mod tests {
                 r#"
 [workspace]
 members = ["crates/calc-core", "crates/calc-cli"]
+resolver = "2"
 "#,
             ),
             (
@@ -2507,7 +2588,10 @@ APP_GREETING = "hello"
         // A path dep outside the workspace is imported recursively, like
         // Cargo does (used by examples/04-voxel-city → sdl3-sys).
         let dir = write_tree(&[
-            ("Cargo.toml", "[workspace]\nmembers = [\"crates/app\"]\n"),
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/app\"]\nresolver = \"2\"\n",
+            ),
             (
                 "crates/app/Cargo.toml",
                 r#"
@@ -2554,7 +2638,10 @@ sdl3-sys = { path = "../../shared/sdl3-sys" }
     #[test]
     fn rejects_cyclic_path_dependencies() {
         let dir = write_tree(&[
-            ("Cargo.toml", "[workspace]\nmembers = [\"a\"]\n"),
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n",
+            ),
             (
                 "a/Cargo.toml",
                 r#"
@@ -2600,6 +2687,7 @@ a = { path = "../a" }
                 r#"
 [workspace]
 members = ["app"]
+resolver = "2"
 
 [workspace.package]
 version = "1.2.3"
@@ -2630,9 +2718,61 @@ edition.workspace = true
     }
 
     #[test]
+    fn applies_patch_to_inherited_registry_dependency() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app", "shared"]
+resolver = "2"
+
+[workspace.dependencies]
+shared = "1"
+
+[patch.crates-io]
+shared = { path = "shared" }
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared.workspace = true
+"#,
+            ),
+            ("app/src/lib.rs", ""),
+            (
+                "shared/Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+            ),
+            ("shared/src/lib.rs", ""),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        let app = model.packages.iter().find(|pkg| pkg.name == "app").unwrap();
+        assert_eq!(app.deps.len(), 1);
+        assert_eq!(app.deps[0].package.name, "shared");
+        assert!(matches!(app.deps[0].package.source, SourceId::Workspace(_)));
+    }
+
+    #[test]
     fn missing_workspace_package_inheritance_is_a_targeted_error() {
         let dir = write_tree(&[
-            ("Cargo.toml", "[workspace]\nmembers = [\"app\"]\n"),
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+            ),
             (
                 "app/Cargo.toml",
                 r#"
@@ -2661,6 +2801,7 @@ version.workspace = true
                 r#"
 [workspace]
 members = ["app"]
+resolver = "2"
 "#,
             ),
             (
@@ -2696,6 +2837,7 @@ name = "app_core"
                 r#"
 [workspace]
 members = ["app"]
+resolver = "2"
 "#,
             ),
             (
@@ -2727,6 +2869,7 @@ members = ["app"]
                 r#"
 [workspace]
 members = ["app"]
+resolver = "2"
 "#,
             ),
             (
@@ -2756,6 +2899,7 @@ members = ["app"]
                 r#"
 [workspace]
 members = ["app"]
+resolver = "2"
 "#,
             ),
             (
@@ -2897,6 +3041,60 @@ win-only = { path = "../win-only" }
     }
 
     #[test]
+    fn preserves_same_name_edges_for_all_targets() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../common" }
+
+[target.'cfg(windows)'.dependencies]
+shared = { path = "../windows" }
+"#,
+            ),
+            ("src/main.rs", "fn main() {}"),
+            (
+                "../common/Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+            ),
+            ("../common/src/lib.rs", ""),
+            (
+                "../windows/Cargo.toml",
+                "[package]\nname = \"shared\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+            ),
+            ("../windows/src/lib.rs", ""),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        let app = model.packages.iter().find(|pkg| pkg.name == "app").unwrap();
+        assert_eq!(app.deps.len(), 2);
+        assert_eq!(
+            app.deps
+                .iter()
+                .filter(|dep| dep.extern_name == "shared")
+                .count(),
+            2
+        );
+        assert!(app.deps.iter().any(|dep| dep.target.is_none()));
+        assert!(
+            app.deps
+                .iter()
+                .any(|dep| dep.target.as_deref() == Some("cfg(windows)"))
+        );
+    }
+
+    #[test]
     fn dep_table_target_key_filters() {
         let dir = write_tree(&[
             (
@@ -3030,7 +3228,7 @@ strip = "everything"
         .unwrap();
         assert_eq!(model.resolver, ResolverVersion::V3);
 
-        // A package-level resolver wins over the edition default.
+        // Resolver 1 is deliberately unsupported, even when explicit.
         let dir = write_tree(&[
             (
                 "Cargo.toml",
@@ -3038,14 +3236,14 @@ strip = "everything"
             ),
             ("src/main.rs", "fn main() {}"),
         ]);
-        let model = import_cargo_workspace(
+        let error = import_cargo_workspace(
             &dir.path().join("ws"),
             "aarch64-apple-darwin",
             &NO_LOCK,
             None,
         )
-        .unwrap();
-        assert_eq!(model.resolver, ResolverVersion::V1);
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace.resolver = \"2\""));
 
         // Edition 2024 defaults to resolver 3; 2021 to 2.
         let dir = write_tree(&[

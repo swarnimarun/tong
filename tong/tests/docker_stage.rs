@@ -142,7 +142,11 @@ fn setup() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
 
     let workspace = tempfile::tempdir().unwrap();
     let ws = workspace.path();
-    fs::write(ws.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\n").unwrap();
+    fs::write(
+        ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
     fs::create_dir_all(ws.join("app/src")).unwrap();
     fs::write(
         ws.join("app/Cargo.toml"),

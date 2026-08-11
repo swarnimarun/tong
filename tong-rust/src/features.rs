@@ -12,11 +12,9 @@
 //! - Resolver 1: one domain — features unify across normal, build, and
 //!   dev dependencies (the legacy behavior that made `cargo build` see
 //!   dev-dep features).
-//! - Resolver 2: dev-dependencies are a separate domain; normal and
-//!   build-dependencies unify.
-//! - Resolver 3: build-dependencies form a separate *host* domain too — a
-//!   package used as both a normal and a build dependency keeps
-//!   independent feature sets (`FeatureMap::build_features`).
+//! - Resolvers 2 and 3: build-dependencies form a separate *host* domain,
+//!   and dev-dependencies do not affect normal builds. Resolver 3 changes
+//!   version selection policy, not Cargo's feature-domain isolation.
 //!
 //! The resolution is a fixpoint workqueue: activating a feature enqueues
 //! the references it declares; every (package, feature, domain) triple is
@@ -58,6 +56,10 @@ pub struct FeatureMap {
     pub build_features: BTreeMap<PackageId, BTreeSet<String>>,
     /// Active optional build-dep edges per package (host domain).
     pub active_build_optional_deps: BTreeMap<PackageId, BTreeSet<String>>,
+    /// Feature requests made through an unresolved registry edge while
+    /// `tong lock` is collecting the workspace graph. The version resolver
+    /// forwards these to the selected registry package.
+    pub unresolved_edge_features: BTreeMap<(PackageId, String), BTreeSet<String>>,
 }
 
 impl FeatureMap {
@@ -86,6 +88,16 @@ impl FeatureMap {
                 .get(package)
                 .is_some_and(|active| active.contains(extern_name))
     }
+
+    /// Features requested on an unresolved registry dependency edge.
+    pub fn unresolved_features_for(
+        &self,
+        package: &PackageId,
+        extern_name: &str,
+    ) -> Option<&BTreeSet<String>> {
+        self.unresolved_edge_features
+            .get(&(package.clone(), extern_name.to_owned()))
+    }
 }
 
 static EMPTY_FEATURES: BTreeSet<String> = BTreeSet::new();
@@ -96,6 +108,12 @@ impl CanonicalEncode for FeatureMap {
         encode_domain(enc, &self.active_optional_deps);
         encode_domain(enc, &self.build_features);
         encode_domain(enc, &self.active_build_optional_deps);
+        enc.write_u64(self.unresolved_edge_features.len() as u64);
+        for ((package, extern_name), features) in &self.unresolved_edge_features {
+            package.encode(enc);
+            enc.write_str(extern_name);
+            enc.write_seq(&features.iter().cloned().collect::<Vec<_>>());
+        }
     }
 }
 
@@ -219,6 +237,7 @@ pub fn resolve_features(
         queue: Vec::new(),
         edge_queue: Vec::new(),
         pending_weak: Vec::new(),
+        unresolved_edge_features: BTreeMap::new(),
         expanded: BTreeSet::new(),
         native_imports: &native_imports,
     };
@@ -240,10 +259,10 @@ pub fn resolve_features(
         }
     }
 
-    // Resolver 3 host domain: packages with build scripts compile their
+    // Resolver 2/3 host domain: packages with build scripts compile their
     // (non-optional) build-dependencies for the host — a separate feature
     // domain from the target one.
-    if state.resolver == ResolverVersion::V3 {
+    if state.resolver != ResolverVersion::V1 {
         for package in &model.packages {
             if package.build_script.is_some() {
                 for dep in &package.build_deps {
@@ -328,6 +347,7 @@ pub fn resolve_features(
         active_optional_deps: state.active_optional,
         build_features: state.host_features_on,
         active_build_optional_deps: state.host_active_optional,
+        unresolved_edge_features: state.unresolved_edge_features,
     })
 }
 
@@ -359,6 +379,9 @@ struct Resolver<'a> {
     /// at the fixpoint until the dep activates (cargo semantics: the
     /// feature applies once the dep is enabled, regardless of ref order).
     pending_weak: Vec<(PackageId, String, String, String, Domain)>,
+    /// Requests on provisional registry edges, keyed by the declaring
+    /// package and extern name.
+    unresolved_edge_features: BTreeMap<(PackageId, String), BTreeSet<String>>,
     /// Packages already expanded (non-optional edges activated) in a
     /// domain.
     expanded: BTreeSet<(PackageId, Domain)>,
@@ -385,8 +408,7 @@ impl<'a> Resolver<'a> {
     /// The edges of `package` in `domain`, per resolver semantics:
     ///
     /// - Resolver 1: normal + build + dev (unified).
-    /// - Resolver 2: normal + build (+ dev when included).
-    /// - Resolver 3, target: normal (+ dev when included); host: normal +
+    /// - Resolver 2/3, target: normal (+ dev when included); host: normal +
     ///   build (a host crate's normal deps compile for the host too).
     fn edges_for<'b>(&self, package: &'b Package, domain: Domain) -> Vec<&'b Dep> {
         let mut out: Vec<&'b Dep> = Vec::new();
@@ -396,24 +418,17 @@ impl<'a> Resolver<'a> {
                 out.extend(package.build_deps.iter());
                 out.extend(package.dev_deps.iter());
             }
-            (ResolverVersion::V2, Domain::Target) => {
-                out.extend(package.deps.iter());
-                out.extend(package.build_deps.iter());
-                if self.include_dev {
-                    out.extend(package.dev_deps.iter());
-                }
-            }
-            (ResolverVersion::V3, Domain::Target) => {
+            (ResolverVersion::V2 | ResolverVersion::V3, Domain::Target) => {
                 out.extend(package.deps.iter());
                 if self.include_dev {
                     out.extend(package.dev_deps.iter());
                 }
             }
-            (ResolverVersion::V3, Domain::Host) => {
+            (ResolverVersion::V2 | ResolverVersion::V3, Domain::Host) => {
                 out.extend(package.deps.iter());
                 out.extend(package.build_deps.iter());
             }
-            (ResolverVersion::V1 | ResolverVersion::V2, Domain::Host) => {}
+            (ResolverVersion::V1, Domain::Host) => {}
         }
         out
     }
@@ -432,11 +447,17 @@ impl<'a> Resolver<'a> {
                 || dep.extern_name.replace('-', "_") == normalized
                 || dep.package.name.replace('-', "_") == normalized
         };
-        if let Some(dep) = pkg.deps.iter().find(|dep| matches(dep)) {
+        let preferred = |deps: &'a [Dep]| {
+            deps.iter()
+                .filter(|dep| matches(dep))
+                .find(|dep| dep.optional)
+                .or_else(|| deps.iter().find(|dep| matches(dep)))
+        };
+        if let Some(dep) = preferred(&pkg.deps) {
             return Some((dep, Domain::Target));
         }
-        if let Some(dep) = pkg.build_deps.iter().find(|dep| matches(dep)) {
-            let domain = if self.resolver == ResolverVersion::V3 {
+        if let Some(dep) = preferred(&pkg.build_deps) {
+            let domain = if self.resolver != ResolverVersion::V1 {
                 Domain::Host
             } else {
                 Domain::Target
@@ -444,7 +465,7 @@ impl<'a> Resolver<'a> {
             return Some((dep, domain));
         }
         if self.include_dev
-            && let Some(dep) = pkg.dev_deps.iter().find(|dep| matches(dep))
+            && let Some(dep) = preferred(&pkg.dev_deps)
         {
             return Some((dep, Domain::Target));
         }
@@ -588,7 +609,7 @@ impl<'a> Resolver<'a> {
         &mut self,
         package: &PackageId,
         reference: &str,
-        _domain: Domain,
+        domain: Domain,
     ) -> Result<(), FeatureError> {
         let pkg = self.pkg(package)?;
         // `dep:x` — namespaced activation of an optional dependency.
@@ -621,7 +642,7 @@ impl<'a> Resolver<'a> {
         // Plain name: a declared feature or an implicit optional dep
         // (process() decides).
         if !reference.contains('/') {
-            return self.process(package, reference, Domain::Target);
+            return self.process(package, reference, domain);
         }
 
         let (dep_name, rest) = reference.split_once('/').unwrap_or((reference, ""));
@@ -660,14 +681,14 @@ impl<'a> Resolver<'a> {
         // name (tokio's `net = ["mio/os-poll", ...]` lists `mio`).
         self.activate_edge(&pkg.id, &dep, dep_domain)?;
         if dep.optional {
-            self.mark_feature(package, &dep.package.name, _domain);
+            self.mark_feature(package, &dep.package.name, domain);
         }
         self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference)
     }
 
     fn enqueue_dep_feature(
         &mut self,
-        _parent: &PackageId,
+        parent: &PackageId,
         dep: &Dep,
         domain: Domain,
         feature: &str,
@@ -680,6 +701,10 @@ impl<'a> Resolver<'a> {
             crate::model::SourceId::Registry(url) if url.is_empty()
         );
         if provisional {
+            self.unresolved_edge_features
+                .entry((parent.clone(), dep.extern_name.clone()))
+                .or_default()
+                .insert(feature.to_owned());
             return Ok(());
         }
         let dep_package = self.pkg(&dep.package)?;
@@ -982,6 +1007,29 @@ mod tests {
         assert_eq!(bytes, tong_core::canonical::encode_vec(&again));
     }
 
+    #[test]
+    fn forwards_features_to_unresolved_registry_edges() {
+        let mut app = package("app", &[("default", &["remote/extra"])], true);
+        app.deps.push(Dep {
+            extern_name: "remote".to_owned(),
+            package: PackageId {
+                name: "remote".to_owned(),
+                version: semver::Version::new(0, 0, 0),
+                source: SourceId::Registry(String::new()),
+            },
+            optional: false,
+            default_features: true,
+            features: Vec::new(),
+            target: None,
+        });
+        let model = model(vec![app], &["app"]);
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+        assert_eq!(
+            map.unresolved_features_for(&pid("app"), "remote"),
+            Some(&BTreeSet::from(["extra".to_owned()]))
+        );
+    }
+
     /// Resolver 1 unifies dev-dep features into the whole graph, even for
     /// a normal build (the legacy behavior).
     #[test]
@@ -1016,9 +1064,8 @@ mod tests {
         assert!(map.packages[&pid("shared")].contains("devfeat"));
     }
 
-    /// Resolver 3 keeps host (build-dependency) and target (normal
-    /// dependency) feature sets of one package independent; resolver 2
-    /// unifies them.
+    /// Resolvers 2 and 3 keep host (build-dependency) and target (normal
+    /// dependency) feature sets of one package independent.
     #[test]
     fn resolver_v3_separates_host_and_target_domains() {
         let mut app = package("app", &[("default", &[])], true);
@@ -1048,12 +1095,11 @@ mod tests {
         // Host domain: the build edge's feature applies there.
         assert!(map.build_features[&pid("shared")].contains("hostfeat"));
 
-        // Resolver 2: build edges share the target domain — the feature
-        // unifies into `packages`.
+        // Resolver 2 has the same build/target feature isolation.
         model.resolver = ResolverVersion::V2;
         let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
-        assert!(map.packages[&pid("shared")].contains("hostfeat"));
-        assert!(map.build_features[&pid("shared")].is_empty());
+        assert!(map.packages[&pid("shared")].is_empty());
+        assert!(map.build_features[&pid("shared")].contains("hostfeat"));
     }
 
     /// Resolver 3: a host package's normal dependencies activate in the

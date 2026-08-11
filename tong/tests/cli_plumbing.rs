@@ -62,7 +62,7 @@ fn cargo_workspace() -> tempfile::TempDir {
     let ws = dir.path();
     fs::write(
         ws.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\n",
+        "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\nresolver = \"2\"\n",
     )
     .unwrap();
     fs::create_dir_all(ws.join("crates/app/src")).unwrap();

@@ -1478,12 +1478,16 @@ fn graph_json(prepared: &Prepared) -> Result<(), BuildError> {
         } else {
             ""
         };
-        // Resolved features (target domain), sorted.
-        let features: Vec<&str> = map
+        // Cargo metadata reports the union of features activated by every
+        // configured unit even though resolver 2/3 keep host and target
+        // feature domains separate for compilation.
+        let mut feature_set: BTreeSet<&str> = map
             .features_for(&pkg.id, false)
             .iter()
-            .map(|f| f.as_str())
+            .map(String::as_str)
             .collect();
+        feature_set.extend(map.features_for(&pkg.id, true).iter().map(String::as_str));
+        let features: Vec<&str> = feature_set.into_iter().collect();
         // Active edges: non-optional deps plus activated optional edges,
         // across normal/dev/build kinds.
         let mut edges: Vec<String> = Vec::new();
@@ -2544,6 +2548,15 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             let req = semver::VersionReq::parse(&edge.req)
                 .map_err(|err| BuildError::Manifest(err.to_string()))?;
             let dev = dev_edges.contains(&(edge.package.clone(), edge.extern_name.clone()));
+            let mut features = edge.features.clone();
+            if let Some(resolved) = feature_map.unresolved_features_for(&pkg.id, &edge.extern_name)
+            {
+                for feature in resolved {
+                    if !features.contains(feature) {
+                        features.push(feature.clone());
+                    }
+                }
+            }
             deps.push(tong_fetch::ResolvedDep {
                 name: edge.extern_name.clone(),
                 package: Some(edge.package.clone()),
@@ -2551,7 +2564,7 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
                 // Feature-resolved active; see the model-deps loop.
                 optional: false,
                 dev,
-                features: edge.features.clone(),
+                features,
                 default_features: edge.default_features,
             });
             registry_edges += 1;

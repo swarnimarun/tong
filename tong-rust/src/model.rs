@@ -269,12 +269,11 @@ pub enum ResolverVersion {
     /// Resolver 1 (pre-2021 default): a single feature domain — features
     /// unify across normal, build, and dev dependencies.
     V1,
-    /// Resolver 2 (2021+ default): dev-dependencies are a separate feature
-    /// domain; normal and build dependencies unify.
+    /// Resolver 2 (2021+ default): dev dependencies stay out of normal
+    /// builds and build dependencies use a separate host feature domain.
     V2,
-    /// Resolver 3 (2024+ default): build-dependencies are a separate host
-    /// domain too — a package used as both a normal and a build dependency
-    /// keeps independent feature sets.
+    /// Resolver 3 (2024+ default): the same feature domains as resolver 2,
+    /// plus Cargo's newer version-selection policy.
     V3,
 }
 
@@ -283,17 +282,25 @@ impl ResolverVersion {
     /// wins; otherwise the package edition picks the default (2021+ → 2,
     /// 2024 → 3, older → 1).
     pub fn from_manifest(resolver: Option<&str>, edition: Edition) -> Result<Self, String> {
-        match resolver {
-            Some("1") => Ok(Self::V1),
-            Some("2") => Ok(Self::V2),
-            Some("3") => Ok(Self::V3),
-            Some(other) => Err(format!("unsupported resolver version {other:?}")),
-            None => Ok(match edition {
+        let selected = match resolver {
+            Some("1") => Self::V1,
+            Some("2") => Self::V2,
+            Some("3") => Self::V3,
+            Some(other) => return Err(format!("unsupported resolver version {other:?}")),
+            None => match edition {
                 Edition::E2015 | Edition::E2018 => Self::V1,
                 Edition::E2021 => Self::V2,
                 Edition::E2024 => Self::V3,
-            }),
+            },
+        };
+        if selected == Self::V1 {
+            return Err(
+                "Cargo resolver 1 is not supported; set `workspace.resolver = \"2\"` in the \
+                 workspace root, or `package.resolver = \"2\"` for a standalone package"
+                    .to_owned(),
+            );
         }
+        Ok(selected)
     }
 }
 
@@ -854,14 +861,9 @@ mod tests {
 
     #[test]
     fn resolver_defaults_follow_editions() {
-        assert_eq!(
-            ResolverVersion::from_manifest(None, Edition::E2015).unwrap(),
-            ResolverVersion::V1
-        );
-        assert_eq!(
-            ResolverVersion::from_manifest(None, Edition::E2018).unwrap(),
-            ResolverVersion::V1
-        );
+        let implicit = ResolverVersion::from_manifest(None, Edition::E2015).unwrap_err();
+        assert!(implicit.contains("workspace.resolver = \"2\""));
+        assert!(ResolverVersion::from_manifest(None, Edition::E2018).is_err());
         assert_eq!(
             ResolverVersion::from_manifest(None, Edition::E2021).unwrap(),
             ResolverVersion::V2
@@ -870,10 +872,8 @@ mod tests {
             ResolverVersion::from_manifest(None, Edition::E2024).unwrap(),
             ResolverVersion::V3
         );
-        assert_eq!(
-            ResolverVersion::from_manifest(Some("1"), Edition::E2024).unwrap(),
-            ResolverVersion::V1
-        );
+        let explicit = ResolverVersion::from_manifest(Some("1"), Edition::E2024).unwrap_err();
+        assert!(explicit.contains("package.resolver = \"2\""));
         assert!(ResolverVersion::from_manifest(Some("4"), Edition::E2021).is_err());
     }
 }

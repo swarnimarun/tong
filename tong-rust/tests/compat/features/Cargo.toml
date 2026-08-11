@@ -1,5 +1,6 @@
 [workspace]
 members = ["core", "app"]
+resolver = "2"
 
 [workspace.dependencies]
 core = { path = "core", features = ["fast"] }

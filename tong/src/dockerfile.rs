@@ -242,7 +242,7 @@ mod tests {
     fn cargo_workspace(dir: &Path) {
         write(
             &dir.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"app\", \"libc\"]\n",
+            "[workspace]\nmembers = [\"app\", \"libc\"]\nresolver = \"2\"\n",
         );
         write(&dir.join("Cargo.lock"), "# fixture lockfile\n");
         write(

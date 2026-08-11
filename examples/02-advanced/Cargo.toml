@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/advanced-core", "crates/shout", "crates/advanced-app"]
+resolver = "2"
 
 [profile.dev]
 opt-level = 0

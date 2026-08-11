@@ -1,2 +1,3 @@
 [workspace]
 members = ["crates/calc-core", "crates/calc-cli"]
+resolver = "2"

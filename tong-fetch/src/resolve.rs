@@ -1098,12 +1098,7 @@ fn activate(
         .deps
         .iter()
         .filter(|dep| !dep.dev || candidate.local)
-        // Cargo locks every dependency of workspace members (optional and
-        // dev included) but only activated optional deps of registry
-        // packages: the lock mirrors the activated feature graph for
-        // registry deps (indexmap's `arbitrary`/`borsh` stay out) while
-        // member locks are complete (clap_builder's `anstream` appears
-        // even with `color` off).
+        // Only feature-activated optional edges enter the resolved graph.
         .filter(|dep| {
             !dep.optional || closure.enabled.contains(&dep.name) || closure.seen.contains(&dep.name)
         })
@@ -1833,11 +1828,8 @@ mod tests {
         );
     }
 
-    /// Registry packages lock only activated optional deps (the lock
-    /// mirrors the activated feature graph for registry deps — indexmap's
-    /// `arbitrary` stays out of Cargo.lock); workspace members lock every
-    /// dependency (clap_builder's `anstream` appears even with `color`
-    /// off). Weak-referenced deps activate like strong ones.
+    /// Registry packages lock feature-activated optional edges. Weak
+    /// references activate like strong ones for lock resolution.
     #[test]
     fn optional_deps_lock_semantics_match_cargo() {
         // A package with an optional dep enabled only by a non-default
@@ -1889,8 +1881,7 @@ mod tests {
             ),
         ]));
 
-        // Default features only: `extra` (a registry package's inactive
-        // optional dep) stays out of the lock.
+        // Default features only: inactive `extra` stays out of the lock.
         let packages = resolve(
             &fixture,
             &[root(vec![edge("pkg", "^1")])],
