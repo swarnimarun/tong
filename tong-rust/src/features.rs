@@ -886,11 +886,17 @@ impl<'a> Resolver<'a> {
         // feature. Cargo's resolve-node features also list the dep's own
         // name (tokio's `net = ["mio/os-poll", ...]` lists `mio`).
         self.activate_edge(&pkg.id, &dep, dep_domain)?;
-        if dep.optional
-            && (Self::has_implicit_dep_feature(pkg, &dep)
-                || Self::has_declared_dep_feature(pkg, dep_name, &dep))
-        {
-            self.mark_feature(package, dep_name, domain);
+        if dep.optional {
+            if Self::has_declared_dep_feature(pkg, dep_name, &dep) {
+                // A same-named declared feature may carry more references
+                // than `dep:name`. Expand it normally instead of merely
+                // marking it for Cargo's reported feature set; otherwise an
+                // earlier `name/feature` reference can suppress its later
+                // expansion.
+                self.process(package, dep_name, domain)?;
+            } else if Self::has_implicit_dep_feature(pkg, &dep) {
+                self.mark_feature(package, dep_name, domain);
+            }
         }
         self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference)
     }
@@ -1075,6 +1081,30 @@ mod tests {
 
         assert!(map.packages[&pid("app")].contains("extra"));
         assert!(map.packages[&pid("extra")].contains("derive"));
+    }
+
+    #[test]
+    fn early_dep_feature_expands_same_named_declared_feature() {
+        let mut app = package(
+            "app",
+            &[
+                ("default", &["alloc", "helper"]),
+                ("alloc", &["helper/alloc"]),
+                ("helper", &["dep:helper", "math/secure"]),
+            ],
+            true,
+        );
+        app.deps.push(dep("helper", "helper", true));
+        app.deps.push(dep("math", "math", false));
+        let helper = package("helper", &[("alloc", &[])], false);
+        let math = package("math", &[("secure", &[])], false);
+        let model = model(vec![app, helper, math], &["app"]);
+
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+
+        assert!(map.packages[&pid("app")].contains("helper"));
+        assert!(map.packages[&pid("helper")].contains("alloc"));
+        assert!(map.packages[&pid("math")].contains("secure"));
     }
 
     #[test]
