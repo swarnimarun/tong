@@ -40,8 +40,9 @@ diagnostics.
 ```
 
 Default location: `<root>/.tong/store`. Relocate (shared-store mode)
-with `TONG_STORE_DIR` or `[store] dir` in `Tong.toml` (native mode
-only).
+with global `--store-dir`, `TONG_STORE_DIR`, or `[store] dir` in
+`Tong.toml` (native mode only). `tong store path` prints the effective
+location; `--format json` emits a versioned machine-readable result.
 
 Materialized files are writable copies today; they are not hard links to
 immutable CAS blobs. Reflink-first thin materialization and physical-byte

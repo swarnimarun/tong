@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tong_core::action::{ActionId, CachePolicy};
 use tong_core::artifact::TreeDigest;
@@ -45,13 +46,28 @@ pub const DEFAULT_RETENTION: &str = "7d";
 /// Default store size budget (auto-GC after builds).
 pub const DEFAULT_MAX_SIZE: &str = "10G";
 
+/// Process-wide store override set by the CLI's global `--store-dir` flag.
+///
+/// The driver is otherwise configured from manifests and environment variables;
+/// keeping this override outside action configuration ensures that a physical
+/// cache location never changes semantic action identity.
+static STORE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Sets the process-wide store directory selected by the CLI.
+pub fn set_store_dir_override(dir: PathBuf) {
+    let _ = STORE_DIR_OVERRIDE.set(dir);
+}
+
 /// Resolves the store directory for a workspace.
 ///
-/// Resolution order: env `TONG_STORE_DIR` → `[store] dir` in `Tong.toml`
-/// (relative to the workspace root; native mode only) → `<root>/.tong/store`
-/// (the project-local default). Everything else (exec roots, `out/`) stays
-/// under `<root>/.tong/` in both modes.
+/// Resolution order: CLI `--store-dir` → env `TONG_STORE_DIR` → `[store] dir`
+/// in `Tong.toml` (relative to the workspace root; native mode only) →
+/// `<root>/.tong/store` (the project-local default). Everything else (exec
+/// roots, `out/`) stays under `<root>/.tong/` in both modes.
 pub fn store_dir(root: &Path, manifest: Option<&Manifest>) -> Result<PathBuf, BuildError> {
+    if let Some(dir) = STORE_DIR_OVERRIDE.get() {
+        return Ok(dir.clone());
+    }
     if let Some(dir) = std::env::var_os("TONG_STORE_DIR") {
         return Ok(PathBuf::from(dir));
     }
@@ -71,6 +87,12 @@ pub fn store_dir(root: &Path, manifest: Option<&Manifest>) -> Result<PathBuf, Bu
         return Ok(root.join(path));
     }
     Ok(root.join(".tong").join("store"))
+}
+
+/// Resolves the effective store path for a workspace without opening it.
+pub fn resolved_store_dir(root: &Path) -> Result<PathBuf, BuildError> {
+    let manifest = load_manifest(root)?;
+    store_dir(root, manifest.as_ref())
 }
 
 /// Resolves the GC retention policy: `TONG_STORE_RETENTION` →

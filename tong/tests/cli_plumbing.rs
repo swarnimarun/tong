@@ -110,6 +110,33 @@ fn assert_success(output: &std::process::Output, what: &str) {
 }
 
 #[test]
+fn shared_store_reuses_cargo_workspace_actions() {
+    let store = tempfile::tempdir().unwrap();
+    let store_arg = store.path().to_str().unwrap();
+    let first = cargo_workspace();
+    let second = cargo_workspace();
+
+    let output = run_tong(
+        first.path(),
+        &["build", "--workspace", "--store-dir", store_arg],
+    );
+    assert_success(&output, "first shared Cargo build");
+    assert!(!first.path().join(".tong/store").exists());
+
+    let output = run_tong(
+        second.path(),
+        &["--store-dir", store_arg, "build", "--workspace"],
+    );
+    assert_success(&output, "second shared Cargo build");
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("[cached]"),
+        "second Cargo worktree must reuse shared actions: {stdout}"
+    );
+    assert!(!second.path().join(".tong/store").exists());
+}
+
+#[test]
 fn cargo_workflow_commands_native_workspace() {
     let work = native_workspace();
     let ws = work.path();

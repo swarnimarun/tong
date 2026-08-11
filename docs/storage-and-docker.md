@@ -15,7 +15,7 @@ the implementation order.
 | Capability | Current evidence |
 |---|---|
 | Content deduplication | Blobs, trees, action results, sources, and bundles are digest-addressed in `tong-store`. |
-| Cross-worktree reuse | `TONG_STORE_DIR` points multiple workspaces at one store; `native_label_rename_is_digest_stable` proves relocation/label reuse. |
+| Cross-worktree reuse | Global `--store-dir` or `TONG_STORE_DIR` points multiple workspaces at one store; native and Cargo integration tests prove relocation reuse. |
 | Thin project state | In shared mode, the CAS is outside the worktree; `.tong` contains transient exec roots and selected `.tong/out` artifacts. Exec roots are pruned after builds. |
 | On-demand outputs | The driver materializes selected top-level artifacts; dependency intermediates stay in the CAS. |
 | Correct invalidation | Action keys contain content trees, command/environment/platform/toolchain semantics, and narrowed build-script inputs. `explain rebuild` compares recorded actions. |
@@ -29,7 +29,7 @@ incremental-speed advantage over Cargo.
 
 | Gap | Consequence | Planned proof |
 |---|---|---|
-| Shared backing requires an environment variable or native-only manifest field | Cargo-import users do not get an obvious, durable switch. | Global `--store-dir`, then user config/store setup UX and two-worktree tests. |
+| Durable shared backing still requires an environment variable or native-only manifest field | Cargo-import users have a global `--store-dir`, but no persisted workspace-neutral choice. | User config/store setup UX and two-worktree benchmarks. |
 | Final artifact materialization copies every blob | Selected outputs duplicate physical bytes in each worktree. | Reflink-first materializer, unchanged-file skipping, byte counters, mutation tests. |
 | No physical/logical storage report | Users cannot verify savings or tune GC. | `tong store stats --format text|json` with local/shared/reclaimable accounting. |
 | The 24-hour GC floor approximates in-flight safety | Large shared stores retain garbage longer than necessary and lack explicit ownership. | Per-build leases, heartbeat/expiry recovery, concurrent GC tests. |
@@ -42,7 +42,7 @@ incremental-speed advantage over Cargo.
 
 ### A. Make sharing obvious and measurable
 
-- Add global `--store-dir <path>` for every command, with precedence over
+- Global `--store-dir <path>` works for every command, with precedence over
   `TONG_STORE_DIR`, native `[store] dir`, and the project-local default.
 - Add a Cargo/native-neutral user configuration with `store.scope = "user"`
   and an explicit resolved-path diagnostic; never put the path in action

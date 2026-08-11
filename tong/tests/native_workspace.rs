@@ -187,3 +187,68 @@ fn native_label_rename_is_digest_stable() {
         "renamed build must behave identically"
     );
 }
+
+#[test]
+fn global_store_dir_shares_backing_between_worktrees() {
+    let store = tempfile::tempdir().unwrap();
+    let store_arg = store.path().to_str().unwrap();
+    let first = fixture_copy();
+    let second = fixture_copy();
+    for workspace in [first.path(), second.path()] {
+        let copied_build_state = workspace.join(".tong");
+        if copied_build_state.exists() {
+            fs::remove_dir_all(copied_build_state).unwrap();
+        }
+    }
+
+    let output = run_tong(first.path(), None, &["build", "--store-dir", store_arg]);
+    assert!(
+        output.status.success(),
+        "first shared build failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    assert!(!first.path().join(".tong/store").exists());
+    assert!(
+        first.path().join(".tong/out/dev/web-app/web-app").is_file(),
+        "expected selected output: {}",
+        stdout_of(&output)
+    );
+
+    let output = run_tong(second.path(), None, &["--store-dir", store_arg, "build"]);
+    assert!(
+        output.status.success(),
+        "second shared build failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("[cached]"),
+        "second worktree must reuse shared actions: {stdout}"
+    );
+    assert!(!second.path().join(".tong/store").exists());
+    assert!(
+        second
+            .path()
+            .join(".tong/out/dev/web-app/web-app")
+            .is_file()
+    );
+
+    let output = run_tong(
+        second.path(),
+        None,
+        &[
+            "store",
+            "path",
+            "--format",
+            "json",
+            "--store-dir",
+            store_arg,
+        ],
+    );
+    assert!(output.status.success(), "store path failed");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["path"], store_arg);
+}

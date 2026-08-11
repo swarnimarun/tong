@@ -89,7 +89,7 @@ mode from whichever manifest is present.
 | Native interop | `cc_import` for prebuilt C libraries (e.g. SDL3), build-script link directives propagated to dependents |
 | Sources | `Tong.lock` + `tong lock` / `tong fetch` / `tong update`; crates.io sparse index; fully offline builds |
 | Toolchains | System capture (content-fingerprinted, snapshot-cached) or pinned dist bundles via `tong toolchain fetch rust --version` |
-| Caching | Content-addressed store, per-action cache, build-state manifests, reachability GC (`tong gc`), shared stores (`TONG_STORE_DIR`) |
+| Caching | Content-addressed store, per-action cache, build-state manifests, reachability GC (`tong gc`), shared stores (`--store-dir` / `TONG_STORE_DIR`) |
 | Sandboxing | Explicit `[policy] sandbox` levels l1–l4 (bubblewrap on Linux, Seatbelt where usable on macOS, clean-env on Windows) |
 | Docker | `tong build --deps-only` and `tong dockerfile` for layer-cache-friendly images |
 | Determinism | SHA-256 canonical digests, pure analysis, clean action environments, no ambient cargo |

@@ -177,6 +177,19 @@ Deletes unreferenced store objects. Defaults come from
 reports without deleting. GC also runs automatically after every build
 (best-effort). See [Caching and the Store](caching.html).
 
+## Shared store
+
+```sh
+tong --store-dir /path/to/shared build
+tong store path [--format text|json]
+```
+
+`--store-dir` is global, so it may also appear after a subcommand. Point
+multiple worktrees at the same directory to reuse content and action results;
+their `.tong` directories retain only transient execution roots and requested
+artifacts. The CLI flag wins over `TONG_STORE_DIR`, native `[store] dir`, and
+the project-local default.
+
 ## Environment variables
 
 | Variable | Meaning | Default |
@@ -188,8 +201,9 @@ reports without deleting. GC also runs automatically after every build
 | `TONG_REGISTRY_INDEX` | Registry index URL (`sparse+https://…`, `https://…`, `file://…`) | crates.io sparse |
 | `RUST_LOG` | Tracing filter; `tong::perf=debug` emits per-phase perf events to stderr | `warn` |
 
-Precedence: `TONG_STORE_DIR` wins over `[store] dir` in `Tong.toml`
-(native mode only), which wins over the project-local default.
+Precedence: global `--store-dir` wins over `TONG_STORE_DIR`, which wins over
+`[store] dir` in `Tong.toml` (native mode only), which wins over the
+project-local default.
 `TONG_REGISTRY_INDEX` wins over `[registry] index`.
 
 Example — forward perf events without polluting stdout:

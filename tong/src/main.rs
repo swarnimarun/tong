@@ -18,6 +18,10 @@ use driver::{BuildOptions, BuildOutcome, TargetSelection};
     about = "Tong hermetic multi-language build system"
 )]
 struct Cli {
+    /// Content-addressed store location. Share this path across worktrees to
+    /// reuse builds while keeping each project-local `.tong` directory thin.
+    #[arg(long, global = true, value_name = "PATH")]
+    store_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -358,6 +362,21 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Inspect and manage the content-addressed store.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// Print the effective store directory.
+    Path {
+        /// Output format: `text` or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -410,9 +429,17 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    let Cli { store_dir, command } = Cli::parse();
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match cli.command {
+    if let Some(store_dir) = store_dir {
+        let store_dir = if store_dir.is_absolute() {
+            store_dir
+        } else {
+            workspace.join(store_dir)
+        };
+        driver::set_store_dir_override(store_dir);
+    }
+    match command {
         Command::Build {
             labels,
             targets,
@@ -664,6 +691,32 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Store { command } => match command {
+            StoreCommand::Path { format } => match driver::resolved_store_dir(&workspace) {
+                Ok(path) if format == "text" => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Ok(path) if format == "json" => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": 1,
+                            "path": path.to_string_lossy(),
+                        })
+                    );
+                    ExitCode::SUCCESS
+                }
+                Ok(_) => {
+                    eprintln!("tong: error: unsupported format {format:?} (use text or json)");
+                    ExitCode::FAILURE
+                }
+                Err(err) => {
+                    eprintln!("tong: error: {err}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
         Command::Dockerfile {
             profile,
             base,
