@@ -1,4 +1,4 @@
-//! Cargo-compatible feature resolution (resolver 1/2/3 semantics).
+//! Cargo-compatible feature resolution for resolver 2 and resolver 3.
 //!
 //! Pure module, no I/O; deterministic (BTreeMap/BTreeSet everywhere).
 //! Implements the resolver rules: weak dep features (`pkg?/feat`),
@@ -9,12 +9,11 @@
 //!
 //! Feature domains (Cargo's resolver versions, selected per workspace):
 //!
-//! - Resolver 1: one domain — features unify across normal, build, and
-//!   dev dependencies (the legacy behavior that made `cargo build` see
-//!   dev-dep features).
 //! - Resolvers 2 and 3: build-dependencies form a separate *host* domain,
 //!   and dev-dependencies do not affect normal builds. Resolver 3 changes
 //!   version selection policy, not Cargo's feature-domain isolation.
+//! - Resolver 1 is represented only so callers can produce a targeted
+//!   migration diagnostic; configured imports reject it.
 //!
 //! The resolution is a fixpoint workqueue: activating a feature enqueues
 //! the references it declares; every (package, feature, domain) triple is
@@ -50,9 +49,8 @@ pub struct FeatureMap {
     /// with an empty list), in which case the package's feature set is
     /// empty but the edge is live.
     pub active_optional_deps: BTreeMap<PackageId, BTreeSet<String>>,
-    /// Resolver-3 host domain: features activated on build-dependency
-    /// packages (compiled for the execution host). Empty under
-    /// resolvers 1 and 2, where build edges share the target domain.
+    /// Resolver-2/3 host domain: features activated on build-dependency
+    /// and proc-macro packages compiled for the execution host.
     pub build_features: BTreeMap<PackageId, BTreeSet<String>>,
     /// Active optional build-dep edges per package (host domain).
     pub active_build_optional_deps: BTreeMap<PackageId, BTreeSet<String>>,
@@ -63,9 +61,8 @@ pub struct FeatureMap {
 }
 
 impl FeatureMap {
-    /// The activated features of `package` in the given domain; the host
-    /// domain falls back to the unified map (resolvers 1/2 have no host
-    /// domain).
+    /// The activated features of `package` in the given domain. The host
+    /// lookup falls back to target features only for legacy unified maps.
     pub fn features_for(&self, package: &PackageId, host: bool) -> &BTreeSet<String> {
         if host {
             self.build_features
@@ -77,8 +74,8 @@ impl FeatureMap {
     }
 
     /// Whether the optional edge `extern_name` of `package` is active in
-    /// either domain (build edges live in the host domain under resolver
-    /// 3).
+    /// either domain (build and proc-macro edges live in the host domain
+    /// under resolver 2/3).
     pub fn edge_active(&self, package: &PackageId, extern_name: &str) -> bool {
         self.active_optional_deps
             .get(package)
@@ -217,6 +214,45 @@ pub fn resolve_features(
     requests: &[FeatureRequest],
     include_dev_deps: bool,
 ) -> Result<FeatureMap, FeatureError> {
+    resolve_features_inner(model, requests, include_dev_deps, false, None)
+}
+
+/// Resolves configured features after filtering target-table edges for the
+/// requested target and host domains.
+pub fn resolve_features_for_target(
+    model: &RustModel,
+    requests: &[FeatureRequest],
+    include_dev_deps: bool,
+    target_triple: &str,
+    host_triple: &str,
+) -> Result<FeatureMap, FeatureError> {
+    resolve_features_inner(
+        model,
+        requests,
+        include_dev_deps,
+        false,
+        Some((target_triple, host_triple)),
+    )
+}
+
+/// Resolves Cargo's all-platform metadata feature view. Cargo metadata
+/// unions feature requests from duplicate target-table edges, while actual
+/// configured build units keep only the selected target's requests.
+pub fn resolve_all_platform_features(
+    model: &RustModel,
+    requests: &[FeatureRequest],
+    include_dev_deps: bool,
+) -> Result<FeatureMap, FeatureError> {
+    resolve_features_inner(model, requests, include_dev_deps, true, None)
+}
+
+fn resolve_features_inner(
+    model: &RustModel,
+    requests: &[FeatureRequest],
+    include_dev_deps: bool,
+    all_target_variants: bool,
+    configured_triples: Option<(&str, &str)>,
+) -> Result<FeatureMap, FeatureError> {
     let packages: BTreeMap<PackageId, &Package> = model
         .packages
         .iter()
@@ -235,6 +271,7 @@ pub fn resolve_features(
     let mut state = Resolver {
         resolver: model.resolver,
         include_dev: include_dev_deps,
+        all_target_variants,
         packages: &packages,
         features_on: packages
             .keys()
@@ -254,6 +291,7 @@ pub fn resolve_features(
         unresolved_edge_features: BTreeMap::new(),
         expanded: BTreeSet::new(),
         native_imports: &native_imports,
+        configured_triples,
     };
 
     // Seed: explicit workspace-member requests (target domain). Expansion
@@ -271,19 +309,20 @@ pub fn resolve_features(
                 .queue
                 .push((request.package.clone(), feature.clone(), Domain::Target));
         }
-    }
-
-    // Resolver 2/3 host domain: packages with build scripts compile their
-    // (non-optional) build-dependencies for the host — a separate feature
-    // domain from the target one.
-    if state.resolver != ResolverVersion::V1 {
-        for package in &model.packages {
-            if package.build_script.is_some() {
-                for dep in &package.build_deps {
-                    if !dep.optional && !state.native_imports.contains(dep.package.name.as_str()) {
-                        state.activate_edge(&package.id, dep, Domain::Host)?;
-                    }
-                }
+        let proc_macro_root = model.resolver != ResolverVersion::V1
+            && packages
+                .get(&request.package)
+                .and_then(|package| package.lib.as_ref())
+                .is_some_and(|lib| lib.proc_macro);
+        if proc_macro_root {
+            state.ensure_expanded(&request.package, Domain::Host);
+            if request.default_features {
+                state.mark_default(&request.package, Domain::Host);
+            }
+            for feature in &request.features {
+                state
+                    .queue
+                    .push((request.package.clone(), feature.clone(), Domain::Host));
             }
         }
     }
@@ -329,13 +368,9 @@ pub fn resolve_features(
         }
     }
 
-    // Weak features for deps present in the graph: cargo applies
-    // `dep?/feat` whenever the dep is in the resolution (locked) graph,
-    // even if no feature activated it (e.g. toml's `std` =
-    // `["indexmap?/std"]` with `preserve_order` off). The edge itself is
-    // not activated — the dep is not pulled into the build — but the
-    // feature name lands in the dep's activated set, matching cargo's
-    // resolve-node features.
+    // Cargo metadata reports weak `dep?/feat` requests for dependencies
+    // present only in the all-platform resolved graph. Configured builds
+    // retain true weak semantics: the reference never activates the edge.
     let pending = std::mem::take(&mut state.pending_weak);
     for (parent, dep_name, feature, reference, domain) in pending {
         let Some((dep, dep_domain)) = state
@@ -348,7 +383,7 @@ pub fn resolve_features(
             .active_set(dep_domain)
             .get(&parent)
             .is_some_and(|active| active.contains(&dep.extern_name));
-        if !active {
+        if !active && state.all_target_variants {
             state.enqueue_dep_feature(&parent, &dep, dep_domain, &feature, &reference)?;
         }
     }
@@ -378,6 +413,7 @@ enum Domain {
 struct Resolver<'a> {
     resolver: ResolverVersion,
     include_dev: bool,
+    all_target_variants: bool,
     packages: &'a BTreeMap<PackageId, &'a Package>,
     features_on: BTreeMap<PackageId, BTreeSet<String>>,
     active_optional: BTreeMap<PackageId, BTreeSet<String>>,
@@ -400,6 +436,7 @@ struct Resolver<'a> {
     /// domain.
     expanded: BTreeSet<(PackageId, Domain)>,
     native_imports: &'a BTreeSet<&'a str>,
+    configured_triples: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -444,7 +481,19 @@ impl<'a> Resolver<'a> {
             }
             (ResolverVersion::V1, Domain::Host) => {}
         }
+        out.retain(|dep| self.dep_matches_target(dep, domain));
         out
+    }
+
+    fn dep_matches_target(&self, dep: &Dep, domain: Domain) -> bool {
+        let Some((target, host)) = self.configured_triples else {
+            return true;
+        };
+        let Some(condition) = dep.target.as_deref() else {
+            return true;
+        };
+        let triple = if domain == Domain::Host { host } else { target };
+        crate::cargo_import::target_matches(condition, triple, "dependency").unwrap_or(false)
     }
 
     /// Finds a dependency by declared name or extern name across every
@@ -466,16 +515,19 @@ impl<'a> Resolver<'a> {
                 || dep.extern_name.replace('-', "_") == normalized
                 || dep.package.name.replace('-', "_") == normalized
         };
-        let preferred = |deps: &'a [Dep]| {
+        let preferred = |deps: &'a [Dep], domain: Domain| {
             deps.iter()
-                .filter(|dep| matches(dep))
+                .filter(|dep| matches(dep) && self.dep_matches_target(dep, domain))
                 .find(|dep| dep.optional)
-                .or_else(|| deps.iter().find(|dep| matches(dep)))
+                .or_else(|| {
+                    deps.iter()
+                        .find(|dep| matches(dep) && self.dep_matches_target(dep, domain))
+                })
         };
-        if let Some(dep) = preferred(&pkg.deps) {
-            return Some((dep, current_domain));
+        if let Some(dep) = preferred(&pkg.deps, current_domain) {
+            return Some((dep, self.normal_dep_domain(dep, current_domain)));
         }
-        if let Some(dep) = preferred(&pkg.build_deps) {
+        if let Some(dep) = preferred(&pkg.build_deps, Domain::Host) {
             let domain = if self.resolver != ResolverVersion::V1 {
                 Domain::Host
             } else {
@@ -484,11 +536,44 @@ impl<'a> Resolver<'a> {
             return Some((dep, domain));
         }
         if self.include_dev
-            && let Some(dep) = preferred(&pkg.dev_deps)
+            && let Some(dep) = preferred(&pkg.dev_deps, Domain::Target)
         {
-            return Some((dep, Domain::Target));
+            return Some((dep, self.normal_dep_domain(dep, Domain::Target)));
         }
         None
+    }
+
+    fn has_declared_edge(&self, package: &PackageId, name: &str) -> bool {
+        let Some(pkg) = self.packages.get(package) else {
+            return false;
+        };
+        let normalized = name.replace('-', "_");
+        pkg.deps
+            .iter()
+            .chain(pkg.build_deps.iter())
+            .chain(pkg.dev_deps.iter())
+            .any(|dep| {
+                dep.extern_name.replace('-', "_") == normalized
+                    || dep.package.name.replace('-', "_") == normalized
+            })
+    }
+
+    /// Proc macros and everything below them are host units under
+    /// resolver 2/3, even though the edge to the proc-macro crate is a
+    /// normal dependency in Cargo.toml.
+    fn normal_dep_domain(&self, dep: &Dep, current: Domain) -> Domain {
+        if self.resolver != ResolverVersion::V1
+            && (current == Domain::Host
+                || self
+                    .packages
+                    .get(&dep.package)
+                    .and_then(|package| package.lib.as_ref())
+                    .is_some_and(|lib| lib.proc_macro))
+        {
+            Domain::Host
+        } else {
+            Domain::Target
+        }
     }
 
     /// Activates the package's non-optional edges in `domain` exactly once
@@ -502,7 +587,32 @@ impl<'a> Resolver<'a> {
         };
         for dep in self.edges_for(pkg, domain) {
             if !dep.optional && !self.native_imports.contains(dep.package.name.as_str()) {
-                self.edge_queue.push((package.clone(), dep.clone(), domain));
+                let dep_domain = if pkg
+                    .deps
+                    .iter()
+                    .any(|candidate| std::ptr::eq(candidate, dep))
+                    || pkg
+                        .dev_deps
+                        .iter()
+                        .any(|candidate| std::ptr::eq(candidate, dep))
+                {
+                    self.normal_dep_domain(dep, domain)
+                } else {
+                    domain
+                };
+                self.edge_queue
+                    .push((package.clone(), dep.clone(), dep_domain));
+            }
+        }
+        if domain == Domain::Target
+            && self.resolver != ResolverVersion::V1
+            && pkg.build_script.is_some()
+        {
+            for dep in &pkg.build_deps {
+                if !dep.optional && !self.native_imports.contains(dep.package.name.as_str()) {
+                    self.edge_queue
+                        .push((package.clone(), dep.clone(), Domain::Host));
+                }
             }
         }
     }
@@ -540,6 +650,32 @@ impl<'a> Resolver<'a> {
             .insert(feature.to_owned())
     }
 
+    /// Whether Cargo exposes an optional dependency's legacy implicit
+    /// feature. Any `dep:name` reference suppresses that feature globally
+    /// for the package, including when another feature uses `name/feat`.
+    fn has_implicit_dep_feature(pkg: &Package, dep: &Dep) -> bool {
+        let normalized = dep.extern_name.replace('-', "_");
+        !pkg.features
+            .values()
+            .flatten()
+            .filter_map(|reference| reference.strip_prefix("dep:"))
+            .any(|name| name.replace('-', "_") == normalized)
+    }
+
+    /// Whether a declared feature with the dependency's name is itself a
+    /// namespaced activation feature (for example yoke's
+    /// `zerofrom = ["dep:zerofrom"]`). Cargo reports that feature when a
+    /// strong `zerofrom/derive` reference activates the edge.
+    fn has_declared_dep_feature(pkg: &Package, dep_name: &str, dep: &Dep) -> bool {
+        let normalized = dep.extern_name.replace('-', "_");
+        pkg.features.get(dep_name).is_some_and(|references| {
+            references
+                .iter()
+                .filter_map(|reference| reference.strip_prefix("dep:"))
+                .any(|name| name.replace('-', "_") == normalized)
+        })
+    }
+
     /// Activates a dependency edge in `domain`: for optional edges, marks
     /// it active (once), then applies the edge's default-feature and
     /// feature list to the dependency package. Non-optional edges apply
@@ -552,7 +688,8 @@ impl<'a> Resolver<'a> {
     ) -> Result<(), FeatureError> {
         if dep.optional {
             let active = self.active_set(domain).entry(parent.clone()).or_default();
-            if !active.insert(dep.extern_name.clone()) {
+            let newly_active = active.insert(dep.extern_name.clone());
+            if !newly_active && !self.all_target_variants {
                 return Ok(());
             }
         }
@@ -574,12 +711,34 @@ impl<'a> Resolver<'a> {
         }
         self.pkg(&dep.package)?;
         self.ensure_expanded(&dep.package, domain);
-        if dep.default_features {
+        let variants: Vec<Dep> = if self.all_target_variants {
+            self.pkg(parent)?
+                .deps
+                .iter()
+                .chain(self.pkg(parent)?.build_deps.iter())
+                .chain(
+                    self.include_dev
+                        .then_some(self.pkg(parent)?.dev_deps.as_slice())
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter(|candidate| {
+                    candidate.extern_name == dep.extern_name && candidate.package == dep.package
+                })
+                .cloned()
+                .collect()
+        } else {
+            vec![dep.clone()]
+        };
+        if variants.iter().any(|variant| variant.default_features) {
             self.mark_default(&dep.package, domain);
         }
-        for feature in &dep.features {
-            self.queue
-                .push((dep.package.clone(), feature.clone(), domain));
+        let mut features = BTreeSet::new();
+        for variant in &variants {
+            features.extend(variant.features.iter().cloned());
+        }
+        for feature in features {
+            self.queue.push((dep.package.clone(), feature, domain));
         }
         Ok(())
     }
@@ -609,7 +768,9 @@ impl<'a> Resolver<'a> {
             let dep = dep.clone();
             if dep.optional {
                 self.activate_edge(&pkg.id, &dep, dep_domain)?;
-                self.mark_feature(package, &dep.package.name, domain);
+                if Self::has_implicit_dep_feature(pkg, &dep) {
+                    self.mark_feature(package, feature, domain);
+                }
                 return Ok(());
             }
             return Err(FeatureError::NotOptionalDep {
@@ -617,6 +778,18 @@ impl<'a> Resolver<'a> {
                 feature: feature.to_owned(),
                 dep: dep.extern_name.clone(),
             });
+        }
+        if self.configured_triples.is_some()
+            && pkg
+                .optional_anywhere
+                .iter()
+                .any(|name| name.replace('-', "_") == feature.replace('-', "_"))
+        {
+            // An implicit optional-dependency feature exists in Cargo's
+            // all-target namespace even when its only edge is inactive on
+            // this target. Report the feature without activating an extern.
+            self.mark_feature(package, feature, domain);
+            return Ok(());
         }
         Err(FeatureError::UnknownFeature {
             package: package.name.clone(),
@@ -633,12 +806,15 @@ impl<'a> Resolver<'a> {
         let pkg = self.pkg(package)?;
         // `dep:x` — namespaced activation of an optional dependency.
         if let Some(dep_name) = reference.strip_prefix("dep:") {
-            let (dep, dep_domain) =
-                self.edge(package, dep_name, domain)
-                    .ok_or_else(|| FeatureError::UnknownDep {
-                        package: package.name.clone(),
-                        dep: dep_name.to_owned(),
-                    })?;
+            let Some((dep, dep_domain)) = self.edge(package, dep_name, domain) else {
+                if self.configured_triples.is_some() && self.has_declared_edge(package, dep_name) {
+                    return Ok(());
+                }
+                return Err(FeatureError::UnknownDep {
+                    package: package.name.clone(),
+                    dep: dep_name.to_owned(),
+                });
+            };
             let dep = dep.clone();
             if !dep.optional {
                 // Cargo validates `dep:x` against the union of target
@@ -671,12 +847,15 @@ impl<'a> Resolver<'a> {
             .map(|name| (name, true))
             .unwrap_or((dep_name, false));
         let feature = rest;
-        let (dep, dep_domain) =
-            self.edge(package, dep_name, domain)
-                .ok_or_else(|| FeatureError::UnknownDep {
-                    package: package.name.clone(),
-                    dep: dep_name.to_owned(),
-                })?;
+        let Some((dep, dep_domain)) = self.edge(package, dep_name, domain) else {
+            if self.configured_triples.is_some() && self.has_declared_edge(package, dep_name) {
+                return Ok(());
+            }
+            return Err(FeatureError::UnknownDep {
+                package: package.name.clone(),
+                dep: dep_name.to_owned(),
+            });
+        };
         let dep = dep.clone();
 
         let dep_active = if dep.optional {
@@ -686,21 +865,36 @@ impl<'a> Resolver<'a> {
         } else {
             true
         };
-        let _ = dep_active;
         if weak {
-            // `dep?/feat` — cargo activates the dependency and applies
-            // the feature like a strong reference, but the dep's own name
-            // is NOT listed in the parent's node features (syn's
-            // `quote?/proc-macro` lists no `quote`).
-            self.activate_edge(&pkg.id, &dep, dep_domain)?;
-            return self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference);
+            // `dep?/feat` forwards only when another feature activated the
+            // optional dependency. The all-platform metadata view retains
+            // Cargo's resolved weak edge, but configured units must not
+            // compile it solely because of this reference.
+            if dep_active {
+                return self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference);
+            }
+            if self.all_target_variants {
+                self.activate_edge(&pkg.id, &dep, dep_domain)?;
+                return self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference);
+            }
+            self.pending_weak.push((
+                package.clone(),
+                dep_name.to_owned(),
+                feature.to_owned(),
+                reference.to_owned(),
+                dep_domain,
+            ));
+            return Ok(());
         }
         // `dep/feat` — strong reference: activates the dep and its
         // feature. Cargo's resolve-node features also list the dep's own
         // name (tokio's `net = ["mio/os-poll", ...]` lists `mio`).
         self.activate_edge(&pkg.id, &dep, dep_domain)?;
-        if dep.optional {
-            self.mark_feature(package, &dep.package.name, domain);
+        if dep.optional
+            && (Self::has_implicit_dep_feature(pkg, &dep)
+                || Self::has_declared_dep_feature(pkg, dep_name, &dep))
+        {
+            self.mark_feature(package, dep_name, domain);
         }
         self.enqueue_dep_feature(package, &dep, dep_domain, feature, reference)
     }
@@ -861,6 +1055,35 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_dep_stays_out_of_parent_features() {
+        let mut app = package("app", &[("default", &["dep:extra", "extra/feat"])], true);
+        app.deps.push(dep("extra", "extra", true));
+        let extra = package("extra", &[("default", &[]), ("feat", &[])], true);
+        let model = model(vec![app, extra], &["app"]);
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+
+        assert!(!map.packages[&pid("app")].contains("extra"));
+        assert!(map.packages[&pid("extra")].contains("feat"));
+        assert!(map.active_optional_deps[&pid("app")].contains("extra"));
+    }
+
+    #[test]
+    fn declared_namespaced_dep_feature_is_reported() {
+        let mut app = package(
+            "app",
+            &[("default", &["extra/derive"]), ("extra", &["dep:extra"])],
+            true,
+        );
+        app.deps.push(dep("extra", "extra", true));
+        let extra = package("extra", &[("derive", &[])], false);
+        let model = model(vec![app, extra], &["app"]);
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+
+        assert!(map.packages[&pid("app")].contains("extra"));
+        assert!(map.packages[&pid("extra")].contains("derive"));
+    }
+
+    #[test]
     fn inactive_optional_dep_is_not_extern() {
         let mut app = package("app", &[("default", &[])], true);
         app.deps.push(dep("extra", "extra", true));
@@ -897,19 +1120,44 @@ mod tests {
         assert!(map.packages[&pid("extra")].contains("feat"));
     }
 
-    /// Cargo activates optional deps referenced by `dep?/feat` weak
-    /// references exactly like strong ones (verified against `cargo
-    /// metadata`: `futures-core?/alloc` in a default feature activates
-    /// the dep, its edge, and the feature).
     #[test]
-    fn weak_dep_feature_activates_dep() {
+    fn weak_dep_feature_does_not_activate_configured_dep() {
         let mut app = package("app", &[("default", &["extra?/feat"])], true);
         app.deps.push(dep("extra", "extra", true));
         let extra = package("extra", &[("default", &[]), ("feat", &[])], true);
         let model = model(vec![app, extra], &["app"]);
         let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
-        assert!(map.active_optional_deps[&pid("app")].contains("extra"));
-        assert!(map.packages[&pid("extra")].contains("feat"));
+        assert!(!map.edge_active(&pid("app"), "extra"));
+        assert!(!map.packages[&pid("extra")].contains("feat"));
+
+        let metadata =
+            resolve_all_platform_features(&model, &[request("app", &[])], false).unwrap();
+        assert!(metadata.edge_active(&pid("app"), "extra"));
+        assert!(metadata.packages[&pid("extra")].contains("feat"));
+    }
+
+    #[test]
+    fn configured_features_filter_inactive_target_edges() {
+        let mut app = package("app", &[("default", &["runtime/unstable"])], true);
+        let mut edge = dep("runtime", "runtime", false);
+        edge.features.push("unstable".to_owned());
+        edge.target = Some("cfg(tokio_unstable)".to_owned());
+        app.dev_deps.push(edge);
+        let runtime = package("runtime", &[("unstable", &[])], false);
+        let model = model(vec![app, runtime], &["app"]);
+
+        let configured = resolve_features_for_target(
+            &model,
+            &[request("app", &[])],
+            true,
+            "aarch64-apple-darwin",
+            "aarch64-apple-darwin",
+        )
+        .unwrap();
+        assert!(!configured.packages[&pid("runtime")].contains("unstable"));
+
+        let metadata = resolve_all_platform_features(&model, &[request("app", &[])], true).unwrap();
+        assert!(metadata.packages[&pid("runtime")].contains("unstable"));
     }
 
     #[test]
@@ -940,6 +1188,33 @@ mod tests {
         // Edge default-features=false: no default on extra.
         assert!(!map.packages[&pid("extra")].contains("default"));
         assert!(map.packages[&pid("extra")].contains("feat"));
+    }
+
+    #[test]
+    fn metadata_unions_target_variant_features() {
+        let mut app = package("app", &[("default", &["dep:extra"])], true);
+        for (target, feature) in [("cfg(unix)", "unix"), ("cfg(windows)", "windows")] {
+            app.deps.push(Dep {
+                extern_name: "extra".to_owned(),
+                package: pid("extra"),
+                optional: true,
+                default_features: false,
+                features: vec![feature.to_owned()],
+                target: Some(target.to_owned()),
+            });
+        }
+        let extra = package("extra", &[("unix", &[]), ("windows", &[])], false);
+        let model = model(vec![app, extra], &["app"]);
+
+        let configured = resolve_features(&model, &[request("app", &[])], false).unwrap();
+        assert_eq!(configured.packages[&pid("extra")].len(), 1);
+
+        let metadata =
+            resolve_all_platform_features(&model, &[request("app", &[])], false).unwrap();
+        assert_eq!(
+            metadata.packages[&pid("extra")],
+            BTreeSet::from(["unix".to_owned(), "windows".to_owned()])
+        );
     }
 
     #[test]
@@ -1120,6 +1395,105 @@ mod tests {
         let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
         assert!(map.packages[&pid("shared")].is_empty());
         assert!(map.build_features[&pid("shared")].contains("hostfeat"));
+    }
+
+    #[test]
+    fn proc_macro_dependency_features_use_host_domain() {
+        let mut app = package("app", &[("default", &[])], true);
+        app.deps.push(dep("derive", "derive", false));
+
+        let mut derive = package("derive", &[("default", &[])], true);
+        derive.lib = Some(crate::model::LibTarget {
+            name: None,
+            crate_types: Vec::new(),
+            proc_macro: true,
+            path: std::path::PathBuf::from("src/lib.rs"),
+        });
+        derive.deps.push(Dep {
+            extern_name: "syntax".to_owned(),
+            package: pid("syntax"),
+            optional: false,
+            default_features: true,
+            features: vec!["parsing".to_owned()],
+            target: None,
+        });
+        let syntax = package(
+            "syntax",
+            &[("default", &["parsing"]), ("parsing", &[])],
+            true,
+        );
+        let mut model = model(vec![app, derive, syntax], &["app"]);
+        model.resolver = ResolverVersion::V2;
+
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+        assert!(map.features_for(&pid("syntax"), true).contains("parsing"));
+        assert!(map.features_for(&pid("syntax"), false).is_empty());
+    }
+
+    #[test]
+    fn dev_proc_macro_features_use_host_domain() {
+        let mut app = package("app", &[("default", &[])], true);
+        let mut derive_edge = dep("derive", "derive", false);
+        derive_edge.features.push("private".to_owned());
+        app.dev_deps.push(derive_edge);
+
+        let mut derive = package("derive", &[("private", &[])], false);
+        derive.lib = Some(crate::model::LibTarget {
+            name: None,
+            crate_types: Vec::new(),
+            proc_macro: true,
+            path: std::path::PathBuf::from("src/lib.rs"),
+        });
+        let mut model = model(vec![app, derive], &["app"]);
+        model.resolver = ResolverVersion::V2;
+
+        let map = resolve_features(&model, &[request("app", &[])], true).unwrap();
+        assert!(map.features_for(&pid("derive"), true).contains("private"));
+        assert!(map.features_for(&pid("derive"), false).is_empty());
+    }
+
+    #[test]
+    fn selected_proc_macro_expands_host_dependencies() {
+        let mut derive = package("derive", &[("default", &[])], true);
+        derive.lib = Some(crate::model::LibTarget {
+            name: None,
+            crate_types: Vec::new(),
+            proc_macro: true,
+            path: std::path::PathBuf::from("src/lib.rs"),
+        });
+        let mut syntax_edge = dep("syntax", "syntax", false);
+        syntax_edge.default_features = false;
+        syntax_edge.features.push("extra-traits".to_owned());
+        derive.deps.push(syntax_edge);
+        let syntax = package("syntax", &[("extra-traits", &[])], false);
+        let mut model = model(vec![derive, syntax], &["derive"]);
+        model.resolver = ResolverVersion::V2;
+
+        let map = resolve_features(&model, &[request("derive", &[])], true).unwrap();
+        assert!(
+            map.features_for(&pid("syntax"), true)
+                .contains("extra-traits")
+        );
+    }
+
+    #[test]
+    fn lock_only_build_scripts_do_not_activate_host_features() {
+        let app = package("app", &[("default", &[])], true);
+        let mut lock_only = package("lock-only", &[("default", &[])], true);
+        lock_only.build_script = Some(std::path::PathBuf::from("build.rs"));
+        lock_only.build_deps.push(Dep {
+            extern_name: "syntax".to_owned(),
+            package: pid("syntax"),
+            optional: false,
+            default_features: false,
+            features: vec!["visit-mut".to_owned()],
+            target: None,
+        });
+        let syntax = package("syntax", &[("visit-mut", &[])], false);
+        let model = model(vec![app, lock_only, syntax], &["app"]);
+
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+        assert!(map.features_for(&pid("syntax"), true).is_empty());
     }
 
     /// Resolver 3: a host package's normal dependencies activate in the

@@ -346,7 +346,7 @@ fn no_cache_actions_bypass_action_cache() {
     );
     let first_stdout = stdout_of(&first);
     assert!(
-        first_stdout.contains("rust:test-run:app:app"),
+        first_stdout.contains("rust:test-run:app:lib:app"),
         "expected the test-run action, got: {first_stdout}"
     );
     assert!(first_stdout.contains("1 passed"), "{first_stdout}");
@@ -375,7 +375,7 @@ fn no_cache_actions_bypass_action_cache() {
     );
     let test_run_line = second_stdout
         .lines()
-        .find(|line| line.contains("rust:test-run:app:app"))
+        .find(|line| line.contains("rust:test-run:app:lib:app"))
         .expect("the test-run action line");
     assert!(
         !test_run_line.contains("[cached]"),

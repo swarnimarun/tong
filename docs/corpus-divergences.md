@@ -1,103 +1,59 @@
-# Corpus divergences (known, documented gaps)
+# Corpus compatibility evidence
 
-The required corpus tier gates (`corpus-resolve` / `corpus-build`) compare Tong's
-resolver graph and builds against `cargo metadata --locked --offline` and Cargo
-builds for eleven pinned upstream workspaces. This file records every entry
-that does not yet pass, with the observed divergence and its root cause. The
-list is the honest status as of this commit; entries are moved to `pass` only
-when the underlying Tong behavior is fixed and the gate is green again.
+The required corpus tier compares Tong's resolved graph with
+`cargo metadata --locked --offline` and then runs each entry's declared Tong
+build gate. The corpus is pinned in `tests/corpus.toml`; the runner writes the
+machine-readable evidence to `$TONG_CORPUS_DIR/report.json`.
 
-Each entry's `divergence` field in `tests/corpus.toml` names the failing stage
-and a one-line reason; the runner's `report.json` records the observed result.
+This document is a snapshot, not a second source of truth. Regenerate it only
+from a fresh `corpus-resolve` and `corpus-build` run. A row is `pass` only when
+the generated report says so.
 
 ## Required tier
 
-| Entry | Stage | Divergence |
-|---|---|---|
-| anyhow | resolve | pass |
-| hyper | resolve | pass |
-| serde | resolve | pass |
-| axum | resolve | `cookie`'s implicit `aes-gcm` feature cannot resolve |
-| clap | resolve | feature sets of inactive (lock-only) packages miss cargo's default-feature expansion |
-| reqwest | resolve | `hyper-util` references the target-table dep `system-configuration`, absent from the host model |
-| ripgrep | resolve | feature sets of inactive packages miss cargo's default-feature expansion (`cc`, `shlex`) |
-| syn | resolve | duplicate action id `rust:lib:syn@3.0.3:rlib`: the member and a same-name same-version registry `syn` collide |
-| tokio | resolve | feature resolution references unknown package `tokio` (workspace self-referencing dev edges) |
-| tracing | resolve | manifest parse error: `[profile] strip = true` (Cargo accepts a boolean) |
-| wgpu | resolve | `env_logger 0.11.9 is not a registry package`: the pinned git `env_logger` collides with a registry version |
+Fresh evidence from 2026-08-12 01:12:34 IST on `macos-aarch64`:
 
-## Detail and root cause
+| Entry | Resolver | Resolver time | Offline build | Build time |
+|---|---:|---:|---:|---:|
+| anyhow | pass | 1.160 s | pass | 25.956 s |
+| axum | pass | 24.302 s | pass | 575.945 s |
+| clap | pass | 6.504 s | pass | 62.914 s |
+| hyper | pass | 2.866 s | pass | 15.469 s |
+| reqwest | pass | 9.467 s | pass | 12.755 s |
+| ripgrep | pass | 2.517 s | pass | 27.442 s |
+| serde | pass | 1.038 s | pass | 1.723 s |
+| syn | pass | 8.912 s | pass | 3.145 s |
+| tokio | pass | 7.553 s | pass | 20.236 s |
+| tracing | pass | 10.053 s | pass | 234.333 s |
+| wgpu | pass | 28.380 s | pass | 90.452 s |
 
-### axum — `cookie`'s implicit `aes-gcm` feature
+Required result: **11/11 resolver rows and 11/11 offline build rows pass** on
+the recorded platform.
 
-`cookie`'s `private` feature references the optional dependency `aes-gcm`
-(`private = ["aes-gcm", …]`, legacy plain-reference form). `cookie` is an
-optional dep of `axum-extra`; when activated, `axum-extra`'s
-`cookie-private = ["dep:cookie", "cookie/aes-gcm", …]` requests `aes-gcm` on
-the `cookie` edge. The feature resolver requires the `aes-gcm` dependency edge
-to exist in the model, but the lock only records it when the optional dep is
-feature-activated during lock resolution; the chain of implicit activations
-across two crates is not fully closed. Cargo resolves this because its
-feature graph is resolved over the full manifest closure.
+Several upstream workspaces cannot use a literal `--all-targets
+--all-features` stable-toolchain gate. The pinned gate instead exercises the
+broadest stable workflow that the upstream project supports:
 
-### clap, ripgrep — default features of inactive packages
+- ripgrep excludes benchmark targets because its benches require nightly;
+- syn checks its library with `full`, `visit`, `visit-mut`, `fold`, and
+  `extra-traits`, because its full target set requires rustc-private crates;
+- tokio uses the full default-feature workspace because some optional targets
+  additionally require the upstream-only `tokio_unstable` cfg.
 
-`cargo metadata` lists every resolved package's node features with its default
-feature expanded (`linux-raw-sys`'s `auxvec`/`elf`/`errno`, `cc`'s `parallel`,
-`shlex`'s `default`). Tong's feature map leaves inactive (lock-only) packages
-with an empty feature set, so the differential view under-reports. Aligning
-this would require applying default features to every locked package in the
-view, which risks altering build activation; the comparison normalizer should
-be taught the distinction instead.
-
-### reqwest — target-table dependencies absent from the host model
-
-`hyper-util` references `system-configuration` (a `[target.'cfg(macos)'.dependencies]`
-entry) in its features. Tong merges target tables host-only, so non-matching
-target deps are dropped from the model and their feature references cannot
-resolve — cargo keeps all-target deps in its resolve graph for lockfile
-completeness (the documented `targets` fixture divergence, now blocking the
-required tier).
-
-### syn — duplicate action ids for same-name same-version packages
-
-The `syn` workspace contains the member `syn@3.0.3` and — legitimately, per
-cargo's own lock — a registry `syn@3.0.3` (a member's dev-dep on the crates.io
-release). The backend's action labels (`rust:lib:syn@3.0.3:rlib`) do not
-disambiguate the source, so two packages plan one action id and the scheduler
-reports a duplicate. The label must include the source identity.
-
-### tokio — unknown package in feature resolution
-
-The tokio workspace's own members reference `tokio` in dev/feature edges;
-during feature resolution the edge resolves to a package identity the model
-does not contain (a same-name member/registry collision like syn's). The
-resolver must map the edge to the member before the map lookup.
-
-### tracing — `strip = true` profile parse
-
-`inferno`'s manifest declares `[profile.release] strip = true`; Cargo accepts
-booleans for `strip`, Tong's profile parser expects the string forms
-`none`/`debuginfo`/`symbols` only. The parser needs the boolean arm.
-
-### wgpu — git `env_logger` collides with a registry version
-
-`wgpu` pins `env_logger = { version = "0.11", git = …, rev = "d550741" }`. The
-lock records the git source, but the import resolves the edge to the registry
-`env_logger 0.11.9` package (`is not a registry package`), so the git checkout
-never materializes. The `[patch]`/git-vs-registry name collision needs the same
-source-aware disambiguation as the syn case.
+These are corpus-definition constraints, not Tong divergences. Each command is
+recorded in `tests/corpus.toml` or constructed by the corpus runner.
 
 ## Extended tier
 
-Extended entries (`rustls`, `sqlx`, `bevy`, `cargo`, `rust-analyzer`) record
-observed evidence only; they are fetched and reported but never gate.
+Extended entries (`rustls`, `sqlx`, `bevy`, `cargo`, and `rust-analyzer`) are
+evidence-only for 0.2. They remain non-gating until their platform-specific
+requirements, runtime, and expected feature surface are pinned. They become
+the required tier for the 0.3 milestone.
 
-## Status
+## Interpretation
 
-As of this commit, 3 of 11 required resolve rows pass (anyhow, hyper, serde)
-and the build gate has not yet been run to completion for the remaining
-entries. Each divergence above is a distinct, reproducible cargo-parity gap;
-none is a formatting or tooling issue. Fixes land in the owning crate
-(`tong-rust` model/import/features, `tong-fetch` resolver, `tong-graph`
-scheduler) with a synthetic regression before the entry is marked `pass`.
+This result certifies the pinned required revisions on one platform. It does
+not certify every Cargo manifest, every target triple, resolver 3, or the
+extended tier. CI must reproduce resolver parity on all supported hosts and
+offline builds on the applicable hosts before this evidence can be used as a
+0.2 release gate.

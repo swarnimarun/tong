@@ -17,7 +17,10 @@ pub use backend::{FinalArtifact, RustBackend};
 pub use cargo_import::{
     CargoImportError, LockedSource, LockedSourceProvider, cargo_patch_names, import_cargo_workspace,
 };
-pub use features::{FeatureError, FeatureMap, FeatureRequest, resolve_features};
+pub use features::{
+    FeatureError, FeatureMap, FeatureRequest, resolve_all_platform_features, resolve_features,
+    resolve_features_for_target,
+};
 pub use model::{
     BinTarget, CcImport, CrateType, Dep, Edition, GitSelector, LibTarget, Lto, Package, PackageId,
     PackageMetadata, PanicStrategy, ProfileSpec, RegistryEdge, ResolverVersion, RustModel,

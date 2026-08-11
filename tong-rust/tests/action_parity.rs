@@ -55,11 +55,11 @@ fn fixture() -> tempfile::TempDir {
             ),
             (
                 "crates/native-lib/build.rs",
-                "fn main() {\n    assert_eq!(std::env::var(\"CARGO_MANIFEST_LINKS\").unwrap(), \"native_lib\");\n    assert!(std::env::var(\"CARGO_MANIFEST_PATH\").unwrap().ends_with(\"Cargo.toml\"));\n    assert_eq!(std::env::var(\"TARGET\").unwrap(), std::env::var(\"HOST\").unwrap());\n    println!(\"cargo:MYKEY=from_native_lib\");\n}\n",
+                "fn main() {\n    assert_eq!(std::env::var(\"CARGO_MANIFEST_LINKS\").unwrap(), \"native_lib\");\n    assert!(std::env::var(\"CARGO_MANIFEST_PATH\").unwrap().ends_with(\"Cargo.toml\"));\n    assert_eq!(std::env::var(\"TARGET\").unwrap(), std::env::var(\"HOST\").unwrap());\n    assert_eq!(std::env::var(\"CARGO_CFG_TARGET_ENDIAN\").unwrap(), \"little\");\n    let generated = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").unwrap()).join(\"generated.rs\");\n    std::fs::write(&generated, \"pub const GENERATED: u32 = 7;\\n\").unwrap();\n    println!(\"cargo:rustc-env=NATIVE_GENERATED={}\", generated.display());\n    println!(\"cargo:MYKEY=from_native_lib\");\n}\n",
             ),
             (
                 "crates/native-lib/src/lib.rs",
-                "pub fn value() -> u32 { 7 }\n",
+                "include!(env!(\"NATIVE_GENERATED\"));\npub fn value() -> u32 { GENERATED }\n",
             ),
             (
                 "crates/app/Cargo.toml",
@@ -75,11 +75,18 @@ fn fixture() -> tempfile::TempDir {
                 "crates/app/src/main.rs",
                 "fn main() {\n    assert_eq!(env!(\"CARGO_PKG_AUTHORS\"), \"Ada:Grace\");\n    assert_eq!(env!(\"CARGO_PKG_DESCRIPTION\"), \"environment fixture\");\n    assert_eq!(env!(\"CARGO_PKG_VERSION_PRE\"), \"beta.1\");\n    assert_eq!(env!(\"CARGO_PKG_RUST_VERSION\"), \"1.85\");\n    assert!(env!(\"CARGO_PKG_LICENSE_FILE\").ends_with(\"LICENSE\"));\n    println!(\"dep={} ver={} pkg={}\", env!(\"DEP_VALUE\"), env!(\"MY_VERSION\"), env!(\"CARGO_PKG_NAME\"));\n}\n",
             ),
+            ("crates/app/src/lib.rs", "pub fn value() -> u32 { 11 }\n"),
             ("crates/app/LICENSE", "MIT\n"),
             ("crates/app/README.md", "# App\n"),
             (
                 "crates/app/tests/bin_env.rs",
                 "#[test]\nfn cargo_binary_is_available() {\n    assert!(std::path::Path::new(env!(\"CARGO_BIN_EXE_app\")).is_file());\n}\n",
+            ),
+            // Cargo allows an integration test to share the lib target's
+            // name; their build-unit identities must remain distinct.
+            (
+                "crates/app/tests/app.rs",
+                "#[test]\nfn integration_test_named_like_lib() { assert_eq!(app::value(), 11); }\n",
             ),
             // A benchmark target.
             ("crates/app/benches/bench.rs", "fn main() {}\n"),
@@ -90,6 +97,38 @@ fn fixture() -> tempfile::TempDir {
     );
     // The [[bin]] with an explicit path + a [[bench]] via auto-discovery.
     let _ = root;
+    dir
+}
+
+fn proc_macro_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_tree(
+        dir.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"helper\", \"dev-helper\", \"macros\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "helper/Cargo.toml",
+                "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("helper/src/lib.rs", "pub fn value() -> u32 { 7 }\n"),
+            (
+                "dev-helper/Cargo.toml",
+                "[package]\nname = \"dev-helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("dev-helper/src/lib.rs", "pub fn value() -> u32 { 9 }\n"),
+            (
+                "macros/Cargo.toml",
+                "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n\n[dependencies]\nhelper = { path = \"../helper\" }\n\n[dev-dependencies]\ndev-helper = { path = \"../dev-helper\" }\n",
+            ),
+            (
+                "macros/src/lib.rs",
+                "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro]\npub fn seven(_: TokenStream) -> TokenStream { helper::value().to_string().parse().unwrap() }\n#[cfg(test)]\nmod tests { #[test] fn helpers_are_linkable() { assert_eq!(helper::value() + dev_helper::value(), 16); } }\n",
+            ),
+        ],
+    );
     dir
 }
 
@@ -228,6 +267,10 @@ fn action_parity_target_kinds() {
         ids.iter().any(|id| id.starts_with("rust:test-compile:")),
         "{ids:?}"
     );
+    assert!(ids.contains(&"rust:test-compile:app:lib:app"), "{ids:?}");
+    assert!(ids.contains(&"rust:test-compile:app:test:app"), "{ids:?}");
+    assert!(ids.contains(&"rust:bs-run:native-lib"), "{ids:?}");
+    assert!(ids.contains(&"rust:bs-run:native-lib:host"), "{ids:?}");
 
     // The env!-reading binary: run it through its recorded output tree.
     let app = model.packages.iter().find(|p| p.name == "app").unwrap();
@@ -266,6 +309,20 @@ fn action_parity_check_emits_metadata() {
     // Check builds still plan every target kind.
     assert!(
         digests.keys().any(|id| id.starts_with("rust:bin:app:app")),
+        "{digests:?}"
+    );
+}
+
+#[test]
+fn proc_macro_check_tests_use_linkable_host_dependencies() {
+    let work = proc_macro_fixture();
+    let store = tempfile::tempdir().unwrap();
+    let (_, digests, _) = build_workspace(work.path(), store.path(), true);
+
+    assert!(
+        digests
+            .keys()
+            .any(|id| id == "rust:test-compile:macros:lib:macros"),
         "{digests:?}"
     );
 }
@@ -333,6 +390,7 @@ fn action_parity_host_and_target_units_separate() {
             .put_tree(&tong_core::tree::Tree::default())
             .expect("placeholder"),
     };
+    let host = host_triple();
     for action in &planned {
         let spec = (action.make)(&stub, &cas).unwrap();
         let args: Vec<&str> = spec.arguments.iter().map(|a| a.0.as_str()).collect();
@@ -343,11 +401,15 @@ fn action_parity_host_and_target_units_separate() {
             );
             assert_eq!(
                 spec.environment.get("TARGET").map(String::as_str),
-                Some("wasm32-unknown-unknown")
+                if action.logical_id.0.ends_with(":host") {
+                    Some(host.as_str())
+                } else {
+                    Some("wasm32-unknown-unknown")
+                }
             );
             assert_eq!(
                 spec.environment.get("HOST").map(String::as_str),
-                Some(host_triple().as_str())
+                Some(host.as_str())
             );
         }
         if action.logical_id.0.starts_with("rust:bs-compile:") {

@@ -159,10 +159,15 @@ fn load_config() -> CorpusConfig {
     toml::from_str(&text).expect("tests/corpus.toml is valid TOML")
 }
 
-fn selected_entries(config: &CorpusConfig, tier: &str) -> Vec<(String, CorpusEntry)> {
+fn selected_entries(
+    config: &CorpusConfig,
+    tier: &str,
+    only: Option<&str>,
+) -> Vec<(String, CorpusEntry)> {
     config
         .entries
         .iter()
+        .filter(|(name, _)| only.is_none_or(|only| name.as_str() == only))
         .filter(|(_, entry)| match tier {
             "required" => entry.tier == Tier::Required,
             "extended" => entry.tier == Tier::Extended,
@@ -253,6 +258,136 @@ fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn refresh_tong_lock(dirs: &EntryDirs, env: &[(String, String)]) -> Result<(), String> {
+    let output = run_in(
+        &dirs.src,
+        &tong_bin(),
+        &["lock".to_owned(), "--offline".to_owned()],
+        env,
+    );
+    if output.status.success() {
+        Ok(())
+    } else if dirs.src.join("Tong.lock").is_file() {
+        eprintln!(
+            "  lock refresh unavailable; using existing Tong.lock: {}",
+            stderr_of(&output).trim()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "tong lock --offline failed: {}",
+            stderr_of(&output)
+        ))
+    }
+}
+
+/// Imports Cargo's explicitly configured git checkout cache into Tong's
+/// CAS before the corpus lock step. This is required when an upstream
+/// commit is pinned in Cargo.lock but is no longer advertised by the
+/// remote; the corpus still has the exact source fetched by Cargo.
+fn import_cargo_git_checkouts(dirs: &EntryDirs) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct CargoLock {
+        #[serde(default)]
+        package: Vec<CargoLockPackage>,
+    }
+    #[derive(Deserialize)]
+    struct CargoLockPackage {
+        name: String,
+        version: semver::Version,
+        source: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct CargoManifest {
+        package: Option<CargoManifestPackage>,
+    }
+    #[derive(Deserialize)]
+    struct CargoManifestPackage {
+        name: String,
+        version: String,
+    }
+
+    let cargo_lock: CargoLock = toml::from_str(
+        &fs::read_to_string(dirs.src.join("Cargo.lock")).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    let git_packages: BTreeMap<(String, semver::Version), String> = cargo_lock
+        .package
+        .into_iter()
+        .filter_map(|package| {
+            package
+                .source
+                .filter(|source| source.starts_with("git+"))
+                .map(|source| ((package.name, package.version), source))
+        })
+        .collect();
+    if git_packages.is_empty() {
+        return Ok(());
+    }
+
+    let cas = Cas::open(&dirs.store).map_err(|err| err.to_string())?;
+    let mut lock = tong_fetch::TongLock::load(&dirs.src).unwrap_or_default();
+    let checkouts = dirs.cargo_home.join("git/checkouts");
+    let repositories = fs::read_dir(&checkouts).map_err(|err| err.to_string())?;
+    for repository in repositories.flatten() {
+        let revisions = match fs::read_dir(repository.path()) {
+            Ok(revisions) => revisions,
+            Err(_) => continue,
+        };
+        for revision in revisions.flatten() {
+            let checkout = revision.path();
+            let manifest_path = checkout.join("Cargo.toml");
+            let Ok(text) = fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = toml::from_str::<CargoManifest>(&text) else {
+                continue;
+            };
+            let Some(package) = manifest.package else {
+                continue;
+            };
+            let Ok(version) = semver::Version::parse(&package.version) else {
+                continue;
+            };
+            let Some(cargo_source) = git_packages.get(&(package.name.clone(), version.clone()))
+            else {
+                continue;
+            };
+            let Some((location, commit)) = cargo_source
+                .strip_prefix("git+")
+                .and_then(|source| source.rsplit_once('#'))
+            else {
+                continue;
+            };
+            let url = location
+                .split('?')
+                .next()
+                .unwrap_or(location)
+                .trim_end_matches(".git");
+            let source = format!("git+{url}#{commit}");
+            let tree = cas
+                .capture_dir_filtered(&checkout, &[".git", "target"].into_iter().collect())
+                .map_err(|err| err.to_string())?;
+            let manifest_checksum = tong_core::digest::Hasher::digest(text.as_bytes()).to_hex();
+            lock.packages.retain(|locked| {
+                !(locked.name == package.name && locked.source.starts_with(&format!("git+{url}#")))
+            });
+            lock.packages.push(tong_fetch::LockedPackage {
+                name: package.name,
+                version,
+                source,
+                checksum: None,
+                manifest_checksum: Some(manifest_checksum),
+                tree_digest: Some(tree.digest().to_hex()),
+                yanked: false,
+                publish_time: None,
+                dependencies: Vec::new(),
+            });
+        }
+    }
+    lock.save(&dirs.src).map_err(|err| err.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
@@ -309,13 +444,33 @@ fn save_report(report: &Report) {
     fs::write(path, json).unwrap();
 }
 
+fn refresh_report_metadata(report: &mut Report, config: &CorpusConfig) {
+    report.schema = 1;
+    report.generated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    report.platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    for (name, entry) in &config.entries {
+        let row = report.entries.entry(name.clone()).or_default();
+        row.tier = match entry.tier {
+            Tier::Required => "required",
+            Tier::Extended => "extended",
+        }
+        .to_owned();
+        row.rev = entry.rev.clone();
+        row.divergence = (!entry.divergence.is_empty()).then(|| entry.divergence.clone());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // fetch: clone, verify, populate homes (the only networked phase)
 // ---------------------------------------------------------------------------
 
-fn cmd_fetch(tier: &str) {
+fn cmd_fetch(tier: &str, only: Option<&str>) {
     let config = load_config();
-    for (name, entry) in selected_entries(&config, tier) {
+    for (name, entry) in selected_entries(&config, tier, only) {
         println!("fetching {name} @ {}", entry.rev);
         if let Some(reason) = entry.skip_on_host() {
             println!("  skip: {reason}");
@@ -373,6 +528,11 @@ fn cmd_fetch(tier: &str) {
                 stderr_of(&gen_lock)
             );
         }
+        // Import an already-present pinned git checkout before Cargo's
+        // network/cache refresh too; this keeps the Tong path usable when
+        // the remote no longer advertises the locked commit.
+        import_cargo_git_checkouts(&dirs)
+            .unwrap_or_else(|err| panic!("{name}: cannot import Cargo git cache: {err}"));
         let fetch = run_in(
             &dirs.src,
             Path::new("cargo"),
@@ -419,6 +579,16 @@ fn normalize_source(source: &str) -> String {
     }
     if source.starts_with("path+") {
         return "path".to_owned();
+    }
+    if let Some(git) = source.strip_prefix("git+") {
+        let (location, commit) = git.split_once('#').unwrap_or((git, ""));
+        // Cargo includes the requested branch/tag/rev in metadata ids,
+        // while Tong's locked identity is the canonical repository plus
+        // resolved commit. Once locked, selectors and a trailing `.git`
+        // do not change package identity.
+        let repository = location.split_once('?').map_or(location, |(url, _)| url);
+        let repository = repository.strip_suffix(".git").unwrap_or(repository);
+        return format!("git+{repository}#{commit}");
     }
     // crates.io has two index endpoints (the github index cargo prints and
     // the sparse index Tong uses); they are one registry.
@@ -605,11 +775,12 @@ fn compare_views(tong: &View, cargo: &View) -> Option<String> {
     }
 }
 
-fn cmd_resolve(tier: &str) {
+fn cmd_resolve(tier: &str, only: Option<&str>) {
     let config = load_config();
     let mut report = load_report();
+    refresh_report_metadata(&mut report, &config);
     let mut required_failures = 0u32;
-    for (name, entry) in selected_entries(&config, tier) {
+    for (name, entry) in selected_entries(&config, tier, only) {
         println!("resolving {name}");
         if let Some(reason) = entry.skip_on_host() {
             report.entries.entry(name.clone()).or_default().skip = Some(reason);
@@ -626,6 +797,17 @@ fn cmd_resolve(tier: &str) {
         );
         let env = subprocess_env(&config, &dirs, true);
         let started = std::time::Instant::now();
+        if let Err(detail) = refresh_tong_lock(&dirs, &env) {
+            report.entries.entry(name.clone()).or_default().resolver = Some(GateResult {
+                status: "fail".into(),
+                detail,
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+            if entry.tier == Tier::Required {
+                required_failures += 1;
+            }
+            continue;
+        }
         // Cargo oracle (offline; the fetch phase populated the index).
         let mut cargo_args: Vec<String> = entry.cargo.clone();
         if !cargo_args.iter().any(|a| a == "--offline") {
@@ -649,7 +831,7 @@ fn cmd_resolve(tier: &str) {
         let tong_out = run_in(
             &dirs.src,
             &tong_bin(),
-            &["graph", "--format", "json"].map(String::from),
+            &["graph", "--format", "json", "--workspace", "--offline"].map(String::from),
             &env,
         );
         if !tong_out.status.success() {
@@ -699,11 +881,12 @@ fn cmd_resolve(tier: &str) {
 // build: execute the configured Tong command offline
 // ---------------------------------------------------------------------------
 
-fn cmd_build(tier: &str) {
+fn cmd_build(tier: &str, only: Option<&str>) {
     let config = load_config();
     let mut report = load_report();
+    refresh_report_metadata(&mut report, &config);
     let mut required_failures = 0u32;
-    for (name, entry) in selected_entries(&config, tier) {
+    for (name, entry) in selected_entries(&config, tier, only) {
         println!("building {name}");
         if let Some(reason) = entry.skip_on_host() {
             report.entries.entry(name.clone()).or_default().skip = Some(reason);
@@ -716,6 +899,17 @@ fn cmd_build(tier: &str) {
         );
         let env = subprocess_env(&config, &dirs, true);
         let started = std::time::Instant::now();
+        if let Err(detail) = refresh_tong_lock(&dirs, &env) {
+            report.entries.entry(name.clone()).or_default().build = Some(GateResult {
+                status: "fail".into(),
+                detail,
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+            if entry.tier == Tier::Required {
+                required_failures += 1;
+            }
+            continue;
+        }
         let mut args = build_command(&entry);
         if !args.iter().any(|a| a == "--offline") {
             args.push("--offline".into());
@@ -759,17 +953,14 @@ fn cmd_build(tier: &str) {
 }
 
 /// The Tong argv for the entry's gate: the `tokio` gate replaces the
-/// configured command with the full-workspace no-run test; the `wgpu`
-/// gate with the five-package all-features check.
+/// configured command with the full-workspace no-run test. Tokio's
+/// unstable all-features combination requires an explicit
+/// `--cfg tokio_unstable`, so it is not a valid stable Cargo baseline.
+/// The `wgpu` gate uses the five-package all-features check.
 fn build_command(entry: &CorpusEntry) -> Vec<String> {
     match entry.gate {
         Gate::Default => entry.tong.clone(),
-        Gate::Tokio => vec![
-            "test".into(),
-            "--workspace".into(),
-            "--all-features".into(),
-            "--no-run".into(),
-        ],
+        Gate::Tokio => vec!["test".into(), "--workspace".into(), "--no-run".into()],
         Gate::Wgpu => vec![
             "check".into(),
             "-p".into(),
@@ -812,16 +1003,22 @@ enum Command_ {
     Fetch {
         #[arg(long, default_value = "required")]
         tier: String,
+        #[arg(long)]
+        entry: Option<String>,
     },
     /// Differential resolver equality: cargo metadata vs tong graph.
     Resolve {
         #[arg(long, default_value = "required")]
         tier: String,
+        #[arg(long)]
+        entry: Option<String>,
     },
     /// Execute each entry's Tong gate command offline.
     Build {
         #[arg(long, default_value = "required")]
         tier: String,
+        #[arg(long)]
+        entry: Option<String>,
     },
     /// Print the accumulated report.
     Report,
@@ -830,9 +1027,9 @@ enum Command_ {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command_::Fetch { tier } => cmd_fetch(&tier),
-        Command_::Resolve { tier } => cmd_resolve(&tier),
-        Command_::Build { tier } => cmd_build(&tier),
+        Command_::Fetch { tier, entry } => cmd_fetch(&tier, entry.as_deref()),
+        Command_::Resolve { tier, entry } => cmd_resolve(&tier, entry.as_deref()),
+        Command_::Build { tier, entry } => cmd_build(&tier, entry.as_deref()),
         Command_::Report => cmd_report(),
     }
 }
@@ -850,7 +1047,7 @@ mod tests {
             "registry+https://index.crates.io"
         );
         assert_eq!(
-            normalize_source("git+https://github.com/tokio-rs/tokio#abc123"),
+            normalize_source("git+https://github.com/tokio-rs/tokio.git?rev=abc#abc123"),
             "git+https://github.com/tokio-rs/tokio#abc123"
         );
     }
@@ -867,6 +1064,36 @@ mod tests {
         assert!(entry.divergence.is_none());
         assert!(entry.skip.is_none());
         assert!(entry.build.is_none());
+    }
+
+    #[test]
+    fn report_metadata_tracks_config() {
+        let config = CorpusConfig {
+            rust_toolchain: default_toolchain(),
+            entries: BTreeMap::from([(
+                "fixture".to_owned(),
+                CorpusEntry {
+                    url: "https://example.invalid/repo".to_owned(),
+                    rev: "abc123".to_owned(),
+                    tier: Tier::Required,
+                    cargo: default_cargo(),
+                    tong: default_tong(),
+                    gate: Gate::Default,
+                    tools: Vec::new(),
+                    platforms: all_platforms(),
+                    skip_reason: String::new(),
+                    divergence: String::new(),
+                },
+            )]),
+        };
+        let mut report = Report::default();
+        refresh_report_metadata(&mut report, &config);
+        assert_eq!(report.schema, 1);
+        assert!(!report.generated.is_empty());
+        assert!(!report.platform.is_empty());
+        assert_eq!(report.entries["fixture"].tier, "required");
+        assert_eq!(report.entries["fixture"].rev, "abc123");
+        assert!(report.entries["fixture"].divergence.is_none());
     }
 
     #[test]

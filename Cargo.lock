@@ -2823,6 +2823,7 @@ name = "tong-corpus-runner"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

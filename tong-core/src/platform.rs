@@ -67,6 +67,9 @@ pub struct TargetFacts {
     pub vendor: String,
     /// `target_pointer_width` value (`64` or `32`).
     pub pointer_width: String,
+    /// `target_endian` value (`little` for every currently supported
+    /// target).
+    pub endian: String,
 }
 
 /// Parses a rustc-style target triple into [`TargetFacts`]. Supported
@@ -121,6 +124,7 @@ pub fn parse_triple(triple: &str) -> Result<TargetFacts, CfgError> {
         env,
         vendor,
         pointer_width,
+        endian: "little".to_owned(),
     })
 }
 
@@ -334,6 +338,7 @@ fn eval_predicate(name: &str, value: Option<&str>, facts: &TargetFacts) -> Resul
             "target_env" => Some(&facts.env),
             "target_vendor" => Some(&facts.vendor),
             "target_pointer_width" => Some(&facts.pointer_width),
+            "target_endian" => Some(&facts.endian),
             "target_family" | "unix" | "windows" => Some(&facts.family),
             "feature" => {
                 return Err(CfgError::Unsupported(format!(
@@ -385,6 +390,7 @@ mod tests {
         assert_eq!(facts.family, "unix");
         assert_eq!(facts.vendor, "apple");
         assert_eq!(facts.env, "");
+        assert_eq!(facts.endian, "little");
         let facts = parse_triple("x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(facts.os, "linux");
         assert_eq!(facts.env, "gnu");
@@ -403,6 +409,7 @@ mod tests {
         assert!(eval_cfg("target_os = \"macos\"", "aarch64-apple-darwin").unwrap());
         assert!(!eval_cfg("target_os = \"windows\"", "aarch64-apple-darwin").unwrap());
         assert!(eval_cfg("target_arch = \"aarch64\"", "aarch64-apple-darwin").unwrap());
+        assert!(eval_cfg("target_endian = \"little\"", "aarch64-apple-darwin").unwrap());
         assert!(eval_cfg("target_env = \"gnu\"", "x86_64-unknown-linux-gnu").unwrap());
         assert!(eval_cfg("target_vendor = \"apple\"", "aarch64-apple-darwin").unwrap());
     }

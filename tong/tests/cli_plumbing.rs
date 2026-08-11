@@ -209,8 +209,8 @@ fn cargo_workflow_commands_cargo_workspace() {
     for (selector, name, action) in [
         ("--bin", "app", "rust:bin:app:app"),
         ("--example", "demo", "rust:example:app:demo"),
-        ("--test", "smoke", "rust:test-compile:app:smoke"),
-        ("--bench", "simple", "rust:test-compile:app:simple"),
+        ("--test", "smoke", "rust:test-compile:app:test:smoke"),
+        ("--bench", "simple", "rust:test-compile:app:bench:simple"),
     ] {
         let output = run_tong(ws, &["check", selector, name]);
         assert_success(&output, &format!("check {selector} {name}"));

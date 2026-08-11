@@ -4,8 +4,8 @@
 //! `Tong.toml` targets produce; Cargo is never invoked during a Tong build.
 //! Path and workspace dependencies import directly; registry dependencies
 //! resolve through `Tong.lock` + the source store (the driver's
-//! [`LockedSourceProvider`]). Git dependencies are not yet supported and
-//! fail with a targeted diagnostic.
+//! [`LockedSourceProvider`]). Locked git dependencies use the same provider
+//! boundary and retain their exact repository plus commit identity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -77,6 +77,28 @@ struct CargoManifest {
     /// (top-level table; workspace-root only).
     #[serde(default)]
     patch: BTreeMap<String, BTreeMap<String, DepValue>>,
+    #[serde(default)]
+    lints: CargoLints,
+}
+
+#[derive(Deserialize, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+struct CargoLints {
+    #[serde(default)]
+    workspace: bool,
+    #[serde(default)]
+    rust: BTreeMap<String, CargoLint>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum CargoLint {
+    Level(String),
+    Detailed {
+        level: String,
+        #[serde(default, rename = "check-cfg")]
+        check_cfg: Vec<String>,
+    },
 }
 
 /// One `[target.<key>]` table: dependencies scoped to a `cfg(...)`
@@ -194,6 +216,8 @@ struct CargoWorkspace {
     /// Cargo resolver version: `"1"`, `"2"`, or `"3"`.
     #[serde(default)]
     resolver: Option<String>,
+    #[serde(default)]
+    lints: CargoLints,
 }
 
 /// `[workspace.package]` values inherited by member packages.
@@ -237,6 +261,7 @@ enum ReadmeValue {
 struct Inherited {
     deps: BTreeMap<String, DepValue>,
     package: Option<CargoWorkspacePackage>,
+    lints: CargoLints,
 }
 
 /// `name = { version = "...", path = "...", workspace = true, package = "..." }`.
@@ -264,7 +289,7 @@ enum DepValue {
         /// Optional dependency (activated via features).
         optional: Option<bool>,
         /// Disable the dependency's default feature.
-        #[serde(rename = "default-features")]
+        #[serde(rename = "default-features", alias = "default_features")]
         default_features: Option<bool>,
         /// Features requested on the dependency.
         features: Option<Vec<String>>,
@@ -532,6 +557,7 @@ pub fn import_cargo_workspace(
     if let Some(workspace) = &root_manifest.workspace {
         inherited.deps.extend(workspace.dependencies.clone());
         inherited.package = workspace.package.clone();
+        inherited.lints = workspace.lints.clone();
     }
     if let Some(patch) = root_manifest.patch.get("crates-io").or_else(|| {
         root_manifest
@@ -906,6 +932,7 @@ fn import_package(
         Some(workspace) => Inherited {
             deps: workspace.dependencies.clone(),
             package: workspace.package.clone(),
+            lints: workspace.lints.clone(),
         },
         None => inherited.clone(),
     };
@@ -1061,6 +1088,29 @@ fn import_package(
             rustflags: Vec::new(),
             env: BTreeMap::new(),
         };
+        let lints = if manifest.lints.workspace {
+            &inherited.lints
+        } else {
+            &manifest.lints
+        };
+        for (name, lint) in &lints.rust {
+            let (level, check_cfg) = match lint {
+                CargoLint::Level(level) => (level, &[][..]),
+                CargoLint::Detailed {
+                    level, check_cfg, ..
+                } => (level, check_cfg.as_slice()),
+            };
+            if matches!(level.as_str(), "allow" | "warn" | "deny" | "forbid") {
+                pkg.rustflags.push(format!("--{level}"));
+                pkg.rustflags.push(name.clone());
+            }
+            if name == "unexpected_cfgs" {
+                for cfg in check_cfg {
+                    pkg.rustflags.push("--check-cfg".to_owned());
+                    pkg.rustflags.push(cfg.clone());
+                }
+            }
+        }
         // Build script: explicit path, `build = false` opt-out, or Cargo's
         // auto-detection of `build.rs` at the package root.
         pkg.build_script = match &package.build {
@@ -1148,9 +1198,10 @@ fn import_package(
             }
         }
 
-        // Examples: [[example]] entries whose source exists, plus
-        // auto-discovered `examples/*.rs` (Cargo conventions; tong plans
-        // example compiles in test/`--all-targets` builds).
+        // Examples: every explicit [[example]] entry plus auto-discovered
+        // `examples/*.rs`. Cargo metadata preserves explicit targets even
+        // when a registry package omitted their source from its crate
+        // archive; configured builds diagnose a missing selected source.
         let mut example_entries: Vec<(String, PathBuf, Vec<String>, Vec<String>)> = Vec::new();
         for example in &manifest.example {
             let name = example.name.clone().unwrap_or_else(|| {
@@ -1166,15 +1217,13 @@ fn import_package(
                 .path
                 .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("examples/{name}.rs")));
-            if pkg.dir.join(&path).is_file() {
-                example_entries.push((
-                    name,
-                    path,
-                    example.required_features.clone().unwrap_or_default(),
-                    parse_example_crate_types(&example.crate_type)?,
-                ));
-            }
+                .unwrap_or_else(|| default_named_target_path(&pkg.dir, "examples", &name));
+            example_entries.push((
+                name,
+                path,
+                example.required_features.clone().unwrap_or_default(),
+                parse_example_crate_types(&example.crate_type)?,
+            ));
         }
         if package.autoexamples.unwrap_or(true) {
             let mut names: Vec<String> = example_entries
@@ -1182,7 +1231,11 @@ fn import_package(
                 .map(|(name, _, _, _)| name.clone())
                 .collect();
             for (name, path) in discover_named_targets(&pkg.dir, "examples") {
-                if !names.contains(&name) {
+                if !names.contains(&name)
+                    && !example_entries
+                        .iter()
+                        .any(|(_, explicit_path, _, _)| explicit_path == &path)
+                {
                     example_entries.push((name.clone(), path, Vec::new(), Vec::new()));
                     names.push(name);
                 }
@@ -1198,10 +1251,10 @@ fn import_package(
             });
         }
 
-        // Test targets: [[test]] / [[bench]] entries whose source exists
-        // (Cargo drops targets without source files), auto-discovered
-        // `tests/*.rs` / `benches/*.rs`, plus the auto-derived lib unit
-        // test. [[example]] targets are handled above.
+        // Test targets: every explicit [[test]] / [[bench]] entry,
+        // auto-discovered `tests/*.rs` / `benches/*.rs`, plus the
+        // auto-derived lib unit test. Registry archives commonly omit
+        // explicit test sources, but Cargo metadata still reports them.
         for (entry, default_dir, kind, auto) in [
             (
                 &manifest.test,
@@ -1230,12 +1283,7 @@ fn import_package(
                     .path
                     .clone()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(format!("{default_dir}/{name}.rs")));
-                if !pkg.dir.join(&path).is_file() {
-                    // Cargo silently drops test targets whose source is
-                    // missing.
-                    continue;
-                }
+                    .unwrap_or_else(|| default_named_target_path(&pkg.dir, default_dir, &name));
                 pkg.tests.push(TestTarget {
                     name,
                     path,
@@ -1360,7 +1408,13 @@ fn import_package(
                             sources,
                             patches,
                             members,
-                        )?;
+                        )
+                        .map_err(|err| {
+                            CargoImportError::Unsupported(format!(
+                                "while importing path dependency `{}` of `{}`: {err}",
+                                dep.extern_name, pkg.name
+                            ))
+                        })?;
                         if imported.name != dep.package {
                             return Err(CargoImportError::Unsupported(format!(
                                 "path dependency {} = {{ path = {:?} }} resolves to package \
@@ -1418,11 +1472,27 @@ fn import_package(
                             sources,
                             patches,
                             members,
-                        )?
+                        )
+                        .map_err(|err| {
+                            CargoImportError::Unsupported(format!(
+                                "while importing locked dependency `{}` of `{}`: {err}",
+                                dep.extern_name, pkg.name
+                            ))
+                        })?
                     }
                 };
+                let default_extern_name = dep.package.replace('-', "_");
+                let extern_name = if dep.extern_name == default_extern_name {
+                    packages
+                        .values()
+                        .find(|package| package.id == package_id)
+                        .map(lib_crate_name)
+                        .unwrap_or(dep.extern_name)
+                } else {
+                    dep.extern_name
+                };
                 target.push(Dep {
-                    extern_name: dep.extern_name,
+                    extern_name,
                     package: package_id,
                     optional: dep.optional,
                     default_features: dep.default_features,
@@ -1718,6 +1788,33 @@ fn resolve_deps(
                     (
                         path,
                         package,
+                        optional,
+                        default_features,
+                        features,
+                        target.clone(),
+                        locked,
+                    )
+                } else if matches!(parent.id.source, SourceId::Registry(_))
+                    && let Some(version) = version
+                {
+                    // Published crates can retain a development-time
+                    // `path` alongside `version` (notably old crates such
+                    // as kernel32-sys). Cargo ignores that path after
+                    // publication and resolves the registry requirement.
+                    let edge = RegistryEdge {
+                        parent: parent.id.clone(),
+                        extern_name: name.replace('-', "_"),
+                        package: package_name.clone(),
+                        req: version.clone(),
+                        git: None,
+                        optional,
+                        default_features,
+                        features: features.clone(),
+                    };
+                    let locked = sources.locked_package(&edge)?;
+                    (
+                        None,
+                        package_name,
                         optional,
                         default_features,
                         features,
@@ -2274,11 +2371,29 @@ fn discover_named_targets(package_dir: &Path, relative_dir: &str) -> Vec<(String
     discovered
 }
 
+fn default_named_target_path(package_dir: &Path, relative_dir: &str, name: &str) -> PathBuf {
+    let flat = PathBuf::from(format!("{relative_dir}/{name}.rs"));
+    if package_dir.join(&flat).is_file() {
+        flat
+    } else {
+        let nested = PathBuf::from(format!("{relative_dir}/{name}/main.rs"));
+        if package_dir.join(&nested).is_file() {
+            nested
+        } else {
+            // Preserve Cargo's conventional diagnostic path when neither
+            // candidate exists.
+            flat
+        }
+    }
+}
+
 fn parse_example_crate_types(types: &[String]) -> Result<Vec<String>, CargoImportError> {
     types
         .iter()
         .map(|kind| match kind.as_str() {
-            "bin" | "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" => Ok(kind.clone()),
+            "bin" | "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro" => {
+                Ok(kind.clone())
+            }
             other => Err(CargoImportError::Unsupported(format!(
                 "example crate-type {other:?}"
             ))),
@@ -3260,6 +3375,91 @@ path = "tests/configured.rs"
     }
 
     #[test]
+    fn explicit_example_without_path_uses_nested_main() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[[example]]
+name = "demo"
+crate-type = ["rlib"]
+"#,
+            ),
+            ("src/lib.rs", ""),
+            ("examples/demo/main.rs", "fn main() {}"),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        let example = &model.packages.first().unwrap().examples[0];
+        assert_eq!(example.path, PathBuf::from("examples/demo/main.rs"));
+        assert_eq!(example.crate_types, ["rlib"]);
+    }
+
+    #[test]
+    fn imports_inherited_workspace_rust_lints() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[workspace]
+members = ["app"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(custom_platform)'] }
+"#,
+            ),
+            (
+                "app/Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+"#,
+            ),
+            ("app/src/lib.rs", ""),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        let flags = &model.packages.first().unwrap().rustflags;
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair == ["--forbid", "unsafe_code"])
+        );
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair == ["--warn", "unexpected_cfgs"])
+        );
+        assert!(
+            flags
+                .windows(2)
+                .any(|pair| pair == ["--check-cfg", "cfg(custom_platform)"])
+        );
+    }
+
+    #[test]
     fn filters_target_specific_dependencies() {
         let dir = write_tree(&[
             (
@@ -3441,6 +3641,35 @@ win-only = { path = "../win-only", target = "cfg(windows)" }
     }
 
     #[test]
+    fn dependency_uses_library_target_name() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nutf-8 = { path = \"../utf-8\" }\n",
+            ),
+            ("src/lib.rs", ""),
+            (
+                "../utf-8/Cargo.toml",
+                "[package]\nname = \"utf-8\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"utf8\"\n",
+            ),
+            ("../utf-8/src/lib.rs", ""),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        let app = model
+            .packages
+            .iter()
+            .find(|package| package.name == "app")
+            .unwrap();
+        assert_eq!(app.deps[0].extern_name, "utf8");
+    }
+
+    #[test]
     fn unknown_cfg_predicates_evaluate_false() {
         let dir = write_tree(&[
             (
@@ -3505,6 +3734,24 @@ strip = "everything"
         )
         .unwrap_err();
         assert!(err.to_string().contains("strip"), "{err}");
+    }
+
+    #[test]
+    fn accepts_normalized_default_features_key() {
+        #[derive(Deserialize)]
+        struct Manifest {
+            dependency: DepValue,
+        }
+
+        let manifest: Manifest =
+            toml::from_str(r#"dependency = { version = "1", default_features = false }"#).unwrap();
+        let DepValue::Table {
+            default_features, ..
+        } = manifest.dependency
+        else {
+            panic!("expected a dependency table");
+        };
+        assert_eq!(default_features, Some(false));
     }
 
     #[test]

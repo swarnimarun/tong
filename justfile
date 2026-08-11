@@ -36,10 +36,12 @@ corpus-fetch *args:
 
 # Corpus: differential resolver equality vs `cargo metadata --offline`
 corpus-resolve *args:
+    cargo build -p tong
     cargo run -p tong-corpus-runner -- resolve {{ args }}
 
 # Corpus: execute each entry's Tong gate offline
 corpus-build *args:
+    cargo build -p tong
     cargo run -p tong-corpus-runner -- build {{ args }}
 
 # Corpus: print the accumulated report

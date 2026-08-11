@@ -640,13 +640,17 @@ pub fn bench(
     test(root, label, libtest_args, options)
 }
 
-/// Whether a test-run logical id (`rust:test-run:<pkg>:<name>`) matches a
-/// label: the test name, the package name (all its tests), or `pkg:name`.
+/// Whether a test-run id (`rust:test-run:<pkg>:<kind>:<name>`) matches a
+/// label: the target name, package name, or `pkg:name`.
 fn test_run_matches(logical_id: &str, label: &str) -> bool {
     let rest = logical_id
         .strip_prefix("rust:test-run:")
         .unwrap_or(logical_id);
-    let (pkg, name) = rest.split_once(':').unwrap_or((rest, ""));
+    let (pkg_and_kind, name) = rest.rsplit_once(':').unwrap_or((rest, ""));
+    let pkg = pkg_and_kind
+        .rsplit_once(':')
+        .map(|(pkg, _kind)| pkg)
+        .unwrap_or(pkg_and_kind);
     let label = label
         .strip_prefix(':')
         .or_else(|| {
@@ -783,20 +787,6 @@ fn prepare(
 
             let sources = LockfileSource::new(root, &store, cas.clone());
             let model = load_model(root, manifest.as_ref(), &sources)?;
-            if std::env::var_os("TONG_DEBUG_VIEW").is_some() {
-                for pkg in &model.packages {
-                    if pkg.name == "syn" {
-                        eprintln!(
-                            "DEBUG: syn {:?} deps={:?}",
-                            pkg.id.source,
-                            pkg.deps
-                                .iter()
-                                .map(|d| d.extern_name.clone())
-                                .collect::<Vec<_>>()
-                        );
-                    }
-                }
-            }
             tracing::debug!(
                 target: "tong::perf",
                 phase = "prepare.model",
@@ -812,8 +802,16 @@ fn prepare(
                 .iter()
                 .map(|request| request.package.clone())
                 .collect();
-            let feature_map = tong_rust::resolve_features(&model, &requests, include_dev_deps)
-                .map_err(|err| BuildError::Manifest(err.to_string()))?;
+            let host_triple = tong_rust::host_triple()?;
+            let configured_triple = options.target_triple.as_deref().unwrap_or(&host_triple);
+            let feature_map = tong_rust::resolve_features_for_target(
+                &model,
+                &requests,
+                include_dev_deps,
+                configured_triple,
+                &host_triple,
+            )
+            .map_err(|err| BuildError::Manifest(err.to_string()))?;
 
             // Build-start hygiene: prune stale exec roots. Exec content is
             // fully reproducible (everything is in the CAS); failed builds
@@ -1477,7 +1475,7 @@ pub fn graph(root: &Path, format: &str, options: &BuildOptions) -> Result<(), Bu
     let prepared = prepare(root, options, true, &[])?;
     match format {
         "json" => {
-            graph_json(&prepared)?;
+            graph_json(&prepared, options)?;
         }
         "dot" => {
             println!("digraph tong {{");
@@ -1502,29 +1500,51 @@ pub fn graph(root: &Path, format: &str, options: &BuildOptions) -> Result<(), Bu
 /// the planned action graph. The resolver view is the differential corpus
 /// surface compared against `cargo metadata`; the node list mirrors the
 /// old action graph.
-fn graph_json(prepared: &Prepared) -> Result<(), BuildError> {
+fn graph_json(prepared: &Prepared, options: &BuildOptions) -> Result<(), BuildError> {
     let model = &prepared.model;
-    let map = &model.feature_map;
-    if std::env::var_os("TONG_DEBUG_VIEW").is_some() {
+    let requests = feature_requests(model, options, prepared.manifest.as_ref())?;
+    let all_platform_map = tong_rust::resolve_all_platform_features(model, &requests, true)
+        .map_err(|error| BuildError::Manifest(error.to_string()))?;
+    let map = &all_platform_map;
+    // Tong.lock contains Cargo's all-target, all-optional package set;
+    // Cargo metadata's resolve view contains only packages reachable from
+    // configured roots through active edges. Keep those two graphs
+    // separate at this presentation boundary.
+    let mut reachable: BTreeSet<tong_rust::PackageId> = if model.configured_members.is_empty() {
+        model.members.iter().cloned().collect()
+    } else {
+        model.configured_members.iter().cloned().collect()
+    };
+    loop {
+        let before = reachable.len();
         for pkg in &model.packages {
-            if pkg.name == "syn" {
-                eprintln!(
-                    "DEBUG: syn deps={:?}",
-                    pkg.deps
-                        .iter()
-                        .map(|d| d.extern_name.clone())
-                        .collect::<Vec<_>>()
-                );
+            if !reachable.contains(&pkg.id) {
+                continue;
+            }
+            for dep in pkg
+                .deps
+                .iter()
+                .chain(pkg.build_deps.iter())
+                .chain(pkg.dev_deps.iter())
+            {
+                if !dep.optional || map.edge_active(&pkg.id, &dep.extern_name) {
+                    reachable.insert(dep.package.clone());
+                }
             }
         }
+        if reachable.len() == before {
+            break;
+        }
     }
+    let packages: Vec<&tong_rust::Package> = model
+        .packages
+        .iter()
+        .filter(|package| reachable.contains(&package.id))
+        .collect();
+
     println!("{{\"schema\":1,\"packages\":[");
-    for (index, pkg) in model.packages.iter().enumerate() {
-        let comma = if index + 1 < model.packages.len() {
-            ","
-        } else {
-            ""
-        };
+    for (index, pkg) in packages.iter().enumerate() {
+        let comma = if index + 1 < packages.len() { "," } else { "" };
         // Cargo metadata reports the union of features activated by every
         // configured unit even though resolver 2/3 keep host and target
         // feature domains separate for compilation.
@@ -1585,7 +1605,14 @@ fn graph_json(prepared: &Prepared) -> Result<(), BuildError> {
         // Target kinds, mirroring cargo's `targets[].kind`.
         let mut targets: Vec<String> = Vec::new();
         if let Some(lib) = &pkg.lib {
-            let kind = if lib.proc_macro { "proc-macro" } else { "lib" };
+            let kind = if lib.proc_macro {
+                "proc-macro"
+            } else {
+                lib.crate_types
+                    .first()
+                    .map(|crate_type| crate_type.to_rustc())
+                    .unwrap_or("lib")
+            };
             // Cargo's default lib target name is the SANITIZED package
             // name (sharded-slab's lib target is `sharded_slab`).
             let lib_name = lib
@@ -1594,8 +1621,14 @@ fn graph_json(prepared: &Prepared) -> Result<(), BuildError> {
                 .unwrap_or_else(|| tong_rust::model::crate_name(&pkg.name));
             targets.push(format!("{{\"kind\":\"{kind}\",\"name\":\"{lib_name}\"}}"));
         }
-        if pkg.build_script.is_some() {
-            targets.push("{\"kind\":\"custom-build\",\"name\":\"build-script-build\"}".to_owned());
+        if let Some(script) = &pkg.build_script {
+            let stem = script
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("build");
+            targets.push(format!(
+                "{{\"kind\":\"custom-build\",\"name\":\"build-script-{stem}\"}}"
+            ));
         }
         for bin in &pkg.bins {
             targets.push(format!("{{\"kind\":\"bin\",\"name\":\"{}\"}}", bin.name));
@@ -2336,6 +2369,16 @@ impl CollectProvider {
             tree_digest: tong_core::artifact::TreeDigest::new(tree_digest),
         })
     }
+
+    /// A full Cargo.lock commit can expand a short manifest `rev` before
+    /// Tong has captured and fingerprinted the source tree.
+    fn locked_git_commit(&self, name: &str, url: &str) -> Option<String> {
+        let prefix = format!("git+{url}#");
+        self.preferences
+            .as_ref()?
+            .candidates(name)
+            .find_map(|package| package.source.strip_prefix(&prefix).map(str::to_owned))
+    }
 }
 
 impl tong_rust::LockedSourceProvider for CollectProvider {
@@ -2372,6 +2415,7 @@ impl tong_rust::LockedSourceProvider for CollectProvider {
         );
         let prefer_locked = self.drop_preference.as_deref() != Some(edge.package.as_str());
         let locked = self.locked_git(&edge.package, &selector.url);
+        let locked_commit = self.locked_git_commit(&edge.package, &selector.url);
         if self.offline && prefer_locked && locked.is_none() {
             return Err(tong_rust::CargoImportError::Unsupported(format!(
                 "git dependency `{}` from {} is not locked; run `tong lock` online once \
@@ -2390,7 +2434,7 @@ impl tong_rust::LockedSourceProvider for CollectProvider {
             store,
             cas,
             &selector.url,
-            selector.rev.as_deref(),
+            locked_commit.as_deref().or(selector.rev.as_deref()),
             selector.tag.as_deref(),
             selector.branch.as_deref(),
             prefer_locked,
@@ -2451,27 +2495,27 @@ pub fn update(root: &Path, package: Option<&str>) -> Result<(), BuildError> {
     lock_with(root, false, package)
 }
 
-/// Seeds a resolver preference from an existing `Cargo.lock` (no
-/// `Tong.lock` yet): exact registry versions and checksums carry over, so
-/// `tong lock` is stable against a Cargo-generated lock. Registry entries
-/// are matched by name+version; the Cargo source strings are remapped to
-/// the configured index. Path/git entries are not seeded (the workspace
-/// import resolves those).
+/// Seeds resolver preferences and exact dependency edges from Cargo.lock.
+/// Registry sources are remapped to Tong's configured index; existing
+/// Tong path/git entries supply their source and content fingerprints.
 fn seed_from_cargo_lock(
     root: &Path,
     registry_source: &str,
+    existing: &tong_fetch::TongLock,
 ) -> Result<tong_fetch::TongLock, BuildError> {
     #[derive(serde::Deserialize)]
     struct CargoLock {
         #[serde(default)]
         package: Vec<CargoLockPackage>,
     }
-    #[derive(serde::Deserialize)]
+    #[derive(Clone, serde::Deserialize)]
     struct CargoLockPackage {
         name: String,
         version: semver::Version,
         source: Option<String>,
         checksum: Option<String>,
+        #[serde(default)]
+        dependencies: Vec<String>,
     }
     let text = fs::read_to_string(root.join("Cargo.lock"))
         .map_err(|err| BuildError::Manifest(format!("cannot read Cargo.lock: {err}")))?;
@@ -2481,23 +2525,91 @@ fn seed_from_cargo_lock(
         version: tong_fetch::LOCKFILE_VERSION,
         packages: Vec::new(),
     };
-    for package in cargo.package {
+    let cargo_packages = cargo.package;
+    let mapped_source = |package: &CargoLockPackage| {
         if package
             .source
             .as_deref()
             .is_some_and(|source| source.starts_with("registry+"))
         {
+            Some(registry_source.to_owned())
+        } else if let Some(source) = package
+            .source
+            .as_deref()
+            .and_then(|source| source.strip_prefix("git+"))
+            && let Some((location, commit)) = source.rsplit_once('#')
+        {
+            let url = location
+                .split('?')
+                .next()
+                .unwrap_or(location)
+                .trim_end_matches(".git");
+            Some(format!("git+{url}#{commit}"))
+        } else {
+            existing
+                .candidates(&package.name)
+                .find(|candidate| {
+                    candidate.version == package.version
+                        && match package.source.as_deref() {
+                            Some(source) if source.starts_with("git+") => {
+                                candidate.source.starts_with("git+")
+                            }
+                            None => candidate.source.starts_with("path+"),
+                            _ => false,
+                        }
+                })
+                .map(|candidate| candidate.source.clone())
+        }
+    };
+    for package in &cargo_packages {
+        if let Some(source) = mapped_source(package) {
+            let mut dependencies = Vec::new();
+            for dependency in &package.dependencies {
+                let (head, explicit_source) = dependency
+                    .strip_suffix(')')
+                    .and_then(|text| text.rsplit_once(" ("))
+                    .map(|(head, source)| (head, Some(source)))
+                    .unwrap_or((dependency.as_str(), None));
+                let (name, explicit_version) = head
+                    .rsplit_once(' ')
+                    .filter(|(_, version)| semver::Version::parse(version).is_ok())
+                    .map(|(name, version)| (name, Some(version)))
+                    .unwrap_or((head, None));
+                let candidate = cargo_packages.iter().find(|candidate| {
+                    candidate.name == name
+                        && explicit_version
+                            .is_none_or(|version| candidate.version.to_string() == version)
+                        && explicit_source
+                            .is_none_or(|source| candidate.source.as_deref() == Some(source))
+                });
+                if let Some(candidate) = candidate
+                    && let Some(source) = mapped_source(candidate)
+                {
+                    dependencies.push(format!("{} {} {source}", candidate.name, candidate.version));
+                }
+            }
+            let prior = existing.exact(&package.name, &package.version, &source);
+            let registry = source.starts_with("registry+");
             lock.packages.push(tong_fetch::LockedPackage {
-                name: package.name,
-                version: package.version,
-                source: registry_source.to_owned(),
-                checksum: package.checksum,
-                yanked: false,
-                publish_time: None,
-                manifest_checksum: None,
-                tree_digest: None,
-                dependencies: Vec::new(),
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source,
+                checksum: registry.then(|| package.checksum.clone()).flatten(),
+                yanked: prior.is_some_and(|package| package.yanked),
+                publish_time: prior.and_then(|package| package.publish_time.clone()),
+                manifest_checksum: prior.and_then(|package| package.manifest_checksum.clone()),
+                tree_digest: prior.and_then(|package| package.tree_digest.clone()),
+                dependencies,
             });
+        }
+    }
+    for package in &existing.packages {
+        if !package.source.starts_with("registry+")
+            && lock
+                .exact(&package.name, &package.version, &package.source)
+                .is_none()
+        {
+            lock.packages.push(package.clone());
         }
     }
     Ok(lock)
@@ -2518,10 +2630,17 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     // versions/checksums (Cargo semantics: `--locked` forbids creating or
     // updating the lock — enforced by the build driver before any network
     // request). `tong update <package>` drops that package's preference.
-    let mut preferences = tong_fetch::TongLock::load(root).unwrap_or_default();
-    if preferences.packages.is_empty() && root.join("Cargo.lock").is_file() {
+    let existing_preferences = tong_fetch::TongLock::load(root).unwrap_or_default();
+    let mut preferences = existing_preferences.clone();
+    // In Cargo-import mode, an ordinary `tong lock` follows Cargo.lock's
+    // exact registry selection. This makes adopting Tong deterministic and
+    // avoids silently upgrading dependencies merely because Tong.lock was
+    // generated by an older Tong. Keep Tong's git/path pins, since Cargo's
+    // lock format does not contain the source trees Tong needs offline.
+    // `tong update` deliberately keeps Tong.lock as its preference source.
+    if drop_preference.is_none() && root.join("Cargo.lock").is_file() {
         let registry_source = format!("registry+{}", registry.index_url);
-        preferences = seed_from_cargo_lock(root, &registry_source)?;
+        preferences = seed_from_cargo_lock(root, &registry_source, &existing_preferences)?;
     }
     if let Some(package) = drop_preference {
         preferences.packages.retain(|p| p.name != package);
@@ -2548,26 +2667,6 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     let requests = feature_requests(&model, &BuildOptions::default(), manifest.as_ref())?;
     let feature_map = tong_rust::resolve_features(&model, &requests, true)
         .map_err(|err| BuildError::Manifest(err.to_string()))?;
-    if std::env::var_os("TONG_DEBUG_VIEW").is_some() {
-        for pkg in &model.packages {
-            if pkg.name == "syn"
-                && matches!(pkg.id.source, tong_rust::model::SourceId::Workspace(_))
-            {
-                eprintln!(
-                    "DEBUG: lock syn deps={:?} active_optional={:?}",
-                    pkg.deps
-                        .iter()
-                        .map(|d| d.extern_name.clone())
-                        .collect::<Vec<_>>(),
-                    feature_map
-                        .active_optional_deps
-                        .get(&pkg.id)
-                        .cloned()
-                        .unwrap_or_default()
-                );
-            }
-        }
-    }
 
     // The version resolver keys local (workspace/path) packages by name.
     // Two local packages sharing a name would alias there; Cargo can
@@ -2592,8 +2691,8 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     // Workspace/path packages enter the resolution graph as roots; their
     // registry edges resolve against the index, local edges activate the
     // target package at its exact version (cargo semantics). Optional
-    // edges are filtered by the resolved feature map, exactly like the
-    // roots were.
+    // edges are filtered by the resolved feature map; Cargo.lock-seeded
+    // dependency tuples are merged back below for all-target completeness.
     let edge_map: BTreeMap<(tong_rust::PackageId, String, String), &tong_rust::RegistryEdge> =
         edges
             .iter()
@@ -2638,9 +2737,6 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
                 name: dep.extern_name.clone(),
                 package: Some(dep.package.name.clone()),
                 req: None,
-                // The edge is feature-resolved as ACTIVE here; marking it
-                // optional would let the resolver's empty root closure
-                // drop it from the lock.
                 optional: false,
                 dev,
                 features: dep.features.clone(),
@@ -2672,7 +2768,6 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
                 name: edge.extern_name.clone(),
                 package: Some(edge.package.clone()),
                 req: Some(req),
-                // Feature-resolved active; see the model-deps loop.
                 optional: false,
                 dev,
                 features,
@@ -2769,6 +2864,12 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
                 format!("{name} {version} {dep_source}")
             })
             .collect();
+        // Cargo-import locking starts from Cargo.lock's all-target graph.
+        // Preserve its exact inactive optional edges while the resolver's
+        // configured feature closure supplies the active build graph.
+        if let Some(preferred) = preferences.exact(&package.name, &package.version, &source) {
+            deps.extend(preferred.dependencies.iter().cloned());
+        }
         deps.sort();
         deps.dedup();
         locked.packages.push(tong_fetch::LockedPackage {
@@ -2782,6 +2883,17 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             publish_time: None,
             dependencies: deps,
         });
+    }
+    // Packages that are lock-only (for example inactive optional Cargo
+    // dependencies) do not enter the configured resolver activation set,
+    // but their exact identities and edges must remain in Tong.lock.
+    for package in &preferences.packages {
+        if locked
+            .exact(&package.name, &package.version, &package.source)
+            .is_none()
+        {
+            locked.packages.push(package.clone());
+        }
     }
     locked
         .save(root)

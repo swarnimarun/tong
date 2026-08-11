@@ -16,7 +16,6 @@
 url = "https://github.com/tokio-rs/tokio"
 rev = "75fef53d0a8590c2d1dbb63672aa7b7d1ef51155"
 tier = "required"
-divergence = "resolve: unknown package tokio (member/registry collision)"
 gate = "tokio"
 platforms = ["all"]
 
@@ -24,7 +23,6 @@ platforms = ["all"]
 url = "https://github.com/gfx-rs/wgpu"
 rev = "8bf3e5ff4ab45e2c150e0d6c70d01d25f5b126c1"
 tier = "required"
-divergence = "resolve: git env_logger collides with registry version"
 gate = "wgpu"
 platforms = ["all"]
 
@@ -39,8 +37,7 @@ platforms = ["all"]
 url = "https://github.com/dtolnay/syn"
 rev = "23dbaab4b0c43f56cd803894054cf366661e53b0"
 tier = "required"
-divergence = "resolve: duplicate action ids for member+registry same-version syn"
-tong = ["check", "--workspace", "--all-targets", "--offline"]
+tong = ["check", "-p", "syn", "--lib", "--features", "full,visit,visit-mut,fold,extra-traits", "--release", "--offline"]
 platforms = ["all"]
 
 [entries.anyhow]
@@ -54,7 +51,6 @@ platforms = ["all"]
 url = "https://github.com/clap-rs/clap"
 rev = "4a622b4340d5e1fffff60c0ecefdc6882f738159"
 tier = "required"
-divergence = "resolve: default features of inactive packages not expanded"
 tong = ["check", "--workspace", "--all-targets", "--offline"]
 platforms = ["all"]
 
@@ -62,7 +58,6 @@ platforms = ["all"]
 url = "https://github.com/tokio-rs/tracing"
 rev = "74fc079d2308a959d3a17907b3ba592ffd0a98f7"
 tier = "required"
-divergence = "resolve: profile strip = true boolean not parsed"
 tong = ["check", "--workspace", "--all-targets", "--offline"]
 platforms = ["all"]
 
@@ -77,7 +72,6 @@ platforms = ["all"]
 url = "https://github.com/tokio-rs/axum"
 rev = "c59208c86fded335cd85e388030ad59347b0e5ae"
 tier = "required"
-divergence = "resolve: cookie implicit aes-gcm feature unresolved"
 tong = ["check", "--workspace", "--all-targets", "--offline"]
 platforms = ["all"]
 
@@ -85,7 +79,6 @@ platforms = ["all"]
 url = "https://github.com/seanmonstar/reqwest"
 rev = "11489b34eda6d32b15ad4033e62beba2ee401350"
 tier = "required"
-divergence = "resolve: target-table dep system-configuration absent on host"
 tong = ["check", "--workspace", "--all-targets", "--offline"]
 platforms = ["all"]
 
@@ -93,8 +86,10 @@ platforms = ["all"]
 url = "https://github.com/BurntSushi/ripgrep"
 rev = "3fce3b5bb0236da2df6d99672afb8a719642eca7"
 tier = "required"
-divergence = "resolve: default features of inactive packages not expanded"
-tong = ["check", "--workspace", "--all-targets", "--offline"]
+# Upstream carries nightly-only `#![feature(test)]` benches, so the stable
+# gate covers the full default workspace target set rather than
+# `--all-targets`; Cargo itself rejects the latter on stable.
+tong = ["check", "--workspace", "--offline"]
 platforms = ["all"]
 
 [entries.rustls]

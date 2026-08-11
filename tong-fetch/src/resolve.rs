@@ -1098,7 +1098,6 @@ fn activate(
         .deps
         .iter()
         .filter(|dep| !dep.dev || candidate.local)
-        // Only feature-activated optional edges enter the resolved graph.
         .filter(|dep| {
             !dep.optional || closure.enabled.contains(&dep.name) || closure.seen.contains(&dep.name)
         })
@@ -1141,6 +1140,8 @@ fn activate(
     }))
 }
 
+type DependencyQueryKey = (String, Version, Option<String>, String, String);
+
 /// The index query cache: candidates per (parent, dep).
 struct Queryer<'a> {
     crates: &'a dyn CrateSource,
@@ -1149,7 +1150,7 @@ struct Queryer<'a> {
     /// Crate names replaced by `[patch]` path/git entries: registry
     /// requirements on these names resolve to the patched local package.
     patched: &'a BTreeSet<String>,
-    deps_cache: BTreeMap<(String, String, String), Rc<Vec<Summary>>>,
+    deps_cache: BTreeMap<DependencyQueryKey, Rc<Vec<Summary>>>,
 }
 
 impl Queryer<'_> {
@@ -1168,6 +1169,8 @@ impl Queryer<'_> {
         let crate_name = dep.package.as_deref().unwrap_or(&dep.name);
         let cache_key = (
             parent.id.name.clone(),
+            parent.id.version.clone(),
+            parent.id.source.clone(),
             crate_name.to_owned(),
             dep.req
                 .as_ref()
@@ -1209,12 +1212,31 @@ impl Queryer<'_> {
                 // the requirement — with several locked versions the
                 // highest is preferred. Name-only lookups are gone: two
                 // locked versions of one crate must not alias.
-                let locked_version = self
-                    .locked
-                    .candidates(crate_name)
-                    .filter(|p| req.matches(&p.version))
-                    .map(|p| p.version.clone())
-                    .max();
+                let locked_parent = self.locked.candidates(&parent.id.name).find(|package| {
+                    package.version == parent.id.version
+                        && match &parent.id.source {
+                            Some(source) => package.source == *source,
+                            None => package.source.starts_with("registry+"),
+                        }
+                });
+                let edge_locked_version = locked_parent.and_then(|package| {
+                    package.dependencies.iter().find_map(|dependency| {
+                        let (name, version, source) =
+                            crate::lockfile::LockedPackage::parse_dependency(dependency);
+                        (name == crate_name && source.starts_with("registry+"))
+                            .then(|| Version::parse(version).ok())
+                            .flatten()
+                            .filter(|version| req.matches(version))
+                    })
+                });
+                let locked_version = edge_locked_version.or_else(|| {
+                    self.locked
+                        .candidates(crate_name)
+                        .filter(|package| package.source.starts_with("registry+"))
+                        .filter(|package| req.matches(&package.version))
+                        .map(|package| package.version.clone())
+                        .max()
+                });
                 let mut versions: Vec<Summary> = self
                     .crates
                     .versions(crate_name)?
@@ -1607,9 +1629,9 @@ mod tests {
         assert!(c.contains(&"2.0.0".to_owned()), "{c:?}");
     }
 
-    /// The locked version is preferred over the highest match.
+    /// The exact locked parent edge wins over other compatible locks.
     #[test]
-    fn locked_version_is_preferred() {
+    fn locked_parent_edge_is_preferred() {
         let fixture = Fixture(BTreeMap::from([(
             "alpha".to_owned(),
             vec![
@@ -1620,17 +1642,41 @@ mod tests {
         )]));
         let locked = TongLock {
             version: 1,
-            packages: vec![crate::lockfile::LockedPackage {
-                name: "alpha".to_owned(),
-                version: Version::new(1, 2, 0),
-                source: "registry+fixture".to_owned(),
-                checksum: Some("x".to_owned()),
-                manifest_checksum: None,
-                tree_digest: None,
-                yanked: false,
-                publish_time: None,
-                dependencies: Vec::new(),
-            }],
+            packages: vec![
+                crate::lockfile::LockedPackage {
+                    name: "root".to_owned(),
+                    version: Version::new(0, 1, 0),
+                    source: "path+.".to_owned(),
+                    checksum: None,
+                    manifest_checksum: None,
+                    tree_digest: None,
+                    yanked: false,
+                    publish_time: None,
+                    dependencies: vec!["alpha 1.0.0 registry+fixture".to_owned()],
+                },
+                crate::lockfile::LockedPackage {
+                    name: "alpha".to_owned(),
+                    version: Version::new(1, 2, 0),
+                    source: "registry+fixture".to_owned(),
+                    checksum: Some("x".to_owned()),
+                    manifest_checksum: None,
+                    tree_digest: None,
+                    yanked: false,
+                    publish_time: None,
+                    dependencies: Vec::new(),
+                },
+                crate::lockfile::LockedPackage {
+                    name: "alpha".to_owned(),
+                    version: Version::new(1, 5, 0),
+                    source: "path+workspace-alpha".to_owned(),
+                    checksum: None,
+                    manifest_checksum: None,
+                    tree_digest: None,
+                    yanked: false,
+                    publish_time: None,
+                    dependencies: Vec::new(),
+                },
+            ],
         };
         let packages = resolve(
             &fixture,
@@ -1640,7 +1686,7 @@ mod tests {
         )
         .unwrap();
         let alpha = packages.iter().find(|p| p.name == "alpha").unwrap();
-        assert_eq!(alpha.version.to_string(), "1.2.0");
+        assert_eq!(alpha.version.to_string(), "1.0.0");
     }
 
     /// Yanked versions are excluded unless already locked.
@@ -1828,8 +1874,7 @@ mod tests {
         );
     }
 
-    /// Registry packages lock feature-activated optional edges. Weak
-    /// references activate like strong ones for lock resolution.
+    /// Registry packages lock feature-activated optional edges.
     #[test]
     fn optional_deps_lock_semantics_match_cargo() {
         // A package with an optional dep enabled only by a non-default
@@ -1881,7 +1926,7 @@ mod tests {
             ),
         ]));
 
-        // Default features only: inactive `extra` stays out of the lock.
+        // Default features only: inactive `extra` stays out.
         let packages = resolve(
             &fixture,
             &[root(vec![edge("pkg", "^1")])],
@@ -1915,11 +1960,8 @@ mod tests {
         );
     }
 
-    /// A local (workspace member) package locks its dev-dependencies but
-    /// only feature-activated optional deps (clap_builder's default
-    /// `color` locks `anstream`; a non-default optional dep stays out —
-    /// the wgpu-resolver fixture's `extra` is absent from cargo's
-    /// resolve).
+    /// A local package locks dev-dependencies and feature-active optional
+    /// edges.
     #[test]
     fn local_package_lock_semantics_match_cargo() {
         let with_optional = IndexVersion {
@@ -1965,10 +2007,8 @@ mod tests {
                 vec![Fixture::entry("extra", "1.0.0", &[], false)],
             ),
         ]));
-        // The local root's inactive optional `extra` stays out of the
-        // lock (optional deps lock only when feature-activated), while
-        // the local root's dev-dependency IS locked (members' dev-deps
-        // are part of the lock).
+        // The inactive optional edge stays out; the dev dependency is
+        // locked for the workspace member.
         let mut root_deps = vec![edge("pkg", "^1")];
         root_deps.push(ResolvedDep {
             name: "extra".to_owned(),
