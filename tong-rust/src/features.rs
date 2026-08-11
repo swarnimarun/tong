@@ -89,6 +89,20 @@ impl FeatureMap {
                 .is_some_and(|active| active.contains(extern_name))
     }
 
+    /// Whether an optional dependency edge is active in one resolver
+    /// domain. Host lookups must not accidentally inherit activation from
+    /// the target graph (or vice versa) under resolver 2/3.
+    pub fn edge_active_for(&self, package: &PackageId, extern_name: &str, host: bool) -> bool {
+        let domain = if host {
+            &self.active_build_optional_deps
+        } else {
+            &self.active_optional_deps
+        };
+        domain
+            .get(package)
+            .is_some_and(|active| active.contains(extern_name))
+    }
+
     /// Features requested on an unresolved registry dependency edge.
     pub fn unresolved_features_for(
         &self,
@@ -291,8 +305,8 @@ pub fn resolve_features(
         }
         let mut retry = false;
         let mut pending = std::mem::take(&mut state.pending_weak);
-        for (parent, dep_name, feature, reference, _domain) in pending.drain(..) {
-            let Some((dep, dep_domain)) = state.edge(&parent, &dep_name) else {
+        for (parent, dep_name, feature, reference, domain) in pending.drain(..) {
+            let Some((dep, dep_domain)) = state.edge(&parent, &dep_name, domain) else {
                 continue;
             };
             let dep = dep.clone();
@@ -323,9 +337,9 @@ pub fn resolve_features(
     // feature name lands in the dep's activated set, matching cargo's
     // resolve-node features.
     let pending = std::mem::take(&mut state.pending_weak);
-    for (parent, dep_name, feature, reference, _domain) in pending {
+    for (parent, dep_name, feature, reference, domain) in pending {
         let Some((dep, dep_domain)) = state
-            .edge(&parent, &dep_name)
+            .edge(&parent, &dep_name, domain)
             .map(|(d, dd)| (d.clone(), dd))
         else {
             continue;
@@ -435,7 +449,12 @@ impl<'a> Resolver<'a> {
 
     /// Finds a dependency by declared name or extern name across every
     /// edge kind, returning the edge and the domain it belongs to.
-    fn edge(&self, package: &PackageId, name: &str) -> Option<(&Dep, Domain)> {
+    fn edge(
+        &self,
+        package: &PackageId,
+        name: &str,
+        current_domain: Domain,
+    ) -> Option<(&Dep, Domain)> {
         let pkg = self.packages.get(package)?;
         // Declared names compare dash-insensitively: rustls-webpki
         // declares `pki-types` (extern `pki_types`, crate
@@ -454,7 +473,7 @@ impl<'a> Resolver<'a> {
                 .or_else(|| deps.iter().find(|dep| matches(dep)))
         };
         if let Some(dep) = preferred(&pkg.deps) {
-            return Some((dep, Domain::Target));
+            return Some((dep, current_domain));
         }
         if let Some(dep) = preferred(&pkg.build_deps) {
             let domain = if self.resolver != ResolverVersion::V1 {
@@ -586,7 +605,7 @@ impl<'a> Resolver<'a> {
         // Cargo's resolve graph also lists the dep name itself among the
         // package's activated features, so the implicit activation is
         // recorded both as an edge and as a feature name.
-        if let Some((dep, dep_domain)) = self.edge(package, feature) {
+        if let Some((dep, dep_domain)) = self.edge(package, feature, domain) {
             let dep = dep.clone();
             if dep.optional {
                 self.activate_edge(&pkg.id, &dep, dep_domain)?;
@@ -615,7 +634,7 @@ impl<'a> Resolver<'a> {
         // `dep:x` — namespaced activation of an optional dependency.
         if let Some(dep_name) = reference.strip_prefix("dep:") {
             let (dep, dep_domain) =
-                self.edge(package, dep_name)
+                self.edge(package, dep_name, domain)
                     .ok_or_else(|| FeatureError::UnknownDep {
                         package: package.name.clone(),
                         dep: dep_name.to_owned(),
@@ -653,7 +672,7 @@ impl<'a> Resolver<'a> {
             .unwrap_or((dep_name, false));
         let feature = rest;
         let (dep, dep_domain) =
-            self.edge(package, dep_name)
+            self.edge(package, dep_name, domain)
                 .ok_or_else(|| FeatureError::UnknownDep {
                     package: package.name.clone(),
                     dep: dep_name.to_owned(),
@@ -1109,14 +1128,22 @@ mod tests {
     fn resolver_v3_host_subgraph_includes_normal_deps() {
         let mut app = package("app", &[("default", &[])], true);
         app.build_script = Some(std::path::PathBuf::from("build.rs"));
-        app.build_deps.push(dep("hostpkg", "hostpkg", false));
-        let mut hostpkg = package("hostpkg", &[("default", &[])], true);
-        hostpkg.deps.push(dep("leaf", "leaf", false));
+        let mut host_dep = dep("hostpkg", "hostpkg", false);
+        host_dep.features.push("use-leaf".to_owned());
+        app.build_deps.push(host_dep);
+        let mut hostpkg = package(
+            "hostpkg",
+            &[("default", &[]), ("use-leaf", &["dep:leaf"])],
+            true,
+        );
+        hostpkg.deps.push(dep("leaf", "leaf", true));
         let leaf = package("leaf", &[("default", &[])], true);
         let mut model = model(vec![app, hostpkg, leaf], &["app"]);
         model.resolver = ResolverVersion::V3;
         let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
         assert!(map.build_features[&pid("leaf")].contains("default"));
+        assert!(map.edge_active_for(&pid("hostpkg"), "leaf", true));
+        assert!(!map.edge_active_for(&pid("hostpkg"), "leaf", false));
         // The target domain never reached leaf (no normal edge).
         assert!(map.packages[&pid("leaf")].is_empty());
     }

@@ -63,7 +63,7 @@ fn fixture() -> tempfile::TempDir {
             ),
             (
                 "crates/app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"4.5.6-beta.1\"\nedition = \"2021\"\nauthors = [\"Ada\", \"Grace\"]\ndescription = \"environment fixture\"\nhomepage = \"https://example.com/app\"\nrepository = \"https://example.com/repo\"\nlicense = \"MIT\"\nlicense-file = \"LICENSE\"\nreadme = \"README.md\"\nrust-version = \"1.85\"\n\n[dependencies]\nnative-lib = { path = \"../native-lib\" }\n\n[features]\ndefault = []\ngated = []\n\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n\n[[example]]\nname = \"gated\"\npath = \"examples/gated.rs\"\nrequired-features = [\"gated\"]\n",
+                "[package]\nname = \"app\"\nversion = \"4.5.6-beta.1\"\nedition = \"2021\"\nauthors = [\"Ada\", \"Grace\"]\ndescription = \"environment fixture\"\nhomepage = \"https://example.com/app\"\nrepository = \"https://example.com/repo\"\nlicense = \"MIT\"\nlicense-file = \"LICENSE\"\nreadme = \"README.md\"\nrust-version = \"1.85\"\n\n[dependencies]\nnative-lib = { path = \"../native-lib\" }\n\n[build-dependencies]\nnative-lib = { path = \"../native-lib\" }\n\n[features]\ndefault = []\ngated = []\n\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n\n[[example]]\nname = \"gated\"\npath = \"examples/gated.rs\"\nrequired-features = [\"gated\"]\n",
             ),
             // The app's build script reads the DEP_ variable; the binary
             // reads CARGO_ env vars at compile time.
@@ -357,10 +357,17 @@ fn action_parity_host_and_target_units_separate() {
             );
         }
         if action.logical_id.0.starts_with("rust:lib:") {
-            assert!(
-                args.contains(&"--target"),
-                "target lib must use --target: {args:?}"
-            );
+            if action.logical_id.0.ends_with(":host") {
+                assert!(
+                    !args.contains(&"--target"),
+                    "host dependency lib must not use --target: {args:?}"
+                );
+            } else {
+                assert!(
+                    args.contains(&"--target"),
+                    "target lib must use --target: {args:?}"
+                );
+            }
         }
     }
 }
