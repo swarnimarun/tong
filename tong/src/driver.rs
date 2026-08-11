@@ -830,12 +830,6 @@ fn prepare(
             )
             .map_err(|err| BuildError::Manifest(err.to_string()))?;
 
-            // Build-start hygiene: prune stale exec roots. Exec content is
-            // fully reproducible (everything is in the CAS); failed builds
-            // keep their roots until the next build, which is the diagnosis
-            // window.
-            prune_exec_dir(&exec)?;
-
             let toolchain = match capture {
                 Some(handle) => handle
                     .join()
@@ -1133,27 +1127,6 @@ fn record_events(root: &Path, store: &Path, events: &[BuildEvent]) {
     if let Err(err) = fs::write(&path, lines.join("\n")) {
         eprintln!("tong: warning: cannot record build events: {err}");
     }
-}
-
-/// Removes every entry of the exec directory (stale exec roots from failed
-/// or interrupted builds; content is reproducible from the CAS).
-fn prune_exec_dir(exec: &Path) -> io::Result<()> {
-    let entries = match fs::read_dir(exec) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
 }
 
 /// Builds the feature requests for a build: CLI flags apply to the

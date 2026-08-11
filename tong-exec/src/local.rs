@@ -27,7 +27,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tong_core::action::ActionSpec;
@@ -43,6 +43,7 @@ use crate::sandbox::{Sandbox, SandboxLevel, SandboxSpec, default_read_only_binds
 pub use tong_core::action::{BUNDLE_ROOT_VAR, EXEC_ROOT_VAR};
 
 static NEXT_EXECUTOR_ID: AtomicU64 = AtomicU64::new(0);
+const LOCK_FILE: &str = ".lock";
 
 /// The result of a successful, validated execution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,6 +126,9 @@ impl From<io::Error> for ExecError {
 pub struct LocalExecutor {
     cas: Cas,
     invocation_root: PathBuf,
+    /// Held for the executor's lifetime so another Tong process can
+    /// distinguish this live namespace from an abandoned one.
+    invocation_lock: Option<fs::File>,
     /// Sandbox enforcement level (PLAN.md section 11; opt-in).
     sandbox_level: SandboxLevel,
     /// The platform sandbox wrapper.
@@ -135,6 +139,8 @@ pub struct LocalExecutor {
     bundle_roots: HashMap<Digest, PathBuf>,
     /// Keep exec roots after successful runs (debugging).
     keep_exec_roots: bool,
+    /// Failed actions keep their root for diagnosis until the next build.
+    failed: AtomicBool,
 }
 
 impl LocalExecutor {
@@ -151,19 +157,40 @@ impl LocalExecutor {
     ) -> io::Result<Self> {
         let exec_base = exec_base.into();
         fs::create_dir_all(&exec_base)?;
+
+        // Serialize pruning with namespace publication. Each published
+        // namespace has its own held lock, so stale cleanup can skip live
+        // concurrent builds without relying on process ids or timestamps.
+        let setup_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(exec_base.join(LOCK_FILE))?;
+        setup_lock.lock()?;
+        prune_stale_invocations(&exec_base)?;
+
         let executor_id = NEXT_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed);
         let invocation_root = exec_base.join(format!("run-{}-{executor_id}", std::process::id()));
-        fs::create_dir_all(&invocation_root)?;
+        fs::create_dir(&invocation_root)?;
+        let invocation_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(invocation_root.join(LOCK_FILE))?;
+        invocation_lock.lock()?;
         let host = std::env::consts::OS;
         let sandbox = sandbox_for(host);
         Ok(Self {
             cas,
             invocation_root,
+            invocation_lock: Some(invocation_lock),
             sandbox_level,
             sandbox,
             system_tools: HashMap::new(),
             bundle_roots: HashMap::new(),
             keep_exec_roots: false,
+            failed: AtomicBool::new(false),
         })
     }
 
@@ -206,9 +233,8 @@ impl LocalExecutor {
         let result = self.run(spec, &exec_root, &input, &output, &tmp, started);
         if result.is_ok() && !self.keep_exec_roots {
             fs::remove_dir_all(&exec_root)?;
-            // Avoid accumulating empty invocation directories. A failed
-            // action remains inside the directory for diagnostics.
-            let _ = fs::remove_dir(&self.invocation_root);
+        } else if result.is_err() {
+            self.failed.store(true, Ordering::Relaxed);
         }
         result
     }
@@ -437,6 +463,51 @@ impl LocalExecutor {
     }
 }
 
+impl Drop for LocalExecutor {
+    fn drop(&mut self) {
+        // Release ownership before removing a completed namespace. Failed
+        // or explicitly retained roots remain available for diagnostics;
+        // the next constructor will reclaim them after acquiring the lock.
+        self.invocation_lock.take();
+        if !self.keep_exec_roots && !self.failed.load(Ordering::Relaxed) {
+            let _ = fs::remove_dir_all(&self.invocation_root);
+        }
+    }
+}
+
+fn prune_stale_invocations(exec_base: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(exec_base)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == exec_base.join(LOCK_FILE) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            fs::remove_file(path)?;
+            continue;
+        }
+
+        let lock = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join(LOCK_FILE))
+        {
+            Ok(lock) => Some(lock),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        if let Some(lock) = lock {
+            match lock.try_lock() {
+                Ok(()) => drop(lock),
+                Err(fs::TryLockError::WouldBlock) => continue,
+                Err(fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Option<Duration>,
@@ -452,5 +523,45 @@ fn wait_with_timeout(
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_skips_live_invocation_and_drop_cleans_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path().join("store")).unwrap();
+        let exec = dir.path().join("exec");
+        let first = LocalExecutor::new(cas.clone(), &exec).unwrap();
+        let first_root = first.invocation_root.clone();
+        fs::write(first_root.join("sentinel"), b"live").unwrap();
+
+        let second = LocalExecutor::new(cas, &exec).unwrap();
+        let second_root = second.invocation_root.clone();
+        assert!(first_root.join("sentinel").is_file());
+
+        drop(first);
+        drop(second);
+        assert!(!first_root.exists());
+        assert!(!second_root.exists());
+    }
+
+    #[test]
+    fn constructor_prunes_abandoned_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let cas = Cas::open(&store).unwrap();
+        let exec = dir.path().join("exec");
+        let stale = exec.join("run-123-0");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("partial-output"), b"stale").unwrap();
+
+        let executor = LocalExecutor::new(cas, &exec).unwrap();
+
+        assert!(!stale.exists());
+        drop(executor);
     }
 }
