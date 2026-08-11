@@ -872,6 +872,101 @@ project's live objects.
 
 The Nix concept of retaining complete reachable closures is useful here, but Tong should maintain separate build-time and runtime reachability.
 
+### 10.5 Storage and incremental-build advantage
+
+Storage efficiency is a product contract, not an incidental CAS property.
+Tong must keep each worktree's `.tong` directory thin while one optional
+user-level store owns content shared by worktrees and unrelated workspaces.
+The detailed current-state audit and implementation sequence live in
+`docs/storage-and-docker.md`.
+
+The required model is:
+
+```text
+worktree/.tong/          shared store (one per user or explicit path)
+  out/ selected files     blobs/ content stored once
+  exec/ transient         trees/ metadata stored once
+                         results/ action results stored once
+                         state/projects/ GC roots per workspace
+```
+
+Required behavior:
+
+* `TONG_STORE_DIR` remains supported, but a global `--store-dir` option and a
+  durable, workspace-neutral user configuration must make shared backing an
+  obvious one-command choice in both Cargo-import and native mode.
+* Only requested final artifacts are materialized under `.tong/out`; dependency
+  outputs, metadata, and intermediate codegen remain in the shared CAS. Check,
+  metadata, and graph-only commands materialize no user artifacts.
+* Materialization must prefer safe copy-on-write clones (reflinks) and fall
+  back to copies. It must never hard-link writable output to an immutable CAS
+  blob. Repeated materialization must skip files whose digest and mode already
+  match, and stale artifacts from the same selection must be removed.
+* Identical source, toolchain, and action outputs occupy physical storage once
+  across worktrees. State manifests and selected output directory entries are
+  the only unavoidable per-worktree overhead.
+* GC must use explicit leases for running builds and atomic root updates;
+  elapsed age alone is not a concurrency guarantee. Size/age policies operate
+  on physical bytes and never evict a leased or reachable closure.
+* `tong store stats --format text|json` must report project-local bytes,
+  physical shared bytes, logical referenced bytes, deduplication ratio,
+  materialized bytes, reclaimable bytes, and roots by project. `tong clean`
+  must report exactly which project-local data and roots it removed.
+* Source invalidation remains content-correct. A snapshot index may avoid
+  rehashing unchanged source files, but changed or racy entries are hashed and
+  every action key continues to contain content digests. Rust dep-info and
+  build-script rerun declarations narrow subsequent input trees.
+* Rustc incremental state is an optional local acceleration input, never part
+  of cross-machine cache identity. It must be keyed by canonical Rust unit,
+  toolchain, and profile, captured outside final artifacts, bounded by GC, and
+  periodically checked against a clean build. A missing or corrupt state must
+  only cost time, never change correctness.
+
+Competitive gates use a pinned large-workspace benchmark on the same machine
+and warmed filesystem cache:
+
+* no-op wall time is no slower than Cargo by more than 10% or 20 ms, whichever
+  is larger;
+* a representative one-file edit is no slower than Cargo by more than 10%;
+* a second identical worktree with shared backing adds at most 2% of the first
+  build's physical store bytes plus its selected final artifacts;
+* `.tong` in shared mode contains no dependency intermediates and is smaller
+  than Cargo's project-local `target` directory for every required benchmark;
+* cache diagnostics explain every miss as an input, command, environment,
+  toolchain, platform, policy, or prior-state change.
+
+Benchmark reports must include cold, warm, no-op, one-file edit, branch switch,
+second-worktree, GC, and Docker/CI scenarios. Performance claims in release
+documentation must link to a generated report with machine, filesystem,
+toolchain, corpus revision, physical-byte accounting method, and raw samples.
+
+### 10.6 Docker-native execution and cache transport
+
+`tong dockerfile` and `tong build --deps-only` are the existing layer-cache
+path; they are not yet a Docker executor. Native Docker support must add an
+executor selected with `--executor docker` (and the same executor interface
+used by future remote execution), while preserving the action graph and cache
+keys used by local execution.
+
+The Docker executor must:
+
+* use BuildKit when available and fail with an actionable capability report;
+* mount or import/export the Tong CAS without copying it into every layer;
+* key builder caches by execution platform and toolchain/image digest, never a
+  mutable image tag alone;
+* deny action network access by default, allowing it only for explicit fetch
+  actions, and report the capabilities actually achieved;
+* preserve host UID/GID ownership, executable modes, symlinks, cancellation,
+  structured events, and selected-artifact materialization;
+* support local Docker, rootless Docker, CI cache export/import, multi-platform
+  builds, and an offline mode whose network namespace is demonstrably closed;
+* avoid sending `.git`, `.tong`, Cargo `target`, secrets, or unrelated
+  workspace files in the build context.
+
+The generated-Dockerfile workflow remains supported for deployment images.
+The native executor is for running Tong actions in containers; these are
+separate interfaces and must have separate tests and documentation.
+
 ---
 
 ## 11. Sandboxing and Enforcement
@@ -1132,6 +1227,11 @@ Release only when:
   configuration precedence, parallel scheduling, and certified cross-target
   builds.
 * Publish a field-by-field manifest/configuration compatibility matrix.
+* Make shared backing a first-class CLI/config choice, publish physical-storage
+  and incremental-build comparisons with Cargo, and add safe thin-output
+  materialization.
+* Add the Docker executor preview with BuildKit cache persistence and honest
+  sandbox-capability reporting.
 
 ### 1.0 — Generalized hermetic build system
 
@@ -1141,6 +1241,10 @@ Release only when:
   cache correctness.
 * Require every backend to pass the language-neutral action-boundary
   conformance suite.
+* Meet the storage, second-worktree, no-op, and one-file-edit competitive gates
+  in §10.5 on the published large-workspace tier.
+* Certify the local and Docker executors against the same action, cache,
+  cancellation, offline, and adversarial-sandbox suites.
 
 ### Architectural phase ordering
 
@@ -1351,6 +1455,11 @@ tong-store/
 
 ### Deliverables
 
+* First-class shared local-store CLI and user configuration.
+* Build leases, physical-byte accounting, and store statistics.
+* Reflink/unchanged-file materialization and thin-output manifests.
+* Content-correct source snapshot index and bounded rustc incremental state.
+* Docker executor and BuildKit cache import/export.
 * Remote CAS.
 * Remote action cache.
 * Authentication and namespace policy.
@@ -1364,6 +1473,11 @@ tong-store/
 
 ### Exit criteria
 
+* Two worktrees reuse identical actions and content while satisfying §10.5's
+  physical-storage bound.
+* The no-op and one-file-edit benchmarks satisfy §10.5's Cargo-relative gates.
+* Local and Docker execution produce equivalent output-tree digests for the
+  portable action suite.
 * CI-produced actions are reusable by a developer with an identical execution platform.
 * Corrupt remote blobs are detected.
 * Local fallback works when the remote service is unavailable.
@@ -1519,6 +1633,19 @@ Cover:
   (member manifests staged at their real relative paths), then a full
   build in the same store asserting every dep action was a cache hit and
   only workspace actions executed (`tong/tests/docker_stage.rs`).
+* Two worktrees using one store: identical objects occupy one physical copy,
+  project roots remain independent, and cleaning either worktree preserves the
+  other's reachable closure.
+* Interrupted builds hold leases that protect their inputs and partial
+  acceleration state while never publishing a successful action result.
+* Reflink/copy materialization cannot mutate a CAS blob, skips unchanged
+  outputs, and removes stale selected artifacts.
+* Snapshot-index false-dirty, preserved-mtime, racy-write, and corruption cases
+  fall back to content hashing.
+* Incremental and clean Rust compiles produce the same declared output tree for
+  the reproducibility corpus.
+* Docker execution denies undeclared network/filesystem access and reuses the
+  same action result after workspace relocation.
 
 ---
 
@@ -1545,6 +1672,11 @@ Tong should measure:
 * Scheduler idle time.
 * Peak disk usage.
 * Garbage-collection effectiveness.
+* Physical bytes added by a second worktree.
+* Project-local `.tong` bytes versus Cargo `target` bytes.
+* Reflinked, copied, shared, and reclaimable bytes.
+* No-op and one-file-edit time relative to Cargo on the same pinned corpus.
+* Docker context bytes, cache transfer bytes, and warm BuildKit latency.
 
 ### Compatibility
 

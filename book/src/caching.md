@@ -43,6 +43,10 @@ Default location: `<root>/.tong/store`. Relocate (shared-store mode)
 with `TONG_STORE_DIR` or `[store] dir` in `Tong.toml` (native mode
 only).
 
+Materialized files are writable copies today; they are not hard links to
+immutable CAS blobs. Reflink-first thin materialization and physical-byte
+accounting are tracked in `PLAN.md` §10.5.
+
 **Atomicity and concurrency.** CAS writes are temp-file → digest
 verify → atomic rename → immutable final object, so concurrent writers
 are tolerated. There are no whole-build locks: multiple readers are

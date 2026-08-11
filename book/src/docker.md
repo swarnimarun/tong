@@ -9,6 +9,10 @@ build. Two commands make `docker build` layer-cache-friendly:
 - `tong build --deps-only` — compile and cache only dependency actions.
 - `tong dockerfile` — generate the exact `Dockerfile` + `.dockerignore`.
 
+This is a generated deployment-image workflow, not yet a Docker action
+executor. Native `--executor docker` support, BuildKit CAS transport, and
+local/Docker action equivalence are planned in `PLAN.md` §10.6.
+
 The invariant to preserve:
 
 > Dep layers bust **iff** the lockfile content or the toolchain

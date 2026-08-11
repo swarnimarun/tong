@@ -29,7 +29,8 @@ remaining platform certification work are tracked in the
 - **Content-addressed everything.** Actions, trees, blobs, results, and
   sources live in one CAS store; action digests cover only semantic
   execution fields, so renames, relocations, and equivalent graphs all
-  reuse cache entries. No-op rebuilds take ~40 ms.
+  reuse cache entries. Shared backing keeps dependency intermediates out of
+  each worktree; only requested final artifacts are materialized there.
 - **No embedded build language.** Targets are data in `Tong.toml`
   (native mode) or plain `Cargo.toml` workspaces (import mode). No
   Starlark, no scripting language to learn.
@@ -129,7 +130,8 @@ mdbook serve book   # live preview at http://localhost:3000
 
 Design documents that drive the implementation live in [`docs/`](docs/):
 [docker-caching.md](docs/docker-caching.md), [fingerprint-cache.md](docs/fingerprint-cache.md),
-[performance.md](docs/performance.md), and the governing
+[performance.md](docs/performance.md),
+[storage-and-docker.md](docs/storage-and-docker.md), and the governing
 [`PLAN.md`](PLAN.md).
 
 ## Development
