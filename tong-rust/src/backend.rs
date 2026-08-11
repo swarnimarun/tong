@@ -1181,13 +1181,17 @@ impl<'a> RustBackend<'a> {
                             .join("\u{1f}"),
                         links: pkg.links.clone(),
                         profile: self.profile_name.clone(),
-                        cfgs: build_script_cfgs(if feature_host_domain {
-                            &self.toolchain.host_triple
-                        } else {
-                            self.target_triple
-                                .as_deref()
-                                .unwrap_or(&self.toolchain.host_triple)
-                        }),
+                        cfgs: build_script_cfgs(
+                            if feature_host_domain {
+                                &self.toolchain.host_triple
+                            } else {
+                                self.target_triple
+                                    .as_deref()
+                                    .unwrap_or(&self.toolchain.host_triple)
+                            },
+                            &self.toolchain.host_triple,
+                            &self.toolchain.host_cfgs,
+                        ),
                         features: self
                             .model
                             .feature_map
@@ -2531,7 +2535,14 @@ fn glob_match(spec: &str, name: &str) -> bool {
 
 /// Concretizes a planned action into a full `ActionSpec`.
 /// `CARGO_CFG_*` values Cargo exposes for the configured target.
-fn build_script_cfgs(target_triple: &str) -> Vec<(String, String)> {
+fn build_script_cfgs(
+    target_triple: &str,
+    host_triple: &str,
+    host_cfgs: &[(String, String)],
+) -> Vec<(String, String)> {
+    if target_triple == host_triple {
+        return host_cfgs.to_vec();
+    }
     let facts = tong_core::platform::parse_triple(target_triple).unwrap_or_default();
     let mut out = vec![
         ("target_arch".to_owned(), facts.arch.clone()),
@@ -2548,6 +2559,10 @@ fn build_script_cfgs(target_triple: &str) -> Vec<(String, String)> {
         // Cargo's `CARGO_CFG_TARGET_ENDIAN` even on common hosts.
         ("target_endian".to_owned(), facts.endian.clone()),
         ("target_abi".to_owned(), String::new()),
+        // Cargo sets this variable even when the configured target has no
+        // enabled target features. Cross-target compiler cfg capture will
+        // replace this conservative fallback when that toolchain lands.
+        ("target_feature".to_owned(), String::new()),
     ];
     if facts.family == "unix" {
         out.push(("unix".to_owned(), String::new()));
@@ -3233,6 +3248,22 @@ mod tests {
         assert_eq!(
             dependency_crate_type(&[CrateType::Staticlib, CrateType::Cdylib]),
             None
+        );
+    }
+
+    #[test]
+    fn build_scripts_receive_compiler_reported_host_cfgs() {
+        let cfgs = vec![
+            ("target_arch".to_owned(), "aarch64".to_owned()),
+            ("target_feature".to_owned(), "aes,crc,neon".to_owned()),
+        ];
+        assert_eq!(
+            build_script_cfgs("aarch64-apple-darwin", "aarch64-apple-darwin", &cfgs,),
+            cfgs
+        );
+        assert!(
+            build_script_cfgs("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", &cfgs)
+                .contains(&("target_feature".to_owned(), String::new()))
         );
     }
 }

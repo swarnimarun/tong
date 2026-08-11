@@ -241,6 +241,12 @@ fn capture_dist(cas: &Cas, version: &str, root: &Path) -> Result<SystemRust, Too
         .map(str::trim)
         .ok_or_else(|| ToolchainError::Dist("extracted rustc reported no host".to_owned()))?
         .to_owned();
+    let host_cfg_output =
+        crate::toolchain::run_toolchain(&real_rustc, &["--print", "cfg", "--target", &host_triple])
+            .map_err(|err| {
+                ToolchainError::Dist(format!("cannot query extracted rustc cfgs: {err}"))
+            })?;
+    let host_cfgs = crate::toolchain::parse_rustc_cfgs(&host_cfg_output);
 
     let rustc_blob = cas.put_file(&real_rustc)?;
     let excludes = Default::default();
@@ -289,6 +295,7 @@ fn capture_dist(cas: &Cas, version: &str, root: &Path) -> Result<SystemRust, Too
         rustc: real_rustc,
         host_triple,
         version_verbose: version_verbose.trim().to_owned(),
+        host_cfgs,
         rustc_blob,
         rustdoc: None,
         rustdoc_blob: None,

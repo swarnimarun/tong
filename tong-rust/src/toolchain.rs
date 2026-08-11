@@ -35,6 +35,9 @@ pub struct SystemRust {
     pub host_triple: String,
     /// Full `rustc -vV` output, used as an action property.
     pub version_verbose: String,
+    /// Cargo-style `CARGO_CFG_*` values reported by this compiler for its
+    /// host target. Repeated cfg values are joined with commas.
+    pub host_cfgs: Vec<(String, String)>,
     /// Digest of the rustc binary itself.
     pub rustc_blob: BlobDigest,
     /// The real rustdoc binary (never a rustup shim); `None` when the
@@ -161,6 +164,7 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
                     rustc: real_rustc,
                     host_triple: captured.host_triple,
                     version_verbose: captured.version_verbose,
+                    host_cfgs: captured.host_cfgs,
                     rustc_blob: captured.rustc_blob,
                     rustdoc: None,
                     rustdoc_blob: None,
@@ -193,6 +197,9 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
         .map(str::trim)
         .ok_or_else(|| ToolchainError::Missing("rustc -vV reported no host triple".to_owned()))?
         .to_owned();
+    let host_cfg_output =
+        run_toolchain(&real_rustc, &["--print", "cfg", "--target", &host_triple])?;
+    let host_cfgs = parse_rustc_cfgs(&host_cfg_output);
     let rustc_blob = cas.put_file(&real_rustc)?;
     tracing::debug!(
         target: "tong::perf",
@@ -260,6 +267,7 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
                     &bundle,
                     &host_triple,
                     &version_verbose,
+                    &host_cfg_output,
                 ) {
                     tracing::debug!(
                         target: "tong::perf",
@@ -281,6 +289,7 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
         rustc: real_rustc,
         host_triple: host_triple.trim().to_owned(),
         version_verbose: version_verbose.trim().to_owned(),
+        host_cfgs,
         rustc_blob,
         rustdoc: None,
         rustdoc_blob: None,
@@ -303,6 +312,29 @@ pub fn run_toolchain(program: &Path, args: &[&str]) -> Result<String, ToolchainE
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Converts `rustc --print cfg` output to Cargo's `CARGO_CFG_*` values.
+pub(crate) fn parse_rustc_cfgs(output: &str) -> Vec<(String, String)> {
+    let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some((key, value)) = line.split_once('=') {
+            values
+                .entry(key.to_owned())
+                .or_default()
+                .push(value.trim_matches('"').to_owned());
+        } else {
+            values.entry(line.to_owned()).or_default();
+        }
+    }
+    values
+        .into_iter()
+        .map(|(key, values)| (key, values.join(",")))
+        .collect()
 }
 
 fn first_line_of(text: &str) -> Option<&str> {
@@ -353,6 +385,7 @@ struct CachedCapture {
     bundle: EnvironmentBundle,
     host_triple: String,
     version_verbose: String,
+    host_cfgs: Vec<(String, String)>,
 }
 
 /// Stat data of one sysroot entry as folded into the snapshot digest.
@@ -519,12 +552,18 @@ impl ToolchainCache {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        let host_cfg_output = match fs::read_to_string(dir.join("host_cfgs")) {
+            Ok(text) => text,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
         Ok(Some(CachedCapture {
             rustc_blob,
             sysroot_tree,
             bundle,
             host_triple,
             version_verbose,
+            host_cfgs: parse_rustc_cfgs(&host_cfg_output),
         }))
     }
 
@@ -544,6 +583,7 @@ impl ToolchainCache {
         bundle: &EnvironmentBundle,
         host_triple: &str,
         version_verbose: &str,
+        host_cfg_output: &str,
     ) -> io::Result<()> {
         let dir = self.entry_dir(key);
         fs::create_dir_all(dir.join("objects").join("blob"))?;
@@ -564,6 +604,7 @@ impl ToolchainCache {
         write_atomic(&dir.join("snapshot"), snapshot.to_hex().as_bytes())?;
         write_atomic(&dir.join("host_triple"), host_triple.as_bytes())?;
         write_atomic(&dir.join("version_verbose"), version_verbose.as_bytes())?;
+        write_atomic(&dir.join("host_cfgs"), host_cfg_output.as_bytes())?;
         let manifest = format!(
             "rustc_blob {}\nbin_tree {}\nlib_tree {}\nsysroot_tree {}\nbundle {}\n",
             rustc_blob.digest().to_hex(),
@@ -860,4 +901,26 @@ fn parse_manifest(text: &str) -> Option<(BlobDigest, TreeDigest, TreeDigest, Tre
         TreeDigest::new(Digest::from_hex(fields.get("sysroot_tree")?).ok()?),
         Digest::from_hex(fields.get("bundle")?).ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rustc_cfgs_join_repeated_values_for_cargo() {
+        assert_eq!(
+            parse_rustc_cfgs(
+                "target_arch=\"aarch64\"\n\
+                 target_feature=\"aes\"\n\
+                 target_feature=\"crc\"\n\
+                 unix\n",
+            ),
+            [
+                ("target_arch".to_owned(), "aarch64".to_owned()),
+                ("target_feature".to_owned(), "aes,crc".to_owned()),
+                ("unix".to_owned(), String::new()),
+            ]
+        );
+    }
 }
