@@ -137,6 +137,35 @@ fn shared_store_reuses_cargo_workspace_actions() {
 }
 
 #[test]
+fn cargo_package_selection_materializes_different_bin_name() {
+    let work = tempfile::tempdir().unwrap();
+    fs::write(
+        work.path().join("Cargo.toml"),
+        r#"
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "daemon"
+path = "src/main.rs"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(work.path().join("src")).unwrap();
+    fs::write(work.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let output = run_tong(work.path(), &["build", "-p", "server"]);
+    assert_success(&output, "build package with renamed binary");
+    assert!(
+        work.path().join(".tong/out/dev/daemon/daemon").is_file(),
+        "package selection must materialize its binary: {}",
+        stdout_of(&output)
+    );
+}
+
+#[test]
 fn cargo_workflow_commands_native_workspace() {
     let work = native_workspace();
     let ws = work.path();

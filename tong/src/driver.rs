@@ -408,18 +408,13 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     let t_assemble = std::time::Instant::now();
     let mut artifact_pairs: Vec<(String, TreeDigest)> = Vec::new();
     if !options.deps_only {
-        let requested: Vec<&tong_rust::FinalArtifact> = prepared
-            .artifacts
-            .iter()
-            .filter(|artifact| {
-                options.targets.is_empty()
-                    || options
-                        .targets
-                        .iter()
-                        .any(|t| artifact_name_matches(t, &artifact.name))
-            })
-            .collect();
-        for artifact in requested {
+        // The configured model has already applied package/label selection,
+        // and `final_artifacts` has already applied singular target selectors.
+        // Filtering again by the raw package spec is incorrect: a native
+        // target key or Cargo package name need not equal its binary output
+        // name (`//app:app` may produce `web-app`, `-p server` may produce
+        // `daemon`). Materialize exactly the frontend-selected artifacts.
+        for artifact in &prepared.artifacts {
             let Some(result) = completed.0.get(&artifact.action) else {
                 continue;
             };

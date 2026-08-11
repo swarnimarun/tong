@@ -252,3 +252,26 @@ fn global_store_dir_shares_backing_between_worktrees() {
     assert_eq!(value["schema"], 1);
     assert_eq!(value["path"], store_arg);
 }
+
+#[test]
+fn selected_native_label_materializes_declared_output() {
+    let work = fixture_copy();
+    let copied_build_state = work.path().join(".tong");
+    if copied_build_state.exists() {
+        fs::remove_dir_all(copied_build_state).unwrap();
+    }
+
+    let output = run_tong(work.path(), None, &["build", "//app:app"]);
+    assert!(
+        output.status.success(),
+        "selected build failed: {}{}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let binary = work.path().join(".tong/out/dev/web-app/web-app");
+    assert!(
+        binary.is_file(),
+        "native target key must materialize its declared output: {}",
+        stdout_of(&output)
+    );
+}
