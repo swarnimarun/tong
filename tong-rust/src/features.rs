@@ -496,8 +496,8 @@ impl<'a> Resolver<'a> {
         crate::cargo_import::target_matches(condition, triple, "dependency").unwrap_or(false)
     }
 
-    /// Finds a dependency by declared name or extern name across every
-    /// edge kind, returning the edge and the domain it belongs to.
+    /// Finds a dependency by its declared/extern name across every edge
+    /// kind, returning the edge and the domain it belongs to.
     fn edge(
         &self,
         package: &PackageId,
@@ -508,13 +508,12 @@ impl<'a> Resolver<'a> {
         // Declared names compare dash-insensitively: rustls-webpki
         // declares `pki-types` (extern `pki_types`, crate
         // `rustls-pki-types`) and its features reference `pki-types/alloc`.
+        // Do not match the package name: a manifest may depend on multiple
+        // versions under aliases (for example `legacy-rustls` and `rustls`),
+        // and feature references address the dependency key, not the package.
         let normalized = name.replace('-', "_");
-        let matches = |dep: &Dep| {
-            dep.package.name == name
-                || dep.extern_name == name
-                || dep.extern_name.replace('-', "_") == normalized
-                || dep.package.name.replace('-', "_") == normalized
-        };
+        let matches =
+            |dep: &Dep| dep.extern_name == name || dep.extern_name.replace('-', "_") == normalized;
         let preferred = |deps: &'a [Dep], domain: Domain| {
             deps.iter()
                 .filter(|dep| matches(dep) && self.dep_matches_target(dep, domain))
@@ -552,10 +551,7 @@ impl<'a> Resolver<'a> {
             .iter()
             .chain(pkg.build_deps.iter())
             .chain(pkg.dev_deps.iter())
-            .any(|dep| {
-                dep.extern_name.replace('-', "_") == normalized
-                    || dep.package.name.replace('-', "_") == normalized
-            })
+            .any(|dep| dep.extern_name.replace('-', "_") == normalized)
     }
 
     /// Proc macros and everything below them are host units under
@@ -929,10 +925,8 @@ impl<'a> Resolver<'a> {
             // references the optional renamed dep `bson-2` whose
             // extern name is `bson_2`.
             dep.optional
-                && (dep.package.name == feature
-                    || dep.extern_name == feature
-                    || dep.extern_name.replace('-', "_") == feature.replace('-', "_")
-                    || dep.package.name.replace('-', "_") == feature.replace('-', "_"))
+                && (dep.extern_name == feature
+                    || dep.extern_name.replace('-', "_") == feature.replace('-', "_"))
         });
         if !dep_package.features.contains_key(feature) && !implicit {
             return Err(FeatureError::UnknownDepFeature {
@@ -1118,6 +1112,46 @@ mod tests {
         assert!(map.packages[&pid("extra")].contains("feat"));
         let map = resolve_features(&model, &[request("app", &["f"])], false).unwrap();
         assert!(map.packages[&pid("extra")].contains("feat"));
+    }
+
+    #[test]
+    fn feature_reference_selects_dependency_alias() {
+        let legacy_id = PackageId {
+            name: "transport".to_owned(),
+            version: semver::Version::new(1, 0, 0),
+            source: SourceId::Registry("fixture".to_owned()),
+        };
+        let current_id = PackageId {
+            name: "transport".to_owned(),
+            version: semver::Version::new(2, 0, 0),
+            source: SourceId::Registry("fixture".to_owned()),
+        };
+        let mut app = package(
+            "app",
+            &[("default", &["dep:transport", "transport?/modern"])],
+            true,
+        );
+        let mut legacy_dep = dep("legacy_transport", "transport", true);
+        legacy_dep.package = legacy_id.clone();
+        app.deps.push(legacy_dep);
+        let mut current_dep = dep("transport", "transport", true);
+        current_dep.package = current_id.clone();
+        app.deps.push(current_dep);
+
+        let mut legacy = package("transport", &[], false);
+        legacy.id = legacy_id.clone();
+        legacy.version = legacy_id.version.to_string();
+        let mut current = package("transport", &[("modern", &[])], false);
+        current.id = current_id.clone();
+        current.version = current_id.version.to_string();
+
+        let model = model(vec![app, legacy, current], &["app"]);
+        let map = resolve_features(&model, &[request("app", &[])], false).unwrap();
+
+        assert!(map.active_optional_deps[&pid("app")].contains("transport"));
+        assert!(!map.active_optional_deps[&pid("app")].contains("legacy_transport"));
+        assert!(map.packages[&current_id].contains("modern"));
+        assert!(map.packages[&legacy_id].is_empty());
     }
 
     #[test]
