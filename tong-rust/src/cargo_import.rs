@@ -100,6 +100,24 @@ struct CargoPackage {
     version: Option<Field>,
     #[serde(default)]
     edition: Option<Field>,
+    #[serde(default)]
+    authors: Option<AuthorsField>,
+    #[serde(default)]
+    description: Option<Field>,
+    #[serde(default)]
+    documentation: Option<Field>,
+    #[serde(default)]
+    homepage: Option<Field>,
+    #[serde(default)]
+    repository: Option<Field>,
+    #[serde(default)]
+    license: Option<Field>,
+    #[serde(default)]
+    license_file: Option<Field>,
+    #[serde(default)]
+    readme: Option<ReadmeField>,
+    #[serde(default)]
+    rust_version: Option<Field>,
     build: Option<BuildKey>,
     /// Cargo resolver version: `"1"`, `"2"`, or `"3"`.
     #[serde(default)]
@@ -142,6 +160,21 @@ enum Field {
     Inherit { workspace: bool },
 }
 
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum AuthorsField {
+    Value(Vec<String>),
+    Inherit { workspace: bool },
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum ReadmeField {
+    Flag(bool),
+    Value(String),
+    Inherit { workspace: bool },
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 struct CargoWorkspace {
@@ -163,7 +196,7 @@ struct CargoWorkspace {
     resolver: Option<String>,
 }
 
-/// `[workspace.package]` subset: version and edition.
+/// `[workspace.package]` values inherited by member packages.
 #[derive(Deserialize, Clone, Default)]
 #[serde(rename_all = "kebab-case")]
 struct CargoWorkspacePackage {
@@ -171,6 +204,31 @@ struct CargoWorkspacePackage {
     version: Option<String>,
     #[serde(default)]
     edition: Option<String>,
+    #[serde(default)]
+    authors: Option<Vec<String>>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    documentation: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    license_file: Option<String>,
+    #[serde(default)]
+    readme: Option<ReadmeValue>,
+    #[serde(default)]
+    rust_version: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum ReadmeValue {
+    Flag(bool),
+    Value(String),
 }
 
 /// Workspace inheritance context: `[workspace.dependencies]` and
@@ -283,7 +341,7 @@ struct CargoProfile {
     codegen_units: Option<u32>,
     overflow_checks: Option<bool>,
     debug_assertions: Option<bool>,
-    strip: Option<String>,
+    strip: Option<StripValue>,
     rpath: Option<bool>,
     /// `none` | `unpacked` | `packed`.
     split_debuginfo: Option<String>,
@@ -310,6 +368,13 @@ enum OptLevelValue {
 enum DebugValue {
     Bool(bool),
     Num(u8),
+    Str(String),
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum StripValue {
+    Bool(bool),
     Str(String),
 }
 
@@ -973,12 +1038,14 @@ fn import_package(
     visiting.push((canonical.clone(), via_dev));
 
     let result = (|| {
+        let metadata = resolve_package_metadata(package, inherited.package.as_ref(), &canonical)?;
         let mut pkg = Package {
             id: id.clone(),
             name: package.name.clone(),
             dir: canonical.clone(),
             version,
             edition: parse_edition(&edition)?,
+            metadata,
             lib: None,
             bins: Vec::new(),
             examples: Vec::new(),
@@ -1036,18 +1103,8 @@ fn import_package(
             });
         }
 
-        // Binaries: explicit [[bin]] or auto-detected src/main.rs.
-        if manifest.bin.is_empty()
-            && package.autobins.unwrap_or(true)
-            && pkg.dir.join("src/main.rs").is_file()
-        {
-            pkg.bins.push(BinTarget {
-                name: package.name.clone(),
-                crate_name: crate_name(&package.name),
-                path: PathBuf::from("src/main.rs"),
-                required_features: Vec::new(),
-            });
-        }
+        // Binaries: explicit `[[bin]]` entries plus Cargo's automatic
+        // `src/main.rs`, `src/bin/*.rs`, and `src/bin/*/main.rs` targets.
         for bin in &manifest.bin {
             let name = bin.name.clone().unwrap_or_else(|| {
                 bin.path
@@ -1069,11 +1126,32 @@ fn import_package(
                 required_features: bin.required_features.clone().unwrap_or_default(),
             });
         }
+        if package.autobins.unwrap_or(true) {
+            let mut names: BTreeSet<String> = pkg.bins.iter().map(|bin| bin.name.clone()).collect();
+            if pkg.dir.join("src/main.rs").is_file() && names.insert(package.name.clone()) {
+                pkg.bins.push(BinTarget {
+                    name: package.name.clone(),
+                    crate_name: crate_name(&package.name),
+                    path: PathBuf::from("src/main.rs"),
+                    required_features: Vec::new(),
+                });
+            }
+            for (name, path) in discover_named_targets(&pkg.dir, "src/bin") {
+                if names.insert(name.clone()) {
+                    pkg.bins.push(BinTarget {
+                        name: name.clone(),
+                        crate_name: crate_name(&name),
+                        path,
+                        required_features: Vec::new(),
+                    });
+                }
+            }
+        }
 
         // Examples: [[example]] entries whose source exists, plus
         // auto-discovered `examples/*.rs` (Cargo conventions; tong plans
         // example compiles in test/`--all-targets` builds).
-        let mut example_entries: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+        let mut example_entries: Vec<(String, PathBuf, Vec<String>, Vec<String>)> = Vec::new();
         for example in &manifest.example {
             let name = example.name.clone().unwrap_or_else(|| {
                 example
@@ -1094,39 +1172,29 @@ fn import_package(
                     name,
                     path,
                     example.required_features.clone().unwrap_or_default(),
+                    parse_example_crate_types(&example.crate_type)?,
                 ));
             }
         }
-        if package.autoexamples.unwrap_or(true)
-            && let Ok(entries) = fs::read_dir(pkg.dir.join("examples"))
-        {
-            let mut names: Vec<String> =
-                example_entries.iter().map(|(n, _, _)| n.clone()).collect();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "rs") {
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .to_owned();
-                    if !names.contains(&name) {
-                        example_entries.push((
-                            name.clone(),
-                            PathBuf::from(format!("examples/{name}.rs")),
-                            Vec::new(),
-                        ));
-                        names.push(name);
-                    }
+        if package.autoexamples.unwrap_or(true) {
+            let mut names: Vec<String> = example_entries
+                .iter()
+                .map(|(name, _, _, _)| name.clone())
+                .collect();
+            for (name, path) in discover_named_targets(&pkg.dir, "examples") {
+                if !names.contains(&name) {
+                    example_entries.push((name.clone(), path, Vec::new(), Vec::new()));
+                    names.push(name);
                 }
             }
         }
-        for (name, path, required_features) in example_entries {
+        for (name, path, required_features, crate_types) in example_entries {
             pkg.examples.push(crate::model::ExampleTarget {
                 name: name.clone(),
                 crate_name: crate_name(&name),
                 path,
                 required_features,
+                crate_types,
             });
         }
 
@@ -1178,23 +1246,21 @@ fn import_package(
                     required_features: target.required_features.clone().unwrap_or_default(),
                 });
             }
-            // Auto-discovery: `tests/*.rs` / `benches/*.rs` when no
-            // explicit entries exist (Cargo conventions).
-            if entry.is_empty()
-                && auto
-                && let Ok(entries) = fs::read_dir(pkg.dir.join(default_dir))
-            {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "rs") {
-                        let name = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                            .to_owned();
+            // Explicit targets do not suppress other auto-discovered
+            // files. They only override an automatic target of the same
+            // name.
+            if auto {
+                let mut names: BTreeSet<String> = pkg
+                    .tests
+                    .iter()
+                    .filter(|target| target.bench == (kind == "bench"))
+                    .map(|target| target.name.clone())
+                    .collect();
+                for (name, path) in discover_named_targets(&pkg.dir, default_dir) {
+                    if names.insert(name.clone()) {
                         pkg.tests.push(TestTarget {
-                            name: name.clone(),
-                            path: PathBuf::from(format!("{default_dir}/{name}.rs")),
+                            name,
+                            path,
                             bench: kind == "bench",
                             harness: true,
                             doc: false,
@@ -1412,6 +1478,129 @@ fn resolve_field(
             dir.display()
         ))),
     }
+}
+
+fn resolve_optional_field(
+    field: &Option<Field>,
+    inherited: Option<&String>,
+    package_name: &str,
+    what: &str,
+    dir: &Path,
+) -> Result<Option<String>, CargoImportError> {
+    match field {
+        None => Ok(None),
+        Some(Field::Value(value)) => Ok(Some(value.clone())),
+        Some(Field::Inherit { workspace: true }) => inherited.cloned().map(Some).ok_or_else(|| {
+            CargoImportError::Unsupported(format!(
+                "package {package_name:?} in {} inherits {what} from \
+                 [workspace.package], which defines none",
+                dir.display()
+            ))
+        }),
+        Some(Field::Inherit { workspace: false }) => Err(CargoImportError::Unsupported(format!(
+            "package {package_name:?} in {} sets {what}.workspace = false",
+            dir.display()
+        ))),
+    }
+}
+
+fn readme_value(value: &ReadmeValue) -> Option<String> {
+    match value {
+        ReadmeValue::Flag(true) => Some("README.md".to_owned()),
+        ReadmeValue::Flag(false) => None,
+        ReadmeValue::Value(path) => Some(path.clone()),
+    }
+}
+
+fn resolve_package_metadata(
+    package: &CargoPackage,
+    workspace: Option<&CargoWorkspacePackage>,
+    dir: &Path,
+) -> Result<crate::model::PackageMetadata, CargoImportError> {
+    let inherited = |field: fn(&CargoWorkspacePackage) -> &Option<String>| {
+        workspace.and_then(|workspace| field(workspace).as_ref())
+    };
+    let optional = |field: &Option<Field>, value, what| {
+        resolve_optional_field(field, value, &package.name, what, dir)
+    };
+    let authors = match &package.authors {
+        None => Vec::new(),
+        Some(AuthorsField::Value(authors)) => authors.clone(),
+        Some(AuthorsField::Inherit { workspace: true }) => workspace
+            .and_then(|workspace| workspace.authors.clone())
+            .ok_or_else(|| {
+                CargoImportError::Unsupported(format!(
+                    "package {:?} in {} inherits authors from [workspace.package], \
+                     which defines none",
+                    package.name,
+                    dir.display()
+                ))
+            })?,
+        Some(AuthorsField::Inherit { workspace: false }) => {
+            return Err(CargoImportError::Unsupported(format!(
+                "package {:?} in {} sets authors.workspace = false",
+                package.name,
+                dir.display()
+            )));
+        }
+    };
+    let readme = match &package.readme {
+        Some(ReadmeField::Flag(flag)) => readme_value(&ReadmeValue::Flag(*flag)),
+        Some(ReadmeField::Value(path)) => Some(path.clone()),
+        Some(ReadmeField::Inherit { workspace: true }) => workspace
+            .and_then(|workspace| workspace.readme.as_ref())
+            .and_then(readme_value),
+        Some(ReadmeField::Inherit { workspace: false }) => {
+            return Err(CargoImportError::Unsupported(format!(
+                "package {:?} in {} sets readme.workspace = false",
+                package.name,
+                dir.display()
+            )));
+        }
+        None => ["README.md", "README.txt", "README"]
+            .into_iter()
+            .find(|name| dir.join(name).is_file())
+            .map(str::to_owned),
+    };
+    Ok(crate::model::PackageMetadata {
+        authors,
+        description: optional(
+            &package.description,
+            inherited(|workspace| &workspace.description),
+            "description",
+        )?,
+        documentation: optional(
+            &package.documentation,
+            inherited(|workspace| &workspace.documentation),
+            "documentation",
+        )?,
+        homepage: optional(
+            &package.homepage,
+            inherited(|workspace| &workspace.homepage),
+            "homepage",
+        )?,
+        repository: optional(
+            &package.repository,
+            inherited(|workspace| &workspace.repository),
+            "repository",
+        )?,
+        license: optional(
+            &package.license,
+            inherited(|workspace| &workspace.license),
+            "license",
+        )?,
+        license_file: optional(
+            &package.license_file,
+            inherited(|workspace| &workspace.license_file),
+            "license-file",
+        )?,
+        readme,
+        rust_version: optional(
+            &package.rust_version,
+            inherited(|workspace| &workspace.rust_version),
+            "rust-version",
+        )?,
+    })
 }
 
 /// A resolved dependency: the crate name used at the use site, the
@@ -2057,6 +2246,46 @@ fn parse_crate_types(types: &[String]) -> Result<Vec<crate::model::CrateType>, C
     Ok(out)
 }
 
+fn discover_named_targets(package_dir: &Path, relative_dir: &str) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(package_dir.join(relative_dir)) else {
+        return Vec::new();
+    };
+    let mut discovered = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
+                discovered.push((
+                    name.to_owned(),
+                    PathBuf::from(format!("{relative_dir}/{name}.rs")),
+                ));
+            }
+        } else if path.is_dir()
+            && path.join("main.rs").is_file()
+            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+        {
+            discovered.push((
+                name.to_owned(),
+                PathBuf::from(format!("{relative_dir}/{name}/main.rs")),
+            ));
+        }
+    }
+    discovered.sort();
+    discovered
+}
+
+fn parse_example_crate_types(types: &[String]) -> Result<Vec<String>, CargoImportError> {
+    types
+        .iter()
+        .map(|kind| match kind.as_str() {
+            "bin" | "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" => Ok(kind.clone()),
+            other => Err(CargoImportError::Unsupported(format!(
+                "example crate-type {other:?}"
+            ))),
+        })
+        .collect()
+}
+
 fn parse_edition(text: &str) -> Result<Edition, CargoImportError> {
     match text {
         "2015" => Ok(Edition::E2015),
@@ -2250,7 +2479,7 @@ fn resolve_profile_chain(
                 merged.debug_assertions = Some(value);
             }
             if let Some(value) = &override_table.strip {
-                merged.strip = Some(value.clone());
+                merged.strip = Some(resolve_strip(value, name)?);
             }
             if let Some(value) = override_table.rpath {
                 merged.rpath = Some(value);
@@ -2364,15 +2593,7 @@ fn resolve_profile_chain(
         spec.debug_assertions = Some(assertions);
     }
     if let Some(strip) = &table.strip {
-        match strip.as_str() {
-            "none" | "debuginfo" | "symbols" => spec.strip = Some(strip.clone()),
-            other => {
-                return Err(CargoImportError::Unsupported(format!(
-                    "profile {name:?} strip = {other:?}; expected \"none\", \
-                     \"debuginfo\", or \"symbols\""
-                )));
-            }
-        }
+        spec.strip = Some(resolve_strip(strip, name)?);
     }
     if let Some(rpath) = table.rpath {
         spec.rpath = Some(rpath);
@@ -2389,6 +2610,20 @@ fn resolve_profile_chain(
         }
     }
     Ok(spec)
+}
+
+fn resolve_strip(value: &StripValue, profile: &str) -> Result<String, CargoImportError> {
+    match value {
+        StripValue::Bool(true) => Ok("symbols".to_owned()),
+        StripValue::Bool(false) => Ok("none".to_owned()),
+        StripValue::Str(value) if matches!(value.as_str(), "none" | "debuginfo" | "symbols") => {
+            Ok(value.clone())
+        }
+        StripValue::Str(other) => Err(CargoImportError::Unsupported(format!(
+            "profile {profile:?} strip = {other:?}; expected true, false, \
+             \"none\", \"debuginfo\", or \"symbols\""
+        ))),
+    }
 }
 
 /// Loads the root-local cargo config: `.cargo/config.toml` preferred,
@@ -2692,6 +2927,12 @@ resolver = "2"
 [workspace.package]
 version = "1.2.3"
 edition = "2021"
+authors = ["Ada <ada@example.com>"]
+description = "workspace description"
+repository = "https://example.com/repo"
+license = "MIT"
+readme = "README.md"
+rust-version = "1.85"
 "#,
             ),
             (
@@ -2701,9 +2942,16 @@ edition = "2021"
 name = "app"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
 "#,
             ),
             ("app/src/lib.rs", ""),
+            ("app/README.md", "# App"),
         ]);
         let model = import_cargo_workspace(
             &dir.path().join("ws"),
@@ -2715,6 +2963,18 @@ edition.workspace = true
         let app = model.packages.iter().find(|p| p.name == "app").unwrap();
         assert_eq!(app.version, "1.2.3");
         assert_eq!(app.edition, Edition::E2021);
+        assert_eq!(app.metadata.authors, ["Ada <ada@example.com>"]);
+        assert_eq!(
+            app.metadata.description.as_deref(),
+            Some("workspace description")
+        );
+        assert_eq!(
+            app.metadata.repository.as_deref(),
+            Some("https://example.com/repo")
+        );
+        assert_eq!(app.metadata.license.as_deref(), Some("MIT"));
+        assert_eq!(app.metadata.readme.as_deref(), Some("README.md"));
+        assert_eq!(app.metadata.rust_version.as_deref(), Some("1.85"));
     }
 
     #[test]
@@ -2935,6 +3195,7 @@ lto = "thin"
 panic = "abort"
 codegen-units = 4
 overflow-checks = false
+strip = true
 "#,
             ),
             ("src/main.rs", "fn main() {}"),
@@ -2952,9 +3213,50 @@ overflow-checks = false
         assert_eq!(release.panic, PanicStrategy::Abort);
         assert_eq!(release.codegen_units, Some(4));
         assert_eq!(release.overflow_checks, Some(false));
+        assert_eq!(release.strip.as_deref(), Some("symbols"));
         // New parity keys map through.
         assert_eq!(release.debug_assertions, Some(false));
         assert_eq!(release.rpath, None);
+    }
+
+    #[test]
+    fn explicit_targets_do_not_disable_autodiscovery() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[[test]]
+name = "configured"
+path = "tests/configured.rs"
+"#,
+            ),
+            ("src/lib.rs", ""),
+            ("tests/configured.rs", ""),
+            ("tests/automatic.rs", ""),
+            ("tests/nested/main.rs", ""),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        let package = model.packages.first().unwrap();
+        let names: BTreeSet<&str> = package
+            .tests
+            .iter()
+            .map(|test| test.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["app", "automatic", "configured", "nested"])
+        );
     }
 
     #[test]

@@ -385,6 +385,7 @@ impl PackageSeed {
             dir: self.dir,
             version: self.version,
             edition: self.edition.unwrap_or(Edition::E2021),
+            metadata: tong_rust::PackageMetadata::default(),
             lib: self.lib,
             bins: self.bins,
             examples: Vec::new(),

@@ -1147,23 +1147,39 @@ impl<'a> RustBackend<'a> {
                     },
                 );
             }
-            self.plan_compile(
-                actions,
-                &format!("example:{}:{}", self.pkg_key(pkg), example.name),
-                &format!("rust:example:{}:{}", self.pkg_label(pkg), example.name),
-                "RustExample",
-                pkg,
-                source_tree,
-                cc.clone(),
-                example.crate_name.clone(),
-                "bin",
-                Some(example.name.clone()),
-                &deps,
-                bs_run.clone(),
-                self.crate_root_for(&pkg.id, &example.path),
-                false,
-                true,
-            )?;
+            let crate_types: Vec<&str> = if example.crate_types.is_empty() {
+                vec!["bin"]
+            } else {
+                example.crate_types.iter().map(String::as_str).collect()
+            };
+            for crate_type in crate_types {
+                let suffix = if example.crate_types.len() > 1 {
+                    format!(":{crate_type}")
+                } else {
+                    String::new()
+                };
+                self.plan_compile(
+                    actions,
+                    &format!("example:{}:{}{suffix}", self.pkg_key(pkg), example.name),
+                    &format!(
+                        "rust:example:{}:{}{suffix}",
+                        self.pkg_label(pkg),
+                        example.name
+                    ),
+                    "RustExample",
+                    pkg,
+                    source_tree,
+                    cc.clone(),
+                    example.crate_name.clone(),
+                    crate_type,
+                    (crate_type == "bin").then(|| example.name.clone()),
+                    &deps,
+                    bs_run.clone(),
+                    self.crate_root_for(&pkg.id, &example.path),
+                    false,
+                    true,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1304,7 +1320,7 @@ impl<'a> RustBackend<'a> {
                 dll_extension()
             } else {
                 match crate_type {
-                    "rlib" => "rlib",
+                    "lib" | "rlib" => "rlib",
                     "staticlib" => "a",
                     _ => dll_extension(),
                 }

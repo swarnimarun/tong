@@ -363,6 +363,9 @@ pub struct Package {
     pub version: String,
     /// Rust edition.
     pub edition: Edition,
+    /// Descriptive package fields Cargo exposes to compilation through
+    /// `CARGO_PKG_*` variables and metadata output.
+    pub metadata: PackageMetadata,
     /// Library target, if any (or proc macro).
     pub lib: Option<LibTarget>,
     /// Binary targets.
@@ -398,6 +401,30 @@ pub struct Package {
     pub rustflags: Vec<String>,
     /// Extra per-package environment.
     pub env: BTreeMap<String, String>,
+}
+
+/// Cargo package metadata that affects compiler/build-script environment
+/// or Cargo-compatible metadata output.
+#[derive(Clone, Debug, Default)]
+pub struct PackageMetadata {
+    /// Package authors in manifest order.
+    pub authors: Vec<String>,
+    /// Package description.
+    pub description: Option<String>,
+    /// Documentation URL.
+    pub documentation: Option<String>,
+    /// Homepage URL.
+    pub homepage: Option<String>,
+    /// Source repository URL.
+    pub repository: Option<String>,
+    /// SPDX license expression.
+    pub license: Option<String>,
+    /// Package-relative license file.
+    pub license_file: Option<String>,
+    /// Package-relative README file.
+    pub readme: Option<String>,
+    /// Declared minimum supported Rust version.
+    pub rust_version: Option<String>,
 }
 
 /// Rust edition.
@@ -463,6 +490,9 @@ pub struct ExampleTarget {
     pub path: PathBuf,
     /// Features that must all be active for this target to build.
     pub required_features: Vec<String>,
+    /// Rust crate types requested by `[[example]].crate-type`; empty means
+    /// Cargo's default binary example.
+    pub crate_types: Vec<String>,
 }
 
 /// A test target (`[[test]]`, `[[bench]]`, or the auto-derived lib unit
@@ -746,6 +776,7 @@ mod tests {
             dir: PathBuf::from("."),
             version: "0.1.0".to_owned(),
             edition: Edition::E2021,
+            metadata: PackageMetadata::default(),
             lib: None,
             bins: Vec::new(),
             examples: Vec::new(),
