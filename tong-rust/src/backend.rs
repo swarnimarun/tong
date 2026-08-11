@@ -2136,18 +2136,13 @@ impl<'a> RustBackend<'a> {
                 } else {
                     lib.crate_types.clone()
                 };
-                let chosen = *types
-                    .iter()
-                    .find(|t| **t == CrateType::Rlib)
-                    .or_else(|| types.iter().find(|t| **t == CrateType::Staticlib))
-                    .or_else(|| types.iter().find(|t| **t == CrateType::Cdylib))
-                    .or_else(|| types.iter().find(|t| **t == CrateType::Dylib))
-                    .ok_or_else(|| {
-                        PlanError::Message(format!(
-                            "cannot link dependency {:?}: no linkable crate type",
-                            pkg.name
-                        ))
-                    })?;
+                let chosen = dependency_crate_type(&types).ok_or_else(|| {
+                    PlanError::Message(format!(
+                        "cannot link dependency {:?}: its library target has no Rust \
+                             rlib or dylib crate type",
+                        pkg.name
+                    ))
+                })?;
                 let ext = match chosen {
                     CrateType::Rlib => "rlib",
                     CrateType::Staticlib => "a",
@@ -3142,6 +3137,19 @@ fn remap_build_output_path(value: &str, output_mount: &str) -> String {
     value.to_owned()
 }
 
+fn dependency_crate_type(types: &[CrateType]) -> Option<CrateType> {
+    types
+        .iter()
+        .copied()
+        .find(|crate_type| *crate_type == CrateType::Rlib)
+        .or_else(|| {
+            types
+                .iter()
+                .copied()
+                .find(|crate_type| *crate_type == CrateType::Dylib)
+        })
+}
+
 fn link_search_arg(value: &str, output_mount: Option<&str>) -> String {
     // Relative search paths resolve against the package root (the input
     // root, where the source tree is mounted at "."); absolute paths pass
@@ -3209,5 +3217,22 @@ mod tests {
 
         assert_eq!(args, ["-l", "native"]);
         assert!(!env.contains_key("PRIVATE"));
+    }
+
+    #[test]
+    fn rust_dependencies_require_a_metadata_bearing_crate_type() {
+        assert_eq!(
+            dependency_crate_type(&[
+                CrateType::Staticlib,
+                CrateType::Cdylib,
+                CrateType::Dylib,
+                CrateType::Rlib,
+            ]),
+            Some(CrateType::Rlib)
+        );
+        assert_eq!(
+            dependency_crate_type(&[CrateType::Staticlib, CrateType::Cdylib]),
+            None
+        );
     }
 }

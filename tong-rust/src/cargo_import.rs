@@ -2327,11 +2327,11 @@ fn parse_crate_types(types: &[String]) -> Result<Vec<crate::model::CrateType>, C
     let mut out = Vec::new();
     for kind in types {
         let crate_type = match kind.as_str() {
-            "rlib" => crate::model::CrateType::Rlib,
+            "lib" | "rlib" => crate::model::CrateType::Rlib,
             "cdylib" => crate::model::CrateType::Cdylib,
             "staticlib" => crate::model::CrateType::Staticlib,
             "dylib" => crate::model::CrateType::Dylib,
-            "lib" | "bin" => continue,
+            "bin" => continue,
             other => {
                 return Err(CargoImportError::Unsupported(format!(
                     "crate-type {other:?}"
@@ -3233,6 +3233,40 @@ resolver = "2"
         assert_eq!(
             app.build_script.as_deref(),
             Some(std::path::Path::new("build.rs"))
+        );
+    }
+
+    #[test]
+    fn imports_lib_crate_type_as_rlib() {
+        let dir = write_tree(&[
+            (
+                "Cargo.toml",
+                r#"
+[package]
+name = "multi-output-lib"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+"#,
+            ),
+            ("src/lib.rs", "pub fn value() -> u32 { 42 }"),
+        ]);
+        let model = import_cargo_workspace(
+            &dir.path().join("ws"),
+            "aarch64-apple-darwin",
+            &NO_LOCK,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            model.packages[0].lib.as_ref().unwrap().crate_types,
+            [
+                crate::model::CrateType::Rlib,
+                crate::model::CrateType::Cdylib,
+                crate::model::CrateType::Staticlib,
+            ]
         );
     }
 
