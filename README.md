@@ -121,6 +121,20 @@ The default Cargo-import path is currently compatibility-oriented. Strong
 build-script and proc-macro permission auditing/enforcement is planned as an
 opt-in hermetic mode; see [permissions](docs/permissions.md).
 
+### Reclaiming cache space
+
+Tong normally retains recently superseded cache objects for a grace period.
+To remove every object that the latest successful build no longer references,
+run this from the workspace:
+
+```sh
+tong gc --older-than 0
+```
+
+This keeps the current build's cached actions, dependencies, and materialized
+artifact closure. It only removes unreferenced objects, so the store will not
+shrink below the space required to reuse the latest successful build.
+
 ## Implemented now
 
 The current repository includes:
