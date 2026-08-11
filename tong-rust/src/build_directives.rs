@@ -5,17 +5,20 @@
 //! `cargo:` and namespaced `cargo::` spellings are accepted for the known
 //! directives. Any other `cargo::key=value` line is a script failure
 //! (Cargo errors too); a legacy `cargo:KEY=VALUE` line whose key is not a
-//! known directive is the metadata form — the pair is exposed as an
-//! environment variable to the package's dependents.
+//! known directive is the legacy metadata form — the pair is exposed as an
+//! environment variable to the package's dependents. The namespaced form is
+//! `cargo::metadata=KEY=VALUE`.
 
 /// A parsed set of build-script directives.
 #[derive(Clone, Debug, Default)]
 pub struct Directives {
     /// `cargo:rustc-cfg=...` — cfg flags.
     pub cfgs: Vec<String>,
-    /// `cargo:rustc-env=K=V` and metadata `cargo:K=V` — environment for
-    /// dependents.
+    /// `cargo:rustc-env=K=V` — environment for this package's compilation.
     pub env: Vec<(String, String)>,
+    /// `cargo::metadata=K=V` or legacy `cargo:K=V` — metadata exported to
+    /// direct dependents when this package declares `links`.
+    pub metadata: Vec<(String, String)>,
     /// `cargo:rustc-link-lib=...` — native libraries, with an optional
     /// kind prefix (`static:`, `dylib:`, `framework:`).
     pub link_libs: Vec<(Option<String>, String)>,
@@ -74,6 +77,15 @@ pub fn parse_directives(stdout: &str) -> Directives {
                     out.env.push((key.to_owned(), value.to_owned()));
                 }
             }
+            "metadata" => {
+                if let Some((key, value)) = value.split_once('=') {
+                    out.metadata.push((key.to_owned(), value.to_owned()));
+                } else {
+                    out.errors.push(
+                        "build-script directive `cargo::metadata` requires `KEY=VALUE`".to_owned(),
+                    );
+                }
+            }
             "rustc-link-lib" => out.link_libs.push(parse_link_lib(value)),
             "rustc-link-search" => out.link_search.push(value.to_owned()),
             "rustc-flags" => {
@@ -103,7 +115,7 @@ pub fn parse_directives(stdout: &str) -> Directives {
             _ => {
                 // Legacy `cargo:KEY=VALUE` with an unknown key is the
                 // metadata form: an env pair for dependents.
-                out.env.push((key.to_owned(), value.to_owned()));
+                out.metadata.push((key.to_owned(), value.to_owned()));
             }
         }
     }
@@ -152,6 +164,7 @@ mod tests {
              cargo::rustc-link-arg-examples=-E\n\
              cargo::rustc-cdylib-link-arg=-Wl,-install_name\n\
              cargo::rustc-metadata=abc\n\
+             cargo::metadata=DEP_KEY=dep-value\n\
              cargo::rustc-check-cfg=cfg(feature, values(\"a\"))\n\
              cargo:rerun-if-changed=build.rs\n\
              cargo:rerun-if-env-changed=CARGO_FOO\n\
@@ -160,6 +173,10 @@ mod tests {
         );
         assert_eq!(directives.cfgs, vec!["feature=\"x\""]);
         assert_eq!(directives.env, vec![("KEY".to_owned(), "value".to_owned())]);
+        assert_eq!(
+            directives.metadata,
+            vec![("DEP_KEY".to_owned(), "dep-value".to_owned())]
+        );
         assert_eq!(
             directives.link_libs,
             vec![
@@ -184,15 +201,26 @@ mod tests {
 
     #[test]
     fn metadata_keys_become_dependent_env() {
-        let directives = parse_directives("cargo:FOO=bar\ncargo:BAZ=qux\n");
+        let directives = parse_directives(
+            "cargo:FOO=bar\ncargo:BAZ=qux\ncargo::metadata=MODERN=value=with=equals\n",
+        );
         assert_eq!(
-            directives.env,
+            directives.metadata,
             vec![
                 ("FOO".to_owned(), "bar".to_owned()),
                 ("BAZ".to_owned(), "qux".to_owned()),
+                ("MODERN".to_owned(), "value=with=equals".to_owned()),
             ]
         );
+        assert!(directives.env.is_empty());
         assert!(directives.errors.is_empty());
+    }
+
+    #[test]
+    fn malformed_namespaced_metadata_fails_the_script() {
+        let directives = parse_directives("cargo::metadata=missing-value\n");
+        assert_eq!(directives.errors.len(), 1);
+        assert!(directives.errors[0].contains("KEY=VALUE"));
     }
 
     #[test]

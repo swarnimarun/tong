@@ -55,7 +55,7 @@ fn fixture() -> tempfile::TempDir {
             ),
             (
                 "crates/native-lib/build.rs",
-                "fn main() {\n    assert_eq!(std::env::var(\"CARGO_MANIFEST_LINKS\").unwrap(), \"native_lib\");\n    assert!(std::env::var(\"CARGO_MANIFEST_PATH\").unwrap().ends_with(\"Cargo.toml\"));\n    assert_eq!(std::env::var(\"TARGET\").unwrap(), std::env::var(\"HOST\").unwrap());\n    assert_eq!(std::env::var(\"CARGO_CFG_TARGET_ENDIAN\").unwrap(), \"little\");\n    let generated = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").unwrap()).join(\"generated.rs\");\n    std::fs::write(&generated, \"pub const GENERATED: u32 = 7;\\n\").unwrap();\n    println!(\"cargo:rustc-env=NATIVE_GENERATED={}\", generated.display());\n    println!(\"cargo:MYKEY=from_native_lib\");\n}\n",
+                "fn main() {\n    assert_eq!(std::env::var(\"CARGO_MANIFEST_LINKS\").unwrap(), \"native_lib\");\n    assert!(std::env::var(\"CARGO_MANIFEST_PATH\").unwrap().ends_with(\"Cargo.toml\"));\n    assert_eq!(std::env::var(\"TARGET\").unwrap(), std::env::var(\"HOST\").unwrap());\n    assert_eq!(std::env::var(\"CARGO_CFG_TARGET_ENDIAN\").unwrap(), \"little\");\n    let generated = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").unwrap()).join(\"generated.rs\");\n    std::fs::write(&generated, \"pub const GENERATED: u32 = 7;\\n\").unwrap();\n    println!(\"cargo:rustc-env=NATIVE_GENERATED={}\", generated.display());\n    println!(\"cargo::metadata=MYKEY=from_native_lib\");\n}\n",
             ),
             (
                 "crates/native-lib/src/lib.rs",

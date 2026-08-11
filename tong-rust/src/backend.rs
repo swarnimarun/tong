@@ -2632,7 +2632,7 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                 let bytes = cas.read_blob(stdout)?;
                 let directives = parse_directives(&String::from_utf8_lossy(&bytes));
                 let prefix = format!("DEP_{}_", links.to_ascii_uppercase().replace('-', "_"));
-                for (key, value) in &directives.env {
+                for (key, value) in &directives.metadata {
                     env.insert(
                         format!("{prefix}{}", key.to_ascii_uppercase().replace('-', "_")),
                         value.clone(),
