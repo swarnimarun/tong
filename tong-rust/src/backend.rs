@@ -135,6 +135,9 @@ struct CompileSpec {
     primary: bool,
     /// `--check` build: rustc emits metadata only.
     check: bool,
+    /// Package binaries exposed to integration tests as
+    /// `CARGO_BIN_EXE_<target>`.
+    bin_env: Vec<(String, ActionId, String)>,
 }
 
 struct BuildScriptRunSpec {
@@ -146,13 +149,17 @@ struct BuildScriptRunSpec {
     pkg_name: String,
     pkg_version: String,
     host_triple: String,
+    target_triple: String,
     opt_level: String,
     debug: bool,
     /// The real rustc path (build scripts expect `$RUSTC`, cargo sets it).
     rustc_path: PathBuf,
+    rustdoc_path: PathBuf,
+    encoded_rustflags: String,
+    links: Option<String>,
     /// Profile name (`$PROFILE`).
     profile: String,
-    /// `CARGO_CFG_*` values computed from the host triple.
+    /// `CARGO_CFG_*` values computed from the configured target triple.
     cfgs: Vec<(String, String)>,
     /// The package's activated features (`CARGO_FEATURE_*`).
     features: Vec<String>,
@@ -172,6 +179,9 @@ struct TestRunSpec {
     deps: Vec<DepSpec>,
     crate_root: PathBuf,
     edition: Edition,
+    /// Package binary actions mounted at the same relative paths embedded
+    /// by `CARGO_BIN_EXE_*` during integration-test compilation.
+    bin_env: Vec<(String, ActionId, String)>,
 }
 
 /// The Rust backend: plans actions from a [`RustModel`].
@@ -602,13 +612,14 @@ impl<'a> RustBackend<'a> {
                     deps: Vec::new(),
                     crate_root: PathBuf::new(),
                     edition: pkg.edition,
+                    bin_env: self.package_bin_env(pkg),
                 }),
                 source_tree,
                 rustc: self.toolchain.rustc_blob,
                 bundle: Some(self.toolchain.bundle_ref()),
                 properties: self.base_properties(),
                 global_env: self.model.global_env.clone(),
-                pkg_env: pkg.env.clone(),
+                pkg_env: self.pkg_cargo_env(pkg),
                 cc: Vec::new(),
                 profile_flags: Vec::new(),
                 network_allow: self.network_allow,
@@ -687,13 +698,19 @@ impl<'a> RustBackend<'a> {
                 deps: dep_specs,
                 crate_root: self.crate_root_for(&pkg.id, &target.path),
                 edition: pkg.edition,
+                bin_env: self.package_bin_env(pkg),
             }),
             source_tree,
             rustc: rustdoc_blob,
             bundle: Some(self.toolchain.bundle_ref()),
             properties: self.base_properties(),
             global_env: self.model.global_env.clone(),
-            pkg_env: pkg.env.clone(),
+            pkg_env: {
+                let mut env = self.pkg_cargo_env(pkg);
+                env.insert("CARGO_CRATE_NAME".to_owned(), lib_crate_name(pkg));
+                env.insert("CARGO_PRIMARY_PACKAGE".to_owned(), "1".to_owned());
+                env
+            },
             cc: Vec::new(),
             profile_flags: Vec::new(),
             network_allow: self.network_allow,
@@ -964,11 +981,33 @@ impl<'a> RustBackend<'a> {
                     pkg_name: pkg.name.clone(),
                     pkg_version: pkg.version.clone(),
                     host_triple: self.toolchain.host_triple.clone(),
-                    opt_level: self.profile.opt_level.clone(),
-                    debug: self.profile.debug,
+                    target_triple: self
+                        .target_triple
+                        .clone()
+                        .unwrap_or_else(|| self.toolchain.host_triple.clone()),
+                    opt_level: self.effective_profile(&pkg.name).opt_level.clone(),
+                    debug: self.effective_profile(&pkg.name).debug,
                     rustc_path: self.toolchain.rustc.clone(),
+                    rustdoc_path: self
+                        .toolchain
+                        .rustdoc
+                        .clone()
+                        .unwrap_or_else(|| self.toolchain.rustc.with_file_name("rustdoc")),
+                    encoded_rustflags: self
+                        .model
+                        .global_rustflags
+                        .iter()
+                        .chain(pkg.rustflags.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}"),
+                    links: pkg.links.clone(),
                     profile: self.profile_name.clone(),
-                    cfgs: build_script_cfgs(&self.toolchain.host_triple),
+                    cfgs: build_script_cfgs(
+                        self.target_triple
+                            .as_deref()
+                            .unwrap_or(&self.toolchain.host_triple),
+                    ),
                     features: self
                         .model
                         .feature_map
@@ -983,10 +1022,10 @@ impl<'a> RustBackend<'a> {
                 properties: self.base_properties(),
                 global_env: self.model.global_env.clone(),
                 pkg_env: {
-                    let mut env = pkg.env.clone();
-                    env.insert("CARGO_PKG_NAME".to_owned(), pkg.name.clone());
-                    env.insert("CARGO_PKG_VERSION".to_owned(), pkg.version.clone());
-                    env.extend(self.pkg_version_env(pkg));
+                    let mut env = self.pkg_cargo_env(pkg);
+                    if self.is_member(pkg) {
+                        env.insert("CARGO_PRIMARY_PACKAGE".to_owned(), "1".to_owned());
+                    }
                     env.extend(run_env);
                     env
                 },
@@ -1333,6 +1372,11 @@ impl<'a> RustBackend<'a> {
         // output tree must be mounted at `deps/` (Cargo puts all rlibs in
         // one directory). Scheduling waits for all of them.
         let transitive_deps = self.transitive_dep_specs(&pkg.id, deps)?;
+        let bin_env = if mnemonic == "RustTestCompile" {
+            self.package_bin_env(pkg)
+        } else {
+            Vec::new()
+        };
         // Per-crate feature cfgs: `--cfg feature="<name>"` for every
         // activated feature (sorted), mirroring Cargo.
         let feature_cfgs: Vec<String> = unit
@@ -1376,19 +1420,14 @@ impl<'a> RustBackend<'a> {
                 host_unit,
                 primary: !self.pkg_external(pkg),
                 check,
+                bin_env,
             }),
             source_tree,
             rustc: self.toolchain.rustc_blob,
             bundle: Some(self.toolchain.bundle_ref()),
             properties: self.base_properties(),
             global_env: self.model.global_env.clone(),
-            pkg_env: {
-                let mut env = pkg.env.clone();
-                env.insert("CARGO_PKG_NAME".to_owned(), pkg.name.clone());
-                env.insert("CARGO_PKG_VERSION".to_owned(), pkg.version.clone());
-                env.extend(self.pkg_version_env(pkg));
-                env
-            },
+            pkg_env: self.pkg_cargo_env(pkg),
             cc,
             profile_flags: profile_flags.clone(),
             network_allow: self.network_allow,
@@ -1409,6 +1448,19 @@ impl<'a> RustBackend<'a> {
         }
         let active = self.model.feature_map.features_for(&pkg.id, false);
         required.iter().all(|feature| active.contains(feature))
+    }
+
+    fn package_bin_env(&self, pkg: &Package) -> Vec<(String, ActionId, String)> {
+        pkg.bins
+            .iter()
+            .filter(|bin| self.required_features_active(pkg, &bin.required_features))
+            .filter_map(|bin| {
+                self.planned_ids
+                    .get(&format!("bin:{}:{}", self.pkg_key(pkg), bin.name))
+                    .cloned()
+                    .map(|action| (bin.name.clone(), action, bin.name.clone()))
+            })
+            .collect()
     }
 
     /// Whether a package belongs to the workspace (`model.members`);
@@ -1475,26 +1527,55 @@ impl<'a> RustBackend<'a> {
         }
     }
 
-    /// `CARGO_PKG_VERSION_*` env vars (crates use `env!` at compile time).
-    fn pkg_version_env(&self, pkg: &Package) -> Vec<(String, String)> {
-        let Ok(version) = semver::Version::parse(&pkg.version) else {
-            return Vec::new();
-        };
-        vec![
+    /// Cargo package variables are always defined; absent manifest values
+    /// become empty strings so `env!` behaves exactly as under Cargo.
+    fn pkg_cargo_env(&self, pkg: &Package) -> BTreeMap<String, String> {
+        let mut env = pkg.env.clone();
+        env.insert("CARGO_PKG_NAME".to_owned(), pkg.name.clone());
+        env.insert("CARGO_PKG_VERSION".to_owned(), pkg.version.clone());
+        env.insert(
+            "CARGO_PKG_AUTHORS".to_owned(),
+            pkg.metadata.authors.join(":"),
+        );
+        for (key, value) in [
+            ("CARGO_PKG_DESCRIPTION", pkg.metadata.description.as_deref()),
+            ("CARGO_PKG_HOMEPAGE", pkg.metadata.homepage.as_deref()),
+            ("CARGO_PKG_REPOSITORY", pkg.metadata.repository.as_deref()),
+            ("CARGO_PKG_LICENSE", pkg.metadata.license.as_deref()),
             (
-                "CARGO_PKG_VERSION_MAJOR".to_owned(),
-                version.major.to_string(),
+                "CARGO_PKG_RUST_VERSION",
+                pkg.metadata.rust_version.as_deref(),
             ),
-            (
-                "CARGO_PKG_VERSION_MINOR".to_owned(),
-                version.minor.to_string(),
-            ),
-            (
-                "CARGO_PKG_VERSION_PATCH".to_owned(),
-                version.patch.to_string(),
-            ),
-            ("CARGO_PKG_VERSION_PRE".to_owned(), version.pre.to_string()),
-        ]
+            ("CARGO_PKG_README", pkg.metadata.readme.as_deref()),
+        ] {
+            env.insert(key.to_owned(), value.unwrap_or_default().to_owned());
+        }
+        env.insert(
+            "CARGO_PKG_LICENSE_FILE".to_owned(),
+            pkg.metadata
+                .license_file
+                .as_deref()
+                .map(|path| format!("{EXEC_ROOT_VAR}/in/{path}"))
+                .unwrap_or_default(),
+        );
+        if let Ok(version) = semver::Version::parse(&pkg.version) {
+            env.extend([
+                (
+                    "CARGO_PKG_VERSION_MAJOR".to_owned(),
+                    version.major.to_string(),
+                ),
+                (
+                    "CARGO_PKG_VERSION_MINOR".to_owned(),
+                    version.minor.to_string(),
+                ),
+                (
+                    "CARGO_PKG_VERSION_PATCH".to_owned(),
+                    version.patch.to_string(),
+                ),
+                ("CARGO_PKG_VERSION_PRE".to_owned(), version.pre.to_string()),
+            ]);
+        }
+        env
     }
 
     fn boxed(&self, ctx: Ctx) -> PlannedAction {
@@ -1897,10 +1978,16 @@ impl Ctx {
                     DepSpec::Rust { action, .. } => Some(action.clone()),
                     DepSpec::Native => None,
                 })
+                .chain(spec.bin_env.iter().map(|(_, action, _)| action.clone()))
                 .chain(spec.build_script.clone())
                 .collect(),
-            CtxKind::BuildScriptRun(spec) => vec![spec.compile.clone()],
-            CtxKind::TestRun(spec) => vec![spec.compile.clone()],
+            CtxKind::BuildScriptRun(spec) => std::iter::once(spec.compile.clone())
+                .chain(spec.dep_links.iter().map(|(_, action)| action.clone()))
+                .collect(),
+            CtxKind::TestRun(spec) => std::iter::once(spec.compile.clone())
+                .filter(|action| !action.0.is_empty())
+                .chain(spec.bin_env.iter().map(|(_, action, _)| action.clone()))
+                .collect(),
         };
         deps.sort();
         deps.dedup();
@@ -2028,13 +2115,21 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             mounts.push((RelativePath::new(".").unwrap(), compile_output));
             env.extend([
                 ("OUT_DIR".to_owned(), format!("{EXEC_ROOT_VAR}/out")),
-                ("TARGET".to_owned(), spec.host_triple.clone()),
+                ("TARGET".to_owned(), spec.target_triple.clone()),
                 ("HOST".to_owned(), spec.host_triple.clone()),
                 ("OPT_LEVEL".to_owned(), spec.opt_level.clone()),
                 ("DEBUG".to_owned(), spec.debug.to_string()),
                 ("PROFILE".to_owned(), spec.profile.clone()),
                 ("NUM_JOBS".to_owned(), "1".to_owned()),
                 ("RUSTC".to_owned(), spec.rustc_path.display().to_string()),
+                (
+                    "RUSTDOC".to_owned(),
+                    spec.rustdoc_path.display().to_string(),
+                ),
+                (
+                    "CARGO_ENCODED_RUSTFLAGS".to_owned(),
+                    spec.encoded_rustflags.clone(),
+                ),
                 (
                     "CARGO".to_owned(),
                     std::env::current_exe()
@@ -2048,7 +2143,14 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                     "CARGO_MANIFEST_DIR".to_owned(),
                     format!("{EXEC_ROOT_VAR}/in"),
                 ),
+                (
+                    "CARGO_MANIFEST_PATH".to_owned(),
+                    format!("{EXEC_ROOT_VAR}/in/Cargo.toml"),
+                ),
             ]);
+            if let Some(links) = &spec.links {
+                env.insert("CARGO_MANIFEST_LINKS".to_owned(), links.clone());
+            }
             for (name, value) in &spec.cfgs {
                 env.insert(
                     format!("CARGO_CFG_{}", name.to_ascii_uppercase()),
@@ -2096,6 +2198,15 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
             }
         }
         CtxKind::TestRun(spec) => {
+            for (name, action, _) in &spec.bin_env {
+                let tree = completed
+                    .output_tree(action)
+                    .ok_or_else(|| PlanError::MissingDependency(action.clone()))?;
+                let mount = RelativePath::new(&format!("bin-exe/{name}")).map_err(|err| {
+                    PlanError::Message(format!("invalid binary name {name}: {err}"))
+                })?;
+                mounts.push((mount, tree));
+            }
             if spec.doc {
                 // Doc test: rustdoc compiles the crate from its root and
                 // runs the doctests; dependencies are linked like a
@@ -2166,6 +2277,23 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
                 "CARGO_MANIFEST_DIR".to_owned(),
                 format!("{EXEC_ROOT_VAR}/in"),
             );
+            env.insert(
+                "CARGO_MANIFEST_PATH".to_owned(),
+                format!("{EXEC_ROOT_VAR}/in/Cargo.toml"),
+            );
+            for (name, action, output) in &spec.bin_env {
+                let tree = completed
+                    .output_tree(action)
+                    .ok_or_else(|| PlanError::MissingDependency(action.clone()))?;
+                let mount = RelativePath::new(&format!("bin-exe/{name}")).map_err(|err| {
+                    PlanError::Message(format!("invalid binary name {name}: {err}"))
+                })?;
+                mounts.push((mount, tree));
+                env.insert(
+                    format!("CARGO_BIN_EXE_{name}"),
+                    format!("bin-exe/{name}/{output}"),
+                );
+            }
             for dep in &spec.deps {
                 match dep {
                     DepSpec::Rust {

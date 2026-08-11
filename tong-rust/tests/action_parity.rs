@@ -51,11 +51,11 @@ fn fixture() -> tempfile::TempDir {
             // app's build script reads as DEP_NATIVE_LIB_MYKEY.
             (
                 "crates/native-lib/Cargo.toml",
-                "[package]\nname = \"native-lib\"\nversion = \"1.2.3\"\nedition = \"2021\"\nlinks = \"native_lib\"\n",
+                "[package]\nname = \"native-lib\"\nversion = \"1.2.3\"\nedition = \"2021\"\nlinks = \"native_lib\"\nauthors = [\"Ada <ada@example.com>\"]\n",
             ),
             (
                 "crates/native-lib/build.rs",
-                "fn main() { println!(\"cargo:MYKEY=from_native_lib\"); }\n",
+                "fn main() {\n    assert_eq!(std::env::var(\"CARGO_MANIFEST_LINKS\").unwrap(), \"native_lib\");\n    assert!(std::env::var(\"CARGO_MANIFEST_PATH\").unwrap().ends_with(\"Cargo.toml\"));\n    assert_eq!(std::env::var(\"TARGET\").unwrap(), std::env::var(\"HOST\").unwrap());\n    println!(\"cargo:MYKEY=from_native_lib\");\n}\n",
             ),
             (
                 "crates/native-lib/src/lib.rs",
@@ -63,7 +63,7 @@ fn fixture() -> tempfile::TempDir {
             ),
             (
                 "crates/app/Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"4.5.6\"\nedition = \"2021\"\n\n[dependencies]\nnative-lib = { path = \"../native-lib\" }\n\n[features]\ndefault = []\ngated = []\n\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n\n[[example]]\nname = \"gated\"\npath = \"examples/gated.rs\"\nrequired-features = [\"gated\"]\n",
+                "[package]\nname = \"app\"\nversion = \"4.5.6-beta.1\"\nedition = \"2021\"\nauthors = [\"Ada\", \"Grace\"]\ndescription = \"environment fixture\"\nhomepage = \"https://example.com/app\"\nrepository = \"https://example.com/repo\"\nlicense = \"MIT\"\nlicense-file = \"LICENSE\"\nreadme = \"README.md\"\nrust-version = \"1.85\"\n\n[dependencies]\nnative-lib = { path = \"../native-lib\" }\n\n[features]\ndefault = []\ngated = []\n\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n\n[[example]]\nname = \"gated\"\npath = \"examples/gated.rs\"\nrequired-features = [\"gated\"]\n",
             ),
             // The app's build script reads the DEP_ variable; the binary
             // reads CARGO_ env vars at compile time.
@@ -73,7 +73,13 @@ fn fixture() -> tempfile::TempDir {
             ),
             (
                 "crates/app/src/main.rs",
-                "fn main() {\n    println!(\"dep={} ver={} pkg={}\", env!(\"DEP_VALUE\"), env!(\"MY_VERSION\"), env!(\"CARGO_PKG_NAME\"));\n}\n",
+                "fn main() {\n    assert_eq!(env!(\"CARGO_PKG_AUTHORS\"), \"Ada:Grace\");\n    assert_eq!(env!(\"CARGO_PKG_DESCRIPTION\"), \"environment fixture\");\n    assert_eq!(env!(\"CARGO_PKG_VERSION_PRE\"), \"beta.1\");\n    assert_eq!(env!(\"CARGO_PKG_RUST_VERSION\"), \"1.85\");\n    assert!(env!(\"CARGO_PKG_LICENSE_FILE\").ends_with(\"LICENSE\"));\n    println!(\"dep={} ver={} pkg={}\", env!(\"DEP_VALUE\"), env!(\"MY_VERSION\"), env!(\"CARGO_PKG_NAME\"));\n}\n",
+            ),
+            ("crates/app/LICENSE", "MIT\n"),
+            ("crates/app/README.md", "# App\n"),
+            (
+                "crates/app/tests/bin_env.rs",
+                "#[test]\nfn cargo_binary_is_available() {\n    assert!(std::path::Path::new(env!(\"CARGO_BIN_EXE_app\")).is_file());\n}\n",
             ),
             // A benchmark target.
             ("crates/app/benches/bench.rs", "fn main() {}\n"),
@@ -300,7 +306,7 @@ fn action_parity_host_and_target_units_separate() {
         false,
         false,
         false,
-        Some(host_triple()),
+        Some("wasm32-unknown-unknown".to_owned()),
     )
     .unwrap();
     let planned = backend.plan().unwrap();
@@ -334,6 +340,14 @@ fn action_parity_host_and_target_units_separate() {
             assert!(
                 !args.contains(&"--target"),
                 "host build-script run must not use --target: {args:?}"
+            );
+            assert_eq!(
+                spec.environment.get("TARGET").map(String::as_str),
+                Some("wasm32-unknown-unknown")
+            );
+            assert_eq!(
+                spec.environment.get("HOST").map(String::as_str),
+                Some(host_triple().as_str())
             );
         }
         if action.logical_id.0.starts_with("rust:bs-compile:") {
