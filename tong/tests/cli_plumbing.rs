@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn tong() -> &'static str {
     env!("CARGO_BIN_EXE_tong")
@@ -165,7 +165,23 @@ fn concurrent_workspace_build_waits_for_the_active_build() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    let lock_path = work.path().join(".tong/build.lock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            && matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first build never acquired its lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let second = run_tong(work.path(), &["build"]);
     let first = first.wait_with_output().unwrap();
 

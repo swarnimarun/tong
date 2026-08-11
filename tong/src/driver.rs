@@ -308,7 +308,19 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
         let t_action = std::time::Instant::now();
         let mut cache_source = "executed";
-        let cached = if cacheable && let Some(result) = cache.get(digest)? {
+        let cached_result = if cacheable {
+            match cache.get(digest)? {
+                Some(result) if result.is_complete(cas)? => Some(result),
+                Some(_) => {
+                    cache.remove(digest)?;
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let cached = if let Some(result) = cached_result {
             outcome.actions_cached += 1;
             cache_source = "cached";
             println!(
@@ -550,7 +562,19 @@ pub fn test(
         // every run re-executes (deterministic native tests opt into
         // caching via `cache_test_result = true`).
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
-        let cached = if cacheable && let Some(result) = cache.get(digest)? {
+        let cached_result = if cacheable {
+            match cache.get(digest)? {
+                Some(result) if result.is_complete(cas)? => Some(result),
+                Some(_) => {
+                    cache.remove(digest)?;
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let cached = if let Some(result) = cached_result {
             cache_source = "cached";
             println!(
                 "  [{}/{}] {} ({}) [cached]",

@@ -232,6 +232,30 @@ impl Cas {
         Ok(Some(tree))
     }
 
+    /// Returns whether a tree and its complete transitive blob/subtree
+    /// closure are present. Action-cache hits use this before exposing a
+    /// recorded result to downstream actions.
+    pub fn has_tree_closure(&self, root: TreeDigest) -> io::Result<bool> {
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(digest) = pending.pop() {
+            if !seen.insert(digest) {
+                continue;
+            }
+            let Some(tree) = self.get_tree(digest)? else {
+                return Ok(false);
+            };
+            for entry in tree.entries().values() {
+                match entry {
+                    TreeEntry::File { digest, .. } if !self.has_blob(*digest) => return Ok(false),
+                    TreeEntry::Directory(subtree) => pending.push(*subtree),
+                    TreeEntry::File { .. } | TreeEntry::Symlink { .. } => {}
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Stores an environment bundle, returning its digest. The stored bytes
     /// are the digest pre-image: schema version plus canonical encoding.
     pub fn put_bundle(

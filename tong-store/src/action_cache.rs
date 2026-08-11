@@ -29,6 +29,15 @@ pub struct CachedResult {
     pub duration_millis: u64,
 }
 
+impl CachedResult {
+    /// Whether every object referenced by this result is still present.
+    pub fn is_complete(&self, cas: &Cas) -> io::Result<bool> {
+        Ok(cas.has_blob(self.stdout)
+            && cas.has_blob(self.stderr)
+            && cas.has_tree_closure(self.outputs)?)
+    }
+}
+
 impl CanonicalEncode for CachedResult {
     fn encode(&self, enc: &mut Encoder) {
         self.outputs.encode(enc);
@@ -97,12 +106,23 @@ impl ActionCache {
             Err(err) => Err(err),
         }
     }
+
+    /// Removes an incomplete or otherwise invalid cached result.
+    pub fn remove(&self, action: Digest) -> io::Result<()> {
+        match fs::remove_file(self.path(action)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tong_core::digest::Hasher;
+    use tong_core::tree::{Tree, TreeEntry};
 
     #[test]
     fn cache_roundtrip() {
@@ -121,5 +141,40 @@ mod tests {
         };
         cache.put(action, &result).unwrap();
         assert_eq!(cache.get(action).unwrap(), Some(result));
+    }
+
+    #[test]
+    fn incomplete_result_is_detected_and_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path().join("store")).unwrap();
+        let cache = ActionCache::open(&cas).unwrap();
+        let output_blob = cas.put_blob(b"output").unwrap();
+        let outputs = cas
+            .put_tree(
+                &Tree::new(BTreeMap::from([(
+                    "artifact".to_owned(),
+                    TreeEntry::File {
+                        digest: output_blob,
+                        executable: false,
+                    },
+                )]))
+                .unwrap(),
+            )
+            .unwrap();
+        let result = CachedResult {
+            outputs,
+            stdout: cas.put_blob(b"stdout").unwrap(),
+            stderr: cas.put_blob(b"stderr").unwrap(),
+            duration_millis: 1,
+        };
+        let action = Hasher::digest(b"incomplete-action");
+        cache.put(action, &result).unwrap();
+        assert!(result.is_complete(&cas).unwrap());
+
+        fs::remove_file(cas.blob_path(output_blob).unwrap()).unwrap();
+
+        assert!(!result.is_complete(&cas).unwrap());
+        cache.remove(action).unwrap();
+        assert_eq!(cache.get(action).unwrap(), None);
     }
 }
