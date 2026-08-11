@@ -83,13 +83,13 @@ mode from whichever manifest is present.
 
 | Area | What works today |
 |---|---|
-| Manifests | Native `Tong.toml` targets (`rust_library`, `rust_binary`, `rust_proc_macro`, `rust_test`, `cc_import`) and full Cargo-workspace import |
+| Manifests | Native `Tong.toml` targets (`rust_library`, `rust_binary`, `rust_proc_macro`, `rust_test`, `cc_import`) and experimental Cargo-workspace import |
 | Rust backend | Libraries, binaries, proc macros, tests, build scripts (`cargo:` directives), cdylib/staticlib/dylib, features, workspace inheritance, target-specific deps |
 | Native interop | `cc_import` for prebuilt C libraries (e.g. SDL3), build-script link directives propagated to dependents |
 | Sources | `Tong.lock` + `tong lock` / `tong fetch` / `tong update`; crates.io sparse index; fully offline builds |
 | Toolchains | System capture (content-fingerprinted, snapshot-cached) or pinned dist bundles via `tong toolchain fetch rust --version` |
 | Caching | Content-addressed store, per-action cache, build-state manifests, reachability GC (`tong gc`), shared stores (`TONG_STORE_DIR`) |
-| Sandboxing | Opt-in `[policy] sandbox` levels l1–l4 (bubblewrap on Linux, Seatbelt on macOS, clean-env on Windows) |
+| Sandboxing | Explicit `[policy] sandbox` levels l1–l4 (bubblewrap on Linux, Seatbelt where usable on macOS, clean-env on Windows) |
 | Docker | `tong build --deps-only` and `tong dockerfile` for layer-cache-friendly images |
 | Determinism | SHA-256 canonical digests, pure analysis, clean action environments, no ambient cargo |
 

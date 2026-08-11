@@ -53,12 +53,20 @@ Tong is not initially:
 * A universal package registry.
 * A replacement compiler.
 * A programming language for arbitrary build logic.
-* A complete Cargo command-for-command replacement.
+* A replacement for Cargo's publishing, installation, project-generation,
+  vendoring, or dependency-editing commands.
 * A Nix distribution or Nix expression evaluator.
 * A guarantee that artifacts produced for different target platforms are identical.
 * A solution to Rust compiler limitations such as crate-level compilation granularity or the absence of a stable Rust ABI.
 
 Tong can exploit compiler capabilities such as Rust metadata artifacts and dep-info, but it cannot independently introduce finer Rust compilation units. Similarly, Tong can model prebuilt or opaque Rust artifacts, but general opaque Rust dependencies require compiler and ABI support beyond the build system.
+
+For Rust, Tong does aim to replace Cargo's stable **build workflow**:
+manifest and configuration loading, resolver versions 2 and 3, locking and
+fixed fetching, build, check, run, test, bench, doc, metadata, and dependency
+tree inspection. Cargo-import compatibility belongs to the Rust frontend; it
+must not add Rust-specific behavior to the action schema, scheduler, store,
+sandbox, or remote-execution interfaces.
 
 ---
 
@@ -545,15 +553,19 @@ Configuration transitions should remain restricted. Tong should initially suppor
 Rust support should have two modes:
 
 1. **Native Tong mode:** targets are defined directly in `Tong.toml`.
-2. **Cargo import mode:** `Cargo.toml` and `Cargo.lock` are translated into Tong targets and locked sources.
+2. **Cargo import mode:** `Cargo.toml` is translated into Tong targets;
+   `Tong.lock` remains Tong's exact, source-qualified lock and fixed-source
+   record.
 
-The imported graph must remain inspectable:
+The imported graph must remain inspectable without invoking Cargo:
 
 ```text
 tong query targets
 tong query deps //crates/app
 tong query actions //crates/app
-tong export graph --format=json
+tong graph --format=json
+tong metadata --format-version=1
+tong tree
 ```
 
 Cargo should not be invoked during builds.
@@ -672,7 +684,7 @@ Build-script and proc-macro access controls are particularly important because t
 
 Implement Cargo-compatible feature unification as a pure resolver component with:
 
-* Resolver-version awareness.
+* Independently tested resolver-version 2 and 3 semantics.
 * Host/build/target dependency separation.
 * Optional dependencies.
 * Default-feature control.
@@ -684,6 +696,11 @@ Implement Cargo-compatible feature unification as a pure resolver component with
 The resolved feature graph must be serializable and independently testable.
 
 Use differential tests against Cargo for representative workspaces, but treat the Tong resolver output as a versioned internal format.
+
+Resolver 1 is deliberately unsupported for now. An explicit resolver 1, or
+an older-edition workspace whose Cargo default is resolver 1, must fail with
+a targeted diagnostic suggesting an explicit workspace `resolver = "2"`.
+Tong must never silently apply resolver 2 to a resolver-1 workspace.
 
 ---
 
@@ -1087,6 +1104,46 @@ Cargo’s vision specifically identifies plumbing commands and structured histor
 
 ## 15. Revised Implementation Phases
 
+The numbered phases below describe architectural dependencies, not current
+completion. Delivery is controlled by the following evidence-based milestones.
+Documentation must derive status from the same compatibility reports used by
+CI; implementation alone is not a completed compatibility claim.
+
+### 0.2 — Cargo compatibility preview
+
+Release only when:
+
+* The required pinned Cargo corpus passes resolver and offline-build gates.
+* Resolver 2 and resolver 3 synthetic graphs match Cargo; resolver 1 fails
+  explicitly.
+* Package, action, and artifact identities distinguish name, version, source,
+  target, profile, feature domain, and compile mode.
+* Common host build/check/run/test/bench workflows work without Cargo.
+* Linux L4 sandbox adversarial tests pass and every platform reports achieved
+  enforcement without silent downgrade claims.
+* Full validation, package dry-runs, binary smoke tests, checksums, and release
+  attestations pass.
+
+### 0.3 — Cargo workflow beta
+
+* Promote the extended corpus to required and add large monorepo/performance
+  fixtures.
+* Add Cargo-compatible metadata/tree interfaces, common selection flags,
+  configuration precedence, parallel scheduling, and certified cross-target
+  builds.
+* Publish a field-by-field manifest/configuration compatibility matrix.
+
+### 1.0 — Generalized hermetic build system
+
+* Retain the Cargo workflow gates while Rust, C, and C++ coexist in one action
+  graph.
+* Require published sandbox capability certification and production shared
+  cache correctness.
+* Require every backend to pass the language-neutral action-boundary
+  conformance suite.
+
+### Architectural phase ordering
+
 ## Phase 0 — Specifications and Invariants
 
 ### Deliverables
@@ -1429,6 +1486,12 @@ For Rust:
 * Exercise build scripts and proc macros.
 * Test cross-compilation.
 * Test native dependencies.
+* Compare resolver 2 and resolver 3 independently; reject resolver 1.
+* Keep a pinned required tier that gates releases and an extended tier that
+  records evidence until promoted.
+* Compare the all-platform resolved graph separately from the configured
+  host/target unit graph.
+* Build every required corpus entry with Tong offline after the fetch phase.
 
 For C/C++:
 
@@ -1517,7 +1580,10 @@ Mitigation:
 
 ### Cargo compatibility scope
 
-Complete Cargo compatibility is a multi-year target.
+Complete Cargo command-for-command compatibility is not a target. Stable
+Cargo build-workflow compatibility is a release-gated target; packaging,
+publishing, installation, project generation, vendoring, and dependency
+editing remain Cargo responsibilities.
 
 Mitigation:
 
@@ -1579,7 +1645,8 @@ Tong 1.0 should mean:
 * Build scripts and proc macros are explicit, inspectable actions.
 * Users can determine exactly why an action rebuilt.
 * Unsupported compatibility behavior fails clearly.
+* Resolver 2 and resolver 3 Cargo workflow compatibility is published and
+  continuously tested; resolver 1 remains an explicit non-goal until planned.
 * Every future backend is required to pass the same action-boundary conformance suite.
 
 This establishes Tong as a credible hermetic multi-language build system rather than merely an alternative Cargo frontend.
-

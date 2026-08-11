@@ -83,7 +83,8 @@ explicit and cacheable.
 - A universal package registry
 - A replacement compiler
 - A programming language for arbitrary build logic
-- A complete Cargo command-for-command replacement
+- A replacement for Cargo's publishing, installation, project-generation,
+  vendoring, or dependency-editing commands
 - A Nix distribution or Nix expression evaluator
 
 Tong also does not promise byte-identical artifacts across target
@@ -92,10 +93,12 @@ crate-level compilation granularity or the absence of a stable Rust ABI.
 
 ## Status
 
-Tong 0.1.0 is an experimental implementation of the core pipeline plus the
-Rust offline backend. What works today:
+Tong 0.2.0-dev is an experimental implementation of the core pipeline plus
+the Rust offline backend. Its Cargo-import compatibility is under active
+certification; support claims below describe implemented paths, not a promise
+that arbitrary Cargo workspaces already pass.
 
-- Native `Tong.toml` targets and full Cargo workspace import
+- Native `Tong.toml` targets and Cargo workspace import
 - Rust libraries, binaries, proc macros, tests, and build scripts
 - `Tong.lock` registry resolution and offline builds
 - Content-addressed store, per-action cache, reachability GC

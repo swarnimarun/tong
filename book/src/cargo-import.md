@@ -7,13 +7,15 @@ no Cargo is invoked, and the workspace keeps working with Cargo —
 (the `examples/05-voxel-city-cargo` and `06-sdl3-cargo` workspaces are
 built and run by both tools, producing identical binaries).
 
-Import happens at analysis time; every lowered unit is an explicit
-action with declared inputs, so all of Tong's caching, hermeticity, and
-inspection guarantees apply to Cargo workspaces unchanged.
+Import happens at analysis time; every lowered unit is an explicit action
+with declared inputs. Compatibility is tracked by the synthetic and pinned
+external corpora; unsupported behavior must fail explicitly rather than be
+silently reinterpreted.
 
 ## Supported Cargo features
 
-Verified by the compatibility corpus in `tong-rust/tests/compat/`:
+Covered by focused fixtures in `tong-rust/tests/compat/`; the required
+external corpus remains the release-level compatibility gate:
 
 - **Workspace members and path dependencies**, including dependencies
   *outside* the workspace (canonicalized, deduplicated, cycle-checked).
@@ -61,7 +63,7 @@ tong fetch         # download locked crates into the source store
 tong build         # fully offline from here on
 ```
 
-- `tong lock` uses a cargo-compatible resolver (semver-compatible
+- `tong lock` uses a Cargo-derived resolver (semver-compatible
   activation groups, DFS with backtracking, conflict backjumping) and
   locks the *activated* feature graph — the same shape as `Cargo.lock`.
 - `tong fetch` downloads only what the lockfile names and is a no-op
@@ -84,11 +86,10 @@ to `tong lock`/`tong fetch` (and the toolchain fetcher).
 Unsupported behavior fails with a targeted diagnostic rather than
 silently changing semantics:
 
-- **Git dependencies** (`git = "…"`) — not yet implemented; the import
-  rejects them with an explanation (locked fetching of git sources is
-  planned for Phase 3/5).
-- Rustdoc / documentation tests, and exotic manifest constructs not in
-  the list above, are not yet lowered.
+- Resolver 1 is not implemented. Older workspaces must opt into resolver 2;
+  resolver 2 and 3 are the certification targets.
+- Build-affecting manifest/configuration forms not represented in the
+  compatibility matrix remain unsupported even when their TOML parses.
 
 If a compatibility gap surprises you, check the corpus under
 `tong-rust/tests/compat/` and the roadmap before assuming a bug — but do
