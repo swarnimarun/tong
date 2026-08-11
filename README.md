@@ -165,8 +165,9 @@ The next implementation stages are:
 
 - compatibility/hermetic execution modes and `Tong.permissions.toml` auditing
   for build scripts and proc macros;
-- dependency-ready parallel scheduling and Cargo-relative incremental-build
-  benchmarks;
+- dependency-ready parallel scheduling, `-j` resource accounting, and
+  digest-aware sharing of identical in-flight actions across overlapping
+  same-workspace builds (currently serialized for correctness);
 - physical/logical store statistics, thin/reflink materialization, and build
   leases for safer shared-store GC;
 - Cargo-compatible `metadata` and `tree` commands, broader configuration and

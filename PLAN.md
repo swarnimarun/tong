@@ -869,15 +869,30 @@ Remote execution must come after remote caching. The internal action representat
 
 ### 10.3 Concurrent builds
 
-Do not lock the whole build directory.
+The current correctness baseline serializes mutating build commands in the
+same workspace with a project lock. This prevents a second CLI invocation from
+pruning execution roots or rewriting project state while the first build still
+uses them. It is intentionally an interim safety measure, not the target
+concurrency model.
 
-Concurrency control should be per digest:
+The planned scheduler must replace whole-workspace serialization with
+digest-aware in-flight coordination:
 
-* Multiple readers are always allowed.
-* One executor claims a missing action.
-* Other clients may wait for or independently execute the same action.
-* Completed CAS objects are immutable.
-* Failed and partial results are never committed as successful cache records.
+* Multiple readers and builds in different workspaces are always allowed.
+* A complete action digest identifies compatible in-flight work.
+* One executor may claim a missing action while compatible clients wait for
+  and reuse its validated result.
+* Builds whose flags, inputs, toolchains, or platforms produce different
+  digests execute only their divergent subgraphs independently.
+* Dependency-ready actions within one build run in parallel under explicit
+  `-j` resource accounting.
+* Completed CAS objects are immutable; failed and partial results are never
+  committed as successful cache records.
+
+Removing the workspace lock requires adversarial multi-process tests covering
+identical builds, partially overlapping graphs, incompatible flags, failures,
+interruptions, action-cache publication, output materialization, state writes,
+and concurrent garbage collection.
 
 ### 10.4 Retention and garbage collection
 
@@ -1412,7 +1427,9 @@ tong-store/
 ### Exit criteria
 
 * A synthetic multi-target graph executes incrementally.
-* Concurrent builds do not lock the whole output tree. *(completed: per-digest atomic writes, shared stores, no whole-build locks — §10.3)*
+* Concurrent builds do not lock the whole output tree. *(partial: CAS writes
+  are per-digest and execution roots are isolated, but same-workspace builds
+  remain serialized until §10.3 in-flight coordination lands.)*
 * Cache hits survive process restarts. *(completed: digest-keyed results with build-state manifests and reachability GC — §10.4)*
 * `tong explain rebuild` reports the changed semantic input.
 

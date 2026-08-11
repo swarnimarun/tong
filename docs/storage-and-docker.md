@@ -33,6 +33,7 @@ incremental-speed advantage over Cargo.
 | Final artifact materialization copies every blob | Selected outputs duplicate physical bytes in each worktree. | Reflink-first materializer, unchanged-file skipping, byte counters, mutation tests. |
 | No physical/logical storage report | Users cannot verify savings or tune GC. | `tong store stats --format text|json` with local/shared/reclaimable accounting. |
 | The 24-hour GC floor approximates in-flight safety | Large shared stores retain garbage longer than necessary and lack explicit ownership. | Per-build leases, heartbeat/expiry recovery, concurrent GC tests. |
+| Same-workspace builds are serialized | Parallel CLI invocations are safe, but cannot yet share identical work or independently execute divergent subgraphs. | Digest-aware in-flight action claims, wait/reuse semantics, incompatible-flag tests, and removal of the workspace lock. |
 | Source trees are content-hashed on every analysis | Very large monorepos can spend too long proving unchanged inputs. | Content-correct stat index with racy-clean checks and miss explanations. |
 | Any Rust source edit reruns a whole rustc action without prior incremental state | Edited builds may lose to Cargo even when action lookup is fast. | Bounded local rustc incremental acceleration keyed by canonical unit, with clean-output equivalence checks. |
 | Scheduler is sequential | Large graphs cannot match Cargo wall time despite correct caching. | Dependency-ready `-j` scheduler before performance certification. |
@@ -66,6 +67,9 @@ incremental-speed advantage over Cargo.
 ### C. Match Cargo on edited builds
 
 - Finish the parallel dependency-ready scheduler and `-j` resource accounting.
+- Coordinate overlapping same-workspace builds by complete action digest:
+  wait for identical in-flight actions, reuse validated results, and execute
+  only differing subgraphs when flags or inputs diverge.
 - Add a source fingerprint index as an acceleration layer only. Digest identity
   remains content-based; changed, ambiguous, or racy files are rehashed.
 - Consume rustc dep-info for the next action's minimal source tree and explain
