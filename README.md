@@ -131,7 +131,8 @@ mdbook serve book   # live preview at http://localhost:3000
 Design documents that drive the implementation live in [`docs/`](docs/):
 [docker-caching.md](docs/docker-caching.md), [fingerprint-cache.md](docs/fingerprint-cache.md),
 [performance.md](docs/performance.md),
-[storage-and-docker.md](docs/storage-and-docker.md), and the governing
+[storage-and-docker.md](docs/storage-and-docker.md),
+[permissions.md](docs/permissions.md), and the governing
 [`PLAN.md`](PLAN.md).
 
 ## Development

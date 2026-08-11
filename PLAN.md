@@ -646,6 +646,16 @@ The profile must explicitly encode:
 
 Build scripts require an explicit compatibility ladder.
 
+Build scripts and proc macros are untrusted user programs. They run as
+ordinary action processes inside the same capability broker and sandbox as
+other actions. Compiling a proc macro is not permission to let the resulting
+binary escape the consumer's sandbox. The broker records attempted reads,
+writes, environment lookups, child-process launches, and network connections
+with the action identity and phase (`build-script`, `proc-macro`, or `rustc`).
+
+The same permission model applies while a proc macro executes during rustc
+expansion; it is not treated as trusted compiler code.
+
 #### Strict declarative mode
 
 Common operations should be represented directly:
@@ -672,11 +682,42 @@ network = false
 process = ["//tools:protoc"]
 ```
 
+Proc macros use the same shape, with permissions scoped to the source-qualified
+package and host unit:
+
+```toml
+[permissions.package_name.proc_macro]
+read = ["templates/**"]
+write = []
+env = ["CARGO_PKG_VERSION"]
+process = ["//tools:helper"]
+network = false
+```
+
+For Cargo-import workspaces these declarations live in a checked-in
+`Tong.permissions.toml` companion file, not in `Cargo.toml`, so Cargo can
+continue to parse the project unchanged. Native workspaces may inline the
+same tables. `$OUT_DIR` is the only implicit writable location; every other
+write requires a declaration.
+
 #### Compatibility capture mode
 
 During migration, Tong may run a build script in a tracing sandbox, report observed accesses, and generate a candidate permission declaration.
 
-Capture mode must not be considered fully hermetic and must not publish shared-cache results by default.
+Capture mode must not be considered fully hermetic and must not publish shared-cache results by default. `tong audit permissions` (or
+`tong build --audit-permissions`) records successful and denied filesystem,
+environment, process, and network attempts and emits a minimal candidate TOML
+plus a human-readable diff. Tracing is best-effort and reports what could not
+be observed.
+
+Normal builds are enforcement-only: they load the checked-in permission file,
+grant exactly those capabilities, and fail with a targeted remediation when a
+new access is attempted. An interactive build may show the capability diff and
+ask the user to approve writing the companion file; it never silently broadens
+the current action. Non-interactive builds and CI never prompt and print the
+exact TOML entry needed instead. Network-enabled permissions make the action
+uncacheable and are marked in build events. Permission changes are action
+inputs and invalidate affected actions.
 
 Build-script and proc-macro access controls are particularly important because they execute as a prerequisite to compilation and can undermine deterministic caching. Reducing common build-script behavior to declarative rules should be a first-class Rust-backend objective.
 

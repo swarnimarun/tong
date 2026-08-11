@@ -50,6 +50,14 @@ publication. Configure per workspace:
 sandbox = "l3"
 ```
 
+Build scripts and proc macros are treated as untrusted action programs. Use
+`tong audit permissions` to trace their attempted file, environment, process,
+and network accesses, review the generated candidate, and save approved
+capabilities in `Tong.permissions.toml` for Cargo-import workspaces. Normal
+builds enforce that file and never prompt in CI; a new access fails with the
+exact missing permission. Audit runs are diagnostic only and are not
+cache-publishable.
+
 ## Platform support
 
 | Platform | l3/l4 mechanism | Status |

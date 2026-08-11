@@ -81,6 +81,13 @@ tong build         # fully offline from here on
 **Normal builds never touch the network.** Network access is confined
 to `tong lock`/`tong fetch` (and the toolchain fetcher).
 
+Build scripts and proc macros run as sandboxed actions. Their approved
+filesystem, environment, helper-process, and network capabilities are kept in
+the checked-in `Tong.permissions.toml` companion file so Cargo continues to
+parse the original manifests. Run `tong audit permissions` to generate a
+reviewable candidate; normal and CI builds fail rather than prompting when a
+new access appears.
+
 ## Unsupported Cargo features
 
 Unsupported behavior fails with a targeted diagnostic rather than
