@@ -283,7 +283,9 @@ impl Cas {
         self.capture_dir_filtered(path, &CAPTURE_EXCLUDES.iter().copied().collect())
     }
 
-    /// Captures a directory, skipping entries with excluded names.
+    /// Captures a directory, skipping excluded entries at its root.
+    /// Output-directory names remain valid source names below that root
+    /// (for example, Rust's `src/target/` module directory).
     pub fn capture_dir_filtered(
         &self,
         path: &Path,
@@ -310,7 +312,7 @@ impl Cas {
         import_blobs: bool,
     ) -> io::Result<TreeDigest> {
         if import_blobs {
-            self.walk_dir_serial(path, excludes, true)
+            self.walk_dir_serial(path, excludes, true, true)
         } else {
             // Fingerprint mode: hash every file under `path` concurrently,
             // then rebuild the tree from the digests. The tree structure
@@ -318,9 +320,9 @@ impl Cas {
             // hashing is parallel (large toolchain sysroots dominate the
             // system toolchain capture otherwise).
             let mut files: Vec<PathBuf> = Vec::new();
-            collect_files(path, excludes, &mut files)?;
+            collect_files(path, excludes, &mut files, true)?;
             let digests = hash_files_parallel(&files)?;
-            self.build_fingerprint_tree(path, excludes, &digests)
+            self.build_fingerprint_tree(path, excludes, &digests, true)
         }
     }
 
@@ -329,6 +331,7 @@ impl Cas {
         path: &Path,
         excludes: &BTreeSet<&str>,
         import_blobs: bool,
+        root: bool,
     ) -> io::Result<TreeDigest> {
         let mut entries = std::collections::BTreeMap::new();
         for entry in fs::read_dir(path)? {
@@ -339,12 +342,17 @@ impl Cas {
                     format!("non-UTF-8 file name {name:?} in {}", path.display()),
                 )
             })?;
-            if excludes.contains(name.as_str()) {
+            if root && excludes.contains(name.as_str()) {
                 continue;
             }
             let file_type = entry.file_type()?;
             let tree_entry = if file_type.is_dir() {
-                TreeEntry::Directory(self.walk_dir_serial(&entry.path(), excludes, import_blobs)?)
+                TreeEntry::Directory(self.walk_dir_serial(
+                    &entry.path(),
+                    excludes,
+                    import_blobs,
+                    false,
+                )?)
             } else if file_type.is_symlink() {
                 let target = fs::read_link(entry.path())?;
                 TreeEntry::Symlink {
@@ -381,6 +389,7 @@ impl Cas {
         path: &Path,
         excludes: &BTreeSet<&str>,
         digests: &HashMap<PathBuf, BlobDigest>,
+        root: bool,
     ) -> io::Result<TreeDigest> {
         let mut entries = BTreeMap::new();
         for entry in fs::read_dir(path)? {
@@ -391,7 +400,7 @@ impl Cas {
                     format!("non-UTF-8 file name {name:?} in {}", path.display()),
                 )
             })?;
-            if excludes.contains(name.as_str()) {
+            if root && excludes.contains(name.as_str()) {
                 continue;
             }
             let file_type = entry.file_type()?;
@@ -400,6 +409,7 @@ impl Cas {
                     &entry.path(),
                     excludes,
                     digests,
+                    false,
                 )?)
             } else if file_type.is_symlink() {
                 let target = fs::read_link(entry.path())?;
@@ -593,6 +603,7 @@ fn collect_files(
     path: &Path,
     excludes: &BTreeSet<&str>,
     files: &mut Vec<PathBuf>,
+    root: bool,
 ) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -602,12 +613,12 @@ fn collect_files(
                 format!("non-UTF-8 file name {name:?} in {}", path.display()),
             )
         })?;
-        if excludes.contains(name.as_str()) {
+        if root && excludes.contains(name.as_str()) {
             continue;
         }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_files(&entry.path(), excludes, files)?;
+            collect_files(&entry.path(), excludes, files, false)?;
         } else if file_type.is_file() {
             files.push(entry.path());
         }
@@ -733,14 +744,21 @@ mod tests {
         let src = cas.root().parent().unwrap().join("src2");
         fs::create_dir_all(src.join("target")).unwrap();
         fs::create_dir_all(src.join(".tong")).unwrap();
+        fs::create_dir_all(src.join("src/target")).unwrap();
         fs::write(src.join("keep.txt"), b"k").unwrap();
         fs::write(src.join("target/junk"), b"j").unwrap();
+        fs::write(src.join("src/target/module.rs"), b"source").unwrap();
 
         let tree = cas.capture_dir(&src).unwrap();
         let tree = cas.get_tree(tree).unwrap().unwrap();
         assert!(tree.entries().contains_key("keep.txt"));
         assert!(!tree.entries().contains_key("target"));
         assert!(!tree.entries().contains_key(".tong"));
+        let nested = match tree.entries().get("src").unwrap() {
+            TreeEntry::Directory(digest) => cas.get_tree(*digest).unwrap().unwrap(),
+            other => panic!("src should be a directory, got {other:?}"),
+        };
+        assert!(nested.entries().contains_key("target"));
     }
 
     #[test]
