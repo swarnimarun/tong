@@ -4,10 +4,33 @@ Tong is a declarative, hermetic, multi-language build system for monorepos.
 It preserves familiar language workflows while lowering all build work into
 explicit, cacheable actions.
 
-Status: **experimental (0.2.0-dev)**. Rust is the first backend under
-compatibility certification. The Rust, C, and C++ coexistence goal and
-remaining platform certification work are tracked in the
+Status: **highly experimental (0.2.0-dev)**. Rust is the first backend being
+tested for Cargo compatibility. Tong is not yet a drop-in replacement for
+Cargo and should not be used as the only build path for important or
+security-sensitive projects. The Rust, C, and C++ coexistence goal and
+remaining platform work are tracked in the
 [roadmap](https://swarnimarun.github.io/tong/roadmap.html).
+
+## Read this first: experimental and AI-assisted
+
+Tong is being developed with significant use of AI-assisted design,
+implementation, testing, and documentation. Human review and automated tests
+are used, but they do not make the software production-ready or eliminate the
+possibility of subtle resolver, cache, sandbox, compiler, or platform bugs.
+
+Use it with caution:
+
+- keep Cargo or another known-good build path available;
+- do not assume a successful build is hermetic or reproducible unless the
+  platform and sandbox behavior have been explicitly verified;
+- review generated actions, permission files, lockfiles, and artifacts before
+  trusting them;
+- avoid unreviewed shared-cache use for sensitive or untrusted code; and
+- never provide credentials or secrets to experimental Tong workflows.
+
+The README distinguishes implemented behavior from planned work. Planned
+features are design commitments, not promises that the current binary already
+provides them.
 
 ## What makes Tong different
 
@@ -93,6 +116,65 @@ mode from whichever manifest is present.
 | Sandboxing | Explicit `[policy] sandbox` levels l1–l4 (bubblewrap on Linux, Seatbelt where usable on macOS, clean-env on Windows) |
 | Docker | `tong build --deps-only` and `tong dockerfile` for layer-cache-friendly images |
 | Determinism | SHA-256 canonical digests, pure analysis, clean action environments, no ambient cargo |
+
+The default Cargo-import path is currently compatibility-oriented. Strong
+build-script and proc-macro permission auditing/enforcement is planned as an
+opt-in hermetic mode; see [permissions](docs/permissions.md).
+
+## Implemented now
+
+The current repository includes:
+
+- native `Tong.toml` builds and experimental Cargo-import builds;
+- resolver 2 and 3 work, with resolver 1 deliberately rejected;
+- Cargo-style build/check/run/test/bench selection for the supported matrix;
+- explicit Rust library, binary, test, example, bench, build-script, and
+  proc-macro actions;
+- fixed registry and git fetching through `Tong.lock`, including offline
+  builds after sources are present;
+- source-qualified package/action identities, content-addressed artifacts,
+  build-state manifests, and reachability GC;
+- shared backing through `--store-dir` or `TONG_STORE_DIR`, with selected
+  outputs materialized under `.tong/out`;
+- `tong build --deps-only` and `tong dockerfile` for Docker layer-cache
+  workflows; and
+- Linux/macOS/Windows sandbox capability reporting with platform limitations
+  documented rather than hidden.
+
+The required pinned corpus currently passes 11/11 resolver and 11/11 offline
+build rows on the recorded macOS/aarch64 run. That is evidence for the pinned
+corpus and platform, not a universal Cargo compatibility guarantee.
+
+## Planned next
+
+The next implementation stages are:
+
+- compatibility/hermetic execution modes and `Tong.permissions.toml` auditing
+  for build scripts and proc macros;
+- dependency-ready parallel scheduling and Cargo-relative incremental-build
+  benchmarks;
+- physical/logical store statistics, thin/reflink materialization, and build
+  leases for safer shared-store GC;
+- Cargo-compatible `metadata` and `tree` commands, broader configuration and
+  cross-target support;
+- native Docker/BuildKit execution with capability reporting; and
+- CI/release gates across Linux, macOS, and Windows.
+
+## Long-term goals
+
+Tong aims to be a generalized hermetic build engine whose Rust frontend can
+replace Cargo for the stable build workflow—build, check, run, test, bench,
+doc, resolution, metadata, and tree—while keeping Rust-specific behavior out
+of the scheduler, CAS, sandbox, and action schema. It also aims to provide:
+
+- minimal additional storage across worktrees and incremental builds;
+- fast no-op and edited builds competitive with Cargo;
+- optional shared local and remote caching with explainable invalidation;
+- native Docker execution and reproducible cache transport; and
+- later Rust/C/C++ coexistence and additional language backends.
+
+Cargo publishing, installation, project generation, vendoring, and dependency
+editing remain outside the current compatibility goal.
 
 ## Examples
 
