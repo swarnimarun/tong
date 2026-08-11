@@ -258,6 +258,7 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// Builds the workspace at `root` and materializes artifacts under
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
+    let _workspace_lock = WorkspaceBuildLock::acquire(root)?;
     let t_build = std::time::Instant::now();
     // Test/bench/example targets pull in dev-dependencies (cargo's
     // `--all-targets` semantics); plain builds exclude them.
@@ -472,6 +473,36 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     );
 
     Ok(outcome)
+}
+
+/// Serializes builds that mutate one workspace's `.tong` state. Action-level
+/// in-flight deduplication needs scheduler coordination; until that exists,
+/// waiting is safer than allowing one build to prune or rewrite files another
+/// live build still needs.
+struct WorkspaceBuildLock {
+    _file: fs::File,
+}
+
+impl WorkspaceBuildLock {
+    fn acquire(root: &Path) -> io::Result<Self> {
+        let tong_dir = root.join(".tong");
+        fs::create_dir_all(&tong_dir)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(tong_dir.join("build.lock"))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                eprintln!("tong: another build is running; waiting for it to finish");
+                file.lock()?;
+            }
+            Err(fs::TryLockError::Error(err)) => return Err(err),
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 /// Runs the workspace's test targets (`tong test`). Returns the process

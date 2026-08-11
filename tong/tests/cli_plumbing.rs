@@ -4,7 +4,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 fn tong() -> &'static str {
     env!("CARGO_BIN_EXE_tong")
@@ -134,6 +135,47 @@ fn shared_store_reuses_cargo_workspace_actions() {
         "second Cargo worktree must reuse shared actions: {stdout}"
     );
     assert!(!second.path().join(".tong/store").exists());
+}
+
+#[test]
+fn concurrent_workspace_build_waits_for_the_active_build() {
+    let work = tempfile::tempdir().unwrap();
+    fs::write(
+        work.path().join("Cargo.toml"),
+        "[package]\nname = \"serial-build\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(work.path().join("src")).unwrap();
+    fs::write(
+        work.path().join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        work.path().join("build.rs"),
+        "fn main() { std::thread::sleep(std::time::Duration::from_millis(750)); }\n",
+    )
+    .unwrap();
+
+    let first = Command::new(tong())
+        .arg("build")
+        .current_dir(work.path())
+        .env("TONG_RUSTC", rustc_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let second = run_tong(work.path(), &["build"]);
+    let first = first.wait_with_output().unwrap();
+
+    assert_success(&first, "first concurrent build");
+    assert_success(&second, "waiting concurrent build");
+    assert!(
+        stderr_of(&second).contains("another build is running; waiting for it to finish"),
+        "second build did not report waiting: {}",
+        stderr_of(&second)
+    );
 }
 
 #[test]
