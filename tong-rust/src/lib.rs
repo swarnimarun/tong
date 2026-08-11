@@ -19,7 +19,7 @@ pub use cargo_import::{
 };
 pub use features::{FeatureError, FeatureMap, FeatureRequest, resolve_features};
 pub use model::{
-    BinTarget, CcImport, CrateType, Dep, Edition, LibTarget, Lto, Package, PackageId,
+    BinTarget, CcImport, CrateType, Dep, Edition, GitSelector, LibTarget, Lto, Package, PackageId,
     PanicStrategy, ProfileSpec, RegistryEdge, ResolverVersion, RustModel, RustUnitDomain,
     RustUnitId, RustUnitMode, SourceId, TestTarget,
 };

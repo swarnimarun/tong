@@ -1896,6 +1896,16 @@ struct LockfileSource {
     materialized: std::cell::RefCell<Vec<PathBuf>>,
 }
 
+fn locked_source_matches_edge(edge: &tong_rust::RegistryEdge, source: &str) -> bool {
+    match &edge.git {
+        Some(selector) => source
+            .strip_prefix("git+")
+            .and_then(|source| source.split_once('#'))
+            .is_some_and(|(url, _)| url == selector.url),
+        None => source.starts_with("registry+"),
+    }
+}
+
 impl LockfileSource {
     fn new(root: &Path, store: &Path, cas: Cas) -> Self {
         let lock = tong_fetch::TongLock::load(root).ok();
@@ -1950,7 +1960,7 @@ impl LockfileSource {
         {
             for dep in &parent_entry.dependencies {
                 let (name, version, source) = tong_fetch::LockedPackage::parse_dependency(dep);
-                if name != edge.package {
+                if name != edge.package || !locked_source_matches_edge(edge, source) {
                     continue;
                 }
                 let Some(package) = lock.packages.iter().find(|package| {
@@ -1990,7 +2000,9 @@ impl LockfileSource {
         // v1 migration kept unambiguous.
         let candidates: Vec<&tong_fetch::LockedPackage> = lock
             .candidates(&edge.package)
-            .filter(|package| req.matches(&package.version))
+            .filter(|package| {
+                req.matches(&package.version) && locked_source_matches_edge(edge, &package.source)
+            })
             .collect();
         match candidates.len() {
             0 => {
@@ -2790,7 +2802,8 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
 
 #[cfg(test)]
 mod tests {
-    use super::artifact_name_matches;
+    use super::{artifact_name_matches, locked_source_matches_edge};
+    use tong_rust::{GitSelector, PackageId, RegistryEdge, SourceId};
 
     #[test]
     fn artifact_labels_match_exactly_or_with_normalized_separators() {
@@ -2800,5 +2813,46 @@ mod tests {
         assert!(artifact_name_matches("//crates/app:calc-cli", "calc-cli"));
         assert!(artifact_name_matches("calc-cli", "calc-cli"));
         assert!(!artifact_name_matches(":other", "voxel-city"));
+    }
+
+    #[test]
+    fn locked_sources_match_dependency_source_kind() {
+        let mut edge = RegistryEdge {
+            parent: PackageId {
+                name: "root".to_owned(),
+                version: semver::Version::new(1, 0, 0),
+                source: SourceId::Workspace(".".to_owned()),
+            },
+            extern_name: "shared".to_owned(),
+            package: "shared".to_owned(),
+            req: "*".to_owned(),
+            git: None,
+            optional: false,
+            default_features: true,
+            features: Vec::new(),
+        };
+        assert!(locked_source_matches_edge(
+            &edge,
+            "registry+https://github.com/rust-lang/crates.io-index"
+        ));
+        assert!(!locked_source_matches_edge(
+            &edge,
+            "git+https://example.com/shared#0123456789abcdef"
+        ));
+
+        edge.git = Some(GitSelector {
+            url: "https://example.com/shared".to_owned(),
+            rev: None,
+            tag: None,
+            branch: None,
+        });
+        assert!(locked_source_matches_edge(
+            &edge,
+            "git+https://example.com/shared#0123456789abcdef"
+        ));
+        assert!(!locked_source_matches_edge(
+            &edge,
+            "git+https://example.com/other#0123456789abcdef"
+        ));
     }
 }

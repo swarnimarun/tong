@@ -32,6 +32,15 @@ impl PackageId {
     pub fn lock_source(&self) -> String {
         self.source.lock_source()
     }
+
+    /// Stable source-aware suffix for disambiguating otherwise identical
+    /// human labels. This is presentation identity only; action digests use
+    /// the complete canonical package identity.
+    pub fn identity_hash(&self) -> String {
+        let mut enc = Encoder::new();
+        self.encode(&mut enc);
+        enc.digest().to_hex()[..12].to_owned()
+    }
 }
 
 impl fmt::Display for PackageId {
@@ -787,6 +796,13 @@ mod tests {
         assert_eq!(set.len(), 3);
         assert_eq!(a1.lock_source(), "registry+https://index.crates.io");
         assert_eq!(member.lock_source(), "path+crates/alpha");
+
+        let registry_copy = PackageId {
+            name: member.name.clone(),
+            version: member.version.clone(),
+            source: SourceId::Registry("https://index.crates.io".to_owned()),
+        };
+        assert_ne!(member.identity_hash(), registry_copy.identity_hash());
     }
 
     #[test]

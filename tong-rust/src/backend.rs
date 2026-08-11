@@ -1432,8 +1432,9 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Human label for a package in logical ids: the bare name when the
-    /// workspace has one package with that name, else `name@version` (two
-    /// versions of one crate must produce distinct action ids).
+    /// workspace has one package with that name, `name@version` when only
+    /// versions differ, and a source-aware suffix for otherwise identical
+    /// names and versions.
     fn pkg_label(&self, pkg: &Package) -> String {
         let same_name = self
             .model
@@ -1441,10 +1442,20 @@ impl<'a> RustBackend<'a> {
             .iter()
             .filter(|other| other.name == pkg.name)
             .count();
-        if same_name > 1 {
+        if same_name == 1 {
+            return pkg.name.clone();
+        }
+
+        let same_version = self
+            .model
+            .packages
+            .iter()
+            .filter(|other| other.name == pkg.name && other.version == pkg.version)
+            .count();
+        if same_version == 1 {
             format!("{}@{}", pkg.name, pkg.version)
         } else {
-            pkg.name.clone()
+            format!("{}@{}#{}", pkg.name, pkg.version, pkg.id.identity_hash())
         }
     }
 
