@@ -61,7 +61,7 @@ pub struct SandboxSpec {
 }
 
 /// A platform sandbox wrapper.
-pub trait Sandbox {
+pub trait Sandbox: Send + Sync {
     /// Prepends the sandbox invocation to `cmd`. `exec_root` is the
     /// action's working directory (bound read-only; writable subdirs come
     /// from `spec.writable`).

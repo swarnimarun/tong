@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use tong_core::action::{
@@ -117,6 +118,37 @@ fn substitutes_exec_root_in_env() {
     let content = String::from_utf8(cas.read_blob(where_blob).unwrap()).unwrap();
     assert!(content.starts_with('/'), "got: {content}");
     assert!(content.trim_end().ends_with(&action.digest().to_hex()));
+}
+
+#[test]
+fn concurrent_executors_isolate_identical_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let cas = Cas::open(&store).unwrap();
+    let first = LocalExecutor::new(cas.clone(), store.join("exec")).unwrap();
+    let second = LocalExecutor::new(cas.clone(), store.join("exec")).unwrap();
+    let action = script_action(
+        &cas,
+        "#!/bin/sh\nsleep 0.2\ncp data.txt ../out/copied.txt\n",
+        vec!["copied.txt"],
+        None,
+    );
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_barrier = barrier.clone();
+    let first_action = action.clone();
+    let first_run = std::thread::spawn(move || {
+        first_barrier.wait();
+        first.execute(&first_action)
+    });
+    let second_run = std::thread::spawn(move || {
+        barrier.wait();
+        second.execute(&action)
+    });
+
+    let first_outcome = first_run.join().unwrap().unwrap();
+    let second_outcome = second_run.join().unwrap().unwrap();
+    assert_eq!(first_outcome.outputs, second_outcome.outputs);
 }
 
 #[test]

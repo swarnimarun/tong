@@ -4,17 +4,19 @@
 //! layout (PLAN.md section 11, enforcement level 1: clean environment):
 //!
 //! ```text
-//! <exec_base>/<action-digest>/
+//! <exec_base>/<invocation-id>/<action-digest>/
 //!   in/    materialized input root (sources, dep outputs, tools)
 //!   out/   the only directory outputs are captured from
 //!   tmp/   TMPDIR and HOME for the action
 //!   bin/   materialized executable (when it comes from the store)
 //! ```
 //!
-//! The exec root path derives from the action digest, so arguments may
-//! reference `{exec_root}` and stay stable across runs. `{bundle_root}` is
-//! substituted for system-captured bundles, whose files are fingerprinted
-//! but used in place (non-portable; PLAN.md section 5).
+//! The per-invocation namespace prevents concurrent Tong processes from
+//! deleting or rewriting each other's action directories. The action's
+//! directory name still derives from its digest, so arguments may reference
+//! `{exec_root}` without embedding a logical target name. `{bundle_root}` is
+//! substituted for system-captured bundles, whose files are fingerprinted but
+//! used in place (non-portable; PLAN.md section 5).
 //!
 //! Sandboxing beyond a clean environment is Phase 4 work; this executor
 //! documents enforcement level 1 and never claims hermeticity.
@@ -25,6 +27,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tong_core::action::ActionSpec;
@@ -38,6 +41,8 @@ use crate::sandbox::{Sandbox, SandboxLevel, SandboxSpec, default_read_only_binds
 
 /// Placeholder substituted with the action's exec root path.
 pub use tong_core::action::{BUNDLE_ROOT_VAR, EXEC_ROOT_VAR};
+
+static NEXT_EXECUTOR_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The result of a successful, validated execution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,7 +124,7 @@ impl From<io::Error> for ExecError {
 /// A local process executor.
 pub struct LocalExecutor {
     cas: Cas,
-    exec_base: PathBuf,
+    invocation_root: PathBuf,
     /// Sandbox enforcement level (PLAN.md section 11; opt-in).
     sandbox_level: SandboxLevel,
     /// The platform sandbox wrapper.
@@ -146,11 +151,14 @@ impl LocalExecutor {
     ) -> io::Result<Self> {
         let exec_base = exec_base.into();
         fs::create_dir_all(&exec_base)?;
+        let executor_id = NEXT_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed);
+        let invocation_root = exec_base.join(format!("run-{}-{executor_id}", std::process::id()));
+        fs::create_dir_all(&invocation_root)?;
         let host = std::env::consts::OS;
         let sandbox = sandbox_for(host);
         Ok(Self {
             cas,
-            exec_base,
+            invocation_root,
             sandbox_level,
             sandbox,
             system_tools: HashMap::new(),
@@ -179,10 +187,12 @@ impl LocalExecutor {
     /// Executes an action. Cache lookup happens in the driver, not here.
     pub fn execute(&self, spec: &ActionSpec) -> Result<ExecOutcome, ExecError> {
         let digest = spec.digest();
-        let exec_root = self.exec_base.join(digest.to_hex());
+        let exec_root = self.invocation_root.join(digest.to_hex());
         let started = Instant::now();
 
-        // Single-writer-per-digest is a driver guarantee; recreate the dir.
+        // Recreate only this invocation's action directory. Another build may
+        // execute the same digest under its own namespace and atomically race
+        // to publish the identical cache result.
         if exec_root.exists() {
             fs::remove_dir_all(&exec_root)?;
         }
@@ -196,6 +206,9 @@ impl LocalExecutor {
         let result = self.run(spec, &exec_root, &input, &output, &tmp, started);
         if result.is_ok() && !self.keep_exec_roots {
             fs::remove_dir_all(&exec_root)?;
+            // Avoid accumulating empty invocation directories. A failed
+            // action remains inside the directory for diagnostics.
+            let _ = fs::remove_dir(&self.invocation_root);
         }
         result
     }
