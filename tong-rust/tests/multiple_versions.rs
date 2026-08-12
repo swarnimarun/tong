@@ -236,6 +236,7 @@ impl tong_rust::LockedSourceProvider for LockedFixture {
             propagate_source: false,
             id: registry_id(&package.version.to_string()),
             source_dir,
+            source_tree: tong_fetch::source_tree_digest(&self.store, checksum),
         }))
     }
 }

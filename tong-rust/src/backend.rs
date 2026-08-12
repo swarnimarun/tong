@@ -25,7 +25,7 @@ use tong_core::paths::{OutputPath, RelativePath};
 use tong_core::tree::{Tree, TreeEntry};
 use tong_exec::EXEC_ROOT_VAR;
 use tong_graph::{Completed, PlanError, PlannedAction};
-use tong_store::{CAPTURE_EXCLUDES, Cas};
+use tong_store::{CAPTURE_EXCLUDES, Cas, ClosureVerifier};
 
 use crate::build_directives::{Directives, parse_directives};
 use crate::model::{
@@ -393,12 +393,27 @@ impl<'a> RustBackend<'a> {
     pub fn plan(&mut self) -> Result<Vec<PlannedAction>, PlanError> {
         // 1. Capture package source trees once (PLAN.md section 8.3: whole
         //    package tree, excluding known output directories).
+        let mut source_verifier = ClosureVerifier::default();
         for pkg in &self.model.packages {
             if !self.configured_packages.contains(&pkg.id) {
                 continue;
             }
             let mut excludes = CAPTURE_EXCLUDES.iter().copied().collect();
-            let mut tree = self.cas.capture_dir_filtered(&pkg.dir, &excludes)?;
+            let mut tree = if let Some(tree) = pkg.source_tree {
+                if !self
+                    .cas
+                    .has_tree_closure_cached(tree, &mut source_verifier)?
+                {
+                    return Err(PlanError::Message(format!(
+                        "pre-captured source tree {} for {} is incomplete",
+                        tree.digest(),
+                        pkg.id
+                    )));
+                }
+                tree
+            } else {
+                self.cas.capture_dir_filtered(&pkg.dir, &excludes)?
+            };
 
             // Some archive/cache transports materialize a Git symlink as
             // a small text file containing its relative target. Preserve

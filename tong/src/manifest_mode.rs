@@ -383,6 +383,7 @@ impl PackageSeed {
             id,
             name: self.package_name,
             dir: self.dir,
+            source_tree: None,
             version: self.version,
             edition: self.edition.unwrap_or(Edition::E2021),
             metadata: tong_rust::PackageMetadata::default(),

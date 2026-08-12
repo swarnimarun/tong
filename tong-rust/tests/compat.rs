@@ -173,6 +173,7 @@ impl tong_rust::LockedSourceProvider for LockedSource {
                 source,
             },
             source_dir,
+            source_tree: tong_fetch::source_tree_digest(&self.store, checksum),
         }))
     }
 }

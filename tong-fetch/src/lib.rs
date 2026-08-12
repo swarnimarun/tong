@@ -13,7 +13,10 @@ pub mod registry;
 pub mod resolve;
 pub mod sparse_index;
 
-pub use download::{crate_blob_path, fetch_crate, materialize_source, verify_crate_bytes};
+pub use download::{
+    crate_blob_path, fetch_crate, materialize_source, record_source_tree, source_tree_digest,
+    verify_crate_bytes,
+};
 pub use git::{GitError, LockedGit, ResolvedGit, materialize_tree, resolve_and_capture};
 pub use lockfile::{LOCKFILE_VERSION, LockedPackage, TongLock};
 pub use registry::{FetchError, RegistryConfig, fetch_url};

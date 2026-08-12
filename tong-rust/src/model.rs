@@ -366,6 +366,9 @@ pub struct Package {
     pub name: String,
     /// Source root directory, relative to the workspace root.
     pub dir: PathBuf,
+    /// Pre-captured source tree for immutable locked sources. Workspace and
+    /// mutable path packages leave this unset and are captured normally.
+    pub source_tree: Option<tong_core::artifact::TreeDigest>,
     /// Package version — presentation/compiler field.
     pub version: String,
     /// Rust edition.
@@ -781,6 +784,7 @@ mod tests {
             },
             name: name.to_owned(),
             dir: PathBuf::from("."),
+            source_tree: None,
             version: "0.1.0".to_owned(),
             edition: Edition::E2021,
             metadata: PackageMetadata::default(),

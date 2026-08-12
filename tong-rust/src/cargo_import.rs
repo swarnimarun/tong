@@ -487,6 +487,8 @@ pub struct LockedSource {
     pub id: crate::model::PackageId,
     /// Extracted source directory (materialized from the store).
     pub source_dir: PathBuf,
+    /// Source tree captured and verified while fetching this locked source.
+    pub source_tree: Option<tong_core::artifact::TreeDigest>,
     /// Whether the source identity propagates to every package inside the
     /// checkout (git dependencies: all packages from one repository share
     /// the `git+<url>#<commit>` identity). Registry checkouts never
@@ -880,7 +882,10 @@ fn expand_members(
 enum ForcedIdentity {
     /// The exact locked identity: name and version must match the manifest
     /// (registry packages).
-    Exact(crate::model::PackageId),
+    Exact {
+        id: crate::model::PackageId,
+        source_tree: Option<tong_core::artifact::TreeDigest>,
+    },
     /// Only the source is forced; name/version come from the manifest
     /// (git dependencies — the source propagates to every package in the
     /// checkout).
@@ -965,7 +970,7 @@ fn import_package(
     // relative to the workspace root (never the canonical absolute
     // path, so digests are host-independent).
     let id = match &forced {
-        Some(ForcedIdentity::Exact(locked)) => {
+        Some(ForcedIdentity::Exact { id: locked, .. }) => {
             let parsed = semver::Version::parse(&version).ok();
             if locked.name != package.name || parsed.as_ref() != Some(&locked.version) {
                 return Err(CargoImportError::Unsupported(format!(
@@ -1043,7 +1048,7 @@ fn import_package(
                 SourceId::Path(rel)
             };
             let id = match &forced {
-                Some(ForcedIdentity::Exact(locked)) => locked.clone(),
+                Some(ForcedIdentity::Exact { id: locked, .. }) => locked.clone(),
                 Some(ForcedIdentity::Source(source)) => PackageId {
                     name: package.name.clone(),
                     version: id.version,
@@ -1070,6 +1075,10 @@ fn import_package(
             id: id.clone(),
             name: package.name.clone(),
             dir: canonical.clone(),
+            source_tree: match &forced {
+                Some(ForcedIdentity::Exact { source_tree, .. }) => *source_tree,
+                _ => None,
+            },
             version,
             edition: parse_edition(&edition)?,
             metadata,
@@ -1457,7 +1466,10 @@ fn import_package(
                         let forced = if locked.propagate_source {
                             ForcedIdentity::Source(locked.id.source.clone())
                         } else {
-                            ForcedIdentity::Exact(locked.id.clone())
+                            ForcedIdentity::Exact {
+                                id: locked.id.clone(),
+                                source_tree: locked.source_tree,
+                            }
                         };
                         import_package(
                             &locked.source_dir,

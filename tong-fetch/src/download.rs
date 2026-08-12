@@ -24,6 +24,47 @@ pub fn crate_blob_path(store: &Path, checksum: &str) -> PathBuf {
     store.join("sources").join(format!("{checksum}.crate"))
 }
 
+fn source_tree_path(store: &Path, checksum: &str) -> PathBuf {
+    store.join("sources").join(format!("{checksum}.tree"))
+}
+
+/// Reads the canonical source tree captured for a checksum-locked archive.
+pub fn source_tree_digest(store: &Path, checksum: &str) -> Option<TreeDigest> {
+    let text = fs::read_to_string(source_tree_path(store, checksum)).ok()?;
+    tong_core::digest::Digest::from_hex(text.trim())
+        .ok()
+        .map(TreeDigest::new)
+}
+
+/// Atomically records the source tree produced by verified extraction.
+pub fn record_source_tree(
+    store: &Path,
+    checksum: &str,
+    tree: TreeDigest,
+) -> Result<(), FetchError> {
+    let path = source_tree_path(store, checksum);
+    let parent = path.parent().expect("source tree sidecar parent");
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".tmp-tree-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&tmp, tree.digest().to_hex())?;
+    match fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(err) if path.is_file() => {
+            let _ = fs::remove_file(tmp);
+            let _ = err;
+            Ok(())
+        }
+        Err(err) => Err(FetchError::Io(err)),
+    }
+}
+
 /// The extracted checkout directory for a package.
 pub fn checkout_dir(store: &Path, name: &str, version: &Version, checksum: &str) -> PathBuf {
     let short = &checksum[..checksum.len().min(12)];
@@ -65,7 +106,9 @@ pub fn fetch_crate(
     if !checkout.is_dir() {
         extract_crate(&blob_path, &checkout)?;
     }
-    cas.capture_dir(&checkout).map_err(FetchError::Io)
+    let tree = cas.capture_dir(&checkout).map_err(FetchError::Io)?;
+    record_source_tree(cas.root(), checksum, tree)?;
+    Ok(tree)
 }
 
 /// Verifies archive bytes against the expected index checksum.
