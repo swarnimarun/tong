@@ -30,6 +30,8 @@ use tong_core::tree::{Tree, TreeEntry};
 /// exclude known output directories).
 pub const CAPTURE_EXCLUDES: &[&str] = &[".tong", "target", ".git", ".jj"];
 
+const SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
 /// A local content-addressed store.
 #[derive(Clone, Debug)]
 pub struct Cas {
@@ -134,7 +136,9 @@ impl Cas {
             (hasher.finish(), total)
         };
         let digest = BlobDigest::new(digest);
-        self.place_verified("blobs", digest.digest(), &tmp, Some(len))?;
+        // The bytes in `tmp` were hashed while they were copied. Re-reading
+        // the temporary file here used to double all source-capture I/O.
+        self.place_preverified("blobs", digest.digest(), &tmp, Some(len))?;
         Ok(digest)
     }
 
@@ -169,6 +173,18 @@ impl Cas {
                 format!("digest mismatch while storing: expected {digest}, wrote {actual}"),
             ));
         }
+        self.place_preverified(namespace, digest, tmp, expected_len)
+    }
+
+    /// Publishes a temporary object whose bytes were already hashed by the
+    /// caller while writing it.
+    fn place_preverified(
+        &self,
+        namespace: &str,
+        digest: Digest,
+        tmp: &Path,
+        expected_len: Option<u64>,
+    ) -> io::Result<()> {
         if let Some(len) = expected_len {
             let actual_len = fs::metadata(tmp)?.len();
             if actual_len != len {
@@ -362,7 +378,37 @@ impl Cas {
         path: &Path,
         excludes: &std::collections::BTreeSet<&str>,
     ) -> io::Result<TreeDigest> {
-        self.walk_dir(path, excludes, true)
+        let canonical = fs::canonicalize(path)?;
+        let fingerprint = metadata_fingerprint(&canonical, excludes)?;
+        let snapshot = self.snapshot_path(&canonical, excludes);
+        if let Some(tree) = read_snapshot(&snapshot, fingerprint)?
+            && self.has_tree_closure(tree)?
+        {
+            return Ok(tree);
+        }
+
+        // Check metadata on both sides of capture. A concurrently edited
+        // tree is still captured content-correctly, but is never saved as a
+        // reusable metadata snapshot.
+        let tree = self.walk_dir(&canonical, excludes, true)?;
+        let after = metadata_fingerprint(&canonical, excludes)?;
+        if fingerprint == after {
+            write_snapshot(&snapshot, fingerprint, tree)?;
+        }
+        Ok(tree)
+    }
+
+    fn snapshot_path(&self, path: &Path, excludes: &BTreeSet<&str>) -> PathBuf {
+        let mut enc = canonical::Encoder::new();
+        enc.write_u32(SOURCE_SNAPSHOT_SCHEMA_VERSION);
+        enc.write_str(&path.to_string_lossy());
+        enc.write_u64(excludes.len() as u64);
+        for exclude in excludes {
+            enc.write_str(exclude);
+        }
+        self.root
+            .join("snapshots")
+            .join(format!("{}.snapshot", enc.digest().to_hex()))
     }
 
     /// Computes a directory's tree digest without importing file contents
@@ -694,6 +740,133 @@ fn hash_file(path: &Path) -> io::Result<Digest> {
     Ok(hasher.finish())
 }
 
+/// Hashes a directory's identity-bearing metadata without reading file
+/// contents. On Unix, ctime plus device/inode catches preserved-mtime edits
+/// and file replacement; names, types, modes, and symlink targets are also
+/// part of the fingerprint.
+fn metadata_fingerprint(path: &Path, excludes: &BTreeSet<&str>) -> io::Result<Digest> {
+    fn encode_metadata(
+        enc: &mut canonical::Encoder,
+        relative: &Path,
+        metadata: &fs::Metadata,
+        kind: u32,
+    ) {
+        enc.write_str(&relative.to_string_lossy());
+        enc.write_u32(kind);
+        enc.write_u64(metadata.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            enc.write_i64(metadata.mtime());
+            enc.write_i64(metadata.mtime_nsec());
+            enc.write_i64(metadata.ctime());
+            enc.write_i64(metadata.ctime_nsec());
+            enc.write_u64(metadata.dev());
+            enc.write_u64(metadata.ino());
+            enc.write_u32(metadata.mode());
+        }
+        #[cfg(not(unix))]
+        {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .unwrap_or_default();
+            enc.write_u64(modified.as_secs());
+            enc.write_u32(modified.subsec_nanos());
+            enc.write_bool(metadata.permissions().readonly());
+        }
+    }
+
+    fn walk(
+        enc: &mut canonical::Encoder,
+        root: &Path,
+        relative: &Path,
+        excludes: &BTreeSet<&str>,
+    ) -> io::Result<()> {
+        let dir = root.join(relative);
+        encode_metadata(enc, relative, &fs::symlink_metadata(&dir)?, 0);
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().into_string().map_err(|name| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-UTF-8 file name {name:?} in {}", dir.display()),
+                )
+            })?;
+            if relative.as_os_str().is_empty() && excludes.contains(name.as_str()) {
+                continue;
+            }
+            let child = relative.join(&name);
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                walk(enc, root, &child, excludes)?;
+            } else if file_type.is_file() {
+                encode_metadata(enc, &child, &metadata, 1);
+            } else if file_type.is_symlink() {
+                encode_metadata(enc, &child, &metadata, 2);
+                enc.write_str(&fs::read_link(entry.path())?.to_string_lossy());
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported file type: {}", entry.path().display()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let mut enc = canonical::Encoder::new();
+    enc.write_u32(SOURCE_SNAPSHOT_SCHEMA_VERSION);
+    walk(&mut enc, path, Path::new(""), excludes)?;
+    Ok(enc.digest())
+}
+
+fn read_snapshot(path: &Path, fingerprint: Digest) -> io::Result<Option<TreeDigest>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut dec = canonical::Decoder::new(&bytes);
+    let decoded = (|| {
+        let version = dec.read_u32().ok()?;
+        if version != SOURCE_SNAPSHOT_SCHEMA_VERSION {
+            return None;
+        }
+        let recorded = Digest::decode(&mut dec).ok()?;
+        let tree = TreeDigest::new(Digest::decode(&mut dec).ok()?);
+        dec.expect_end().ok()?;
+        (recorded == fingerprint).then_some(tree)
+    })();
+    Ok(decoded)
+}
+
+fn write_snapshot(path: &Path, fingerprint: Digest, tree: TreeDigest) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "snapshot has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut enc = canonical::Encoder::new();
+    enc.write_u32(SOURCE_SNAPSHOT_SCHEMA_VERSION);
+    fingerprint.encode(&mut enc);
+    tree.encode(&mut enc);
+    let tmp = parent.join(format!("tmp-{}", unique_name()));
+    fs::write(&tmp, enc.into_bytes())?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) if path.is_file() => {
+            // Another build published an equally valid acceleration entry.
+            let _ = fs::remove_file(tmp);
+            let _ = err;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Recursively collects the regular-file paths under `path` for parallel
 /// fingerprinting. Symlinks and unsupported file types are skipped here;
 /// the tree rebuild records them.
@@ -833,6 +1006,46 @@ mod tests {
         assert_eq!(
             fs::read_link(out.join("link")).unwrap().to_str().unwrap(),
             "a.txt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_snapshot_detects_preserved_mtime_edit() {
+        let (_dir, cas) = temp_cas();
+        let src = cas.root().parent().unwrap().join("snapshot-src");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("same-size.txt");
+        let timestamp = src.join("timestamp");
+        fs::write(&file, b"before").unwrap();
+        fs::copy(&file, &timestamp).unwrap();
+        assert!(
+            std::process::Command::new("touch")
+                .args(["-r"])
+                .arg(&file)
+                .arg(&timestamp)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let before = cas.capture_dir(&src).unwrap();
+        assert_eq!(cas.capture_dir(&src).unwrap(), before);
+
+        fs::write(&file, b"after!").unwrap();
+        assert!(
+            std::process::Command::new("touch")
+                .args(["-r"])
+                .arg(&timestamp)
+                .arg(&file)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let after = cas.capture_dir(&src).unwrap();
+        assert_ne!(
+            after, before,
+            "ctime must invalidate a preserved-mtime edit"
         );
     }
 
