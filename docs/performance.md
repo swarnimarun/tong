@@ -1,5 +1,38 @@
 # Tong vs Cargo: from-scratch build performance
 
+## 2026-08-12 large-workspace cached-build milestone
+
+The release-built Tong binary was measured on the pinned `tracing` corpus
+after warming both the Tong cache and filesystem cache. The graph contains 454
+actions and every measured action was a validated cache hit.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Tong internal wall time | 10.12 s | 0.99 s median |
+| Preparing | 3.20 s | ~0.87 s |
+| Checking cache | 6.29 s | ~0.10 s |
+| Finishing/state/GC | 0.28 s | ~0 s on unchanged state |
+
+Five release-binary wall-clock samples were 2.03, 1.02, 0.99, 1.00, and
+1.00 seconds. The first sample followed a release link and was retained in the
+raw list; the warmed median is 1.00 seconds. Tong's emitted total for the warm
+samples had a median of roughly 0.99 seconds. This reaches the first milestone
+at timer resolution but does not establish a comfortably sub-second external
+wall-time gate yet.
+
+The improvement came from build-scoped state/result/closure memoization,
+persistent input-tree assembly, a content-correct source snapshot index,
+decoded-tree caching, skipping duplicate state and automatic GC on no-op
+builds, and avoiding per-hit progress lines by default. The remaining dominant
+phase is Cargo manifest/model import plus source metadata validation during
+`Preparing`; action concretization and cache validation are no longer the
+bottleneck.
+
+`tools/cache-stability.sh` is the release-only correctness harness. It rejects
+debug Tong binaries and checks exact cache decisions for no-op, mtime-only,
+unused/unrelated file, preserved-mtime leaf edit, and edit-revert scenarios on
+the checked-in `examples/09-cache-stability` DAG.
+
 Measured 2026-08-09 on `examples/` workspaces that both tools can build.
 Purpose: quantify the clean-build gap, find where tong's time goes, and
 track regressions.
