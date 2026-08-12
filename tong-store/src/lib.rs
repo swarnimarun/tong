@@ -12,7 +12,7 @@ pub mod gc;
 pub mod state;
 
 pub use action_cache::{ActionCache, CachedResult};
-pub use cas::{CAPTURE_EXCLUDES, Cas};
+pub use cas::{CAPTURE_EXCLUDES, Cas, ClosureVerifier};
 pub use gc::{GcOptions, GcReport, sweep};
 pub use state::{
     BUILD_MANIFEST_SCHEMA_VERSION, BuildManifest, RecordedAction, StateStore, graph_digest,

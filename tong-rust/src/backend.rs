@@ -232,11 +232,11 @@ pub struct RustBackend<'a> {
     target_triple: Option<String>,
     /// Arguments passed to the test binaries (after `--`).
     test_args: Vec<String>,
-    /// Build-state store, for rerun-if-changed input narrowing (the
-    /// previous run's directives).
-    state: Option<tong_store::StateStore>,
-    /// The workspace's project hash (state lookup key).
-    project_hash: Option<tong_core::digest::Digest>,
+    /// Actions from the latest successful build, indexed once during
+    /// backend construction. Planning may consult dep-info for hundreds of
+    /// actions; reopening and decoding the same state manifest for every
+    /// lookup makes fully cached large workspaces filesystem-bound.
+    previous_actions: BTreeMap<String, tong_store::RecordedAction>,
 }
 
 impl<'a> RustBackend<'a> {
@@ -342,6 +342,18 @@ impl<'a> RustBackend<'a> {
         } else {
             BTreeSet::new()
         };
+        let previous_actions = state
+            .as_ref()
+            .zip(project_hash.as_ref())
+            .and_then(|(state, project_hash)| state.latest(project_hash))
+            .map(|manifest| {
+                manifest
+                    .actions
+                    .into_iter()
+                    .map(|action| (action.logical_id.clone(), action))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             cas,
             model,
@@ -371,8 +383,7 @@ impl<'a> RustBackend<'a> {
             rustdoc_blob: None,
             target_triple,
             test_args: test_args.to_vec(),
-            state,
-            project_hash,
+            previous_actions,
         })
     }
 
@@ -866,13 +877,7 @@ impl<'a> RustBackend<'a> {
     /// missing or malformed, or it names a path outside the package
     /// (keeping the conservative whole-tree input).
     fn previous_dep_info(&self, logical_id: &str, pkg: &Package) -> Option<Vec<PathBuf>> {
-        let state = self.state.as_ref()?;
-        let project_hash = self.project_hash?;
-        let manifest = state.latest(&project_hash)?;
-        let action = manifest
-            .actions
-            .iter()
-            .find(|action| action.logical_id == logical_id)?;
+        let action = self.previous_actions.get(logical_id)?;
         let tree = self.cas.get_tree(action.outputs).ok().flatten()?;
         let dep_text = find_dep_blob(&tree, &self.cas)?;
         let text = String::from_utf8_lossy(&dep_text);
@@ -893,15 +898,9 @@ impl<'a> RustBackend<'a> {
     /// script, read from the build-state manifest (the latest successful
     /// graph). `None` on the first build.
     fn previous_directives(&self, pkg: &Package, host_domain: bool) -> Option<Directives> {
-        let state = self.state.as_ref()?;
-        let project_hash = self.project_hash?;
-        let manifest = state.latest(&project_hash)?;
         let suffix = if host_domain { ":host" } else { "" };
         let id = format!("rust:bs-run:{}{suffix}", self.pkg_label(pkg));
-        let action = manifest
-            .actions
-            .iter()
-            .find(|action| action.logical_id == id)?;
+        let action = self.previous_actions.get(&id)?;
         let stdout = self.cas.read_blob(action.stdout).ok()?;
         Some(parse_directives(&String::from_utf8_lossy(&stdout)))
     }

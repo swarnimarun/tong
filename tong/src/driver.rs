@@ -18,8 +18,8 @@ use tong_rust::{
     RustBackend, SystemRust, ToolchainError, capture_system_rust, import_cargo_workspace,
 };
 use tong_store::{
-    ActionCache, BuildManifest, CachedResult, Cas, GcOptions, GcReport, StateStore, graph_digest,
-    project_hash, sweep,
+    ActionCache, BuildManifest, CachedResult, Cas, ClosureVerifier, GcOptions, GcReport,
+    StateStore, graph_digest, project_hash, sweep,
 };
 
 use crate::manifest_mode::manifest_to_model;
@@ -288,6 +288,10 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         actions_total: order.len(),
         ..Default::default()
     };
+    let mut closure_verifier = ClosureVerifier::default();
+    let mut concretize_duration = std::time::Duration::ZERO;
+    let mut result_lookup_duration = std::time::Duration::ZERO;
+    let mut closure_verify_duration = std::time::Duration::ZERO;
 
     for index in 0..order.len() {
         let action = &prepared.planned[order[index]];
@@ -299,7 +303,9 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
             outcome.actions_skipped += 1;
             continue;
         }
+        let t_concretize = std::time::Instant::now();
         let spec = (action.make)(&completed, cas)?;
+        concretize_duration += t_concretize.elapsed();
         let digest = spec.digest();
         // `CachePolicy::NoCache` actions (test runs, network-allowed
         // actions) must bypass the action cache entirely: no lookup, no
@@ -309,11 +315,20 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         let t_action = std::time::Instant::now();
         let mut cache_source = "executed";
         let cached_result = if cacheable {
-            match cache.get(digest)? {
-                Some(result) if result.is_complete(cas)? => Some(result),
-                Some(_) => {
-                    cache.remove(digest)?;
-                    None
+            let t_lookup = std::time::Instant::now();
+            let lookup = cache.get(digest)?;
+            result_lookup_duration += t_lookup.elapsed();
+            match lookup {
+                Some(result) => {
+                    let t_verify = std::time::Instant::now();
+                    let complete = result.is_complete_cached(cas, &mut closure_verifier)?;
+                    closure_verify_duration += t_verify.elapsed();
+                    if complete {
+                        Some(result)
+                    } else {
+                        cache.remove(digest)?;
+                        None
+                    }
                 }
                 None => None,
             }
@@ -417,6 +432,13 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         executed = outcome.actions_executed,
         skipped = outcome.actions_skipped,
         duration_ms = t_build.elapsed().as_millis() as u64,
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "schedule.detail",
+        concretize_ms = concretize_duration.as_millis() as u64,
+        result_lookup_ms = result_lookup_duration.as_millis() as u64,
+        closure_verify_ms = closure_verify_duration.as_millis() as u64,
     );
     let t_assemble = std::time::Instant::now();
     let mut artifact_pairs: Vec<(String, TreeDigest)> = Vec::new();
@@ -541,6 +563,7 @@ pub fn test(
     // Executed test runs in (label, stdout blob) order.
     let mut test_runs: Vec<(String, tong_core::artifact::BlobDigest)> = Vec::new();
     let mut failed = false;
+    let mut closure_verifier = ClosureVerifier::default();
 
     for index in 0..order.len() {
         let action = &prepared.planned[order[index]];
@@ -564,7 +587,9 @@ pub fn test(
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
         let cached_result = if cacheable {
             match cache.get(digest)? {
-                Some(result) if result.is_complete(cas)? => Some(result),
+                Some(result) if result.is_complete_cached(cas, &mut closure_verifier)? => {
+                    Some(result)
+                }
                 Some(_) => {
                     cache.remove(digest)?;
                     None

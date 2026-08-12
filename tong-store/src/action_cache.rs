@@ -14,7 +14,7 @@ use tong_core::artifact::{BlobDigest, TreeDigest};
 use tong_core::canonical::{self, CanonicalDecode, CanonicalEncode, DecodeError, Decoder, Encoder};
 use tong_core::digest::Digest;
 
-use crate::cas::Cas;
+use crate::cas::{Cas, ClosureVerifier};
 
 /// A recorded successful action result.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,9 +32,19 @@ pub struct CachedResult {
 impl CachedResult {
     /// Whether every object referenced by this result is still present.
     pub fn is_complete(&self, cas: &Cas) -> io::Result<bool> {
-        Ok(cas.has_blob(self.stdout)
-            && cas.has_blob(self.stderr)
-            && cas.has_tree_closure(self.outputs)?)
+        self.is_complete_cached(cas, &mut ClosureVerifier::default())
+    }
+
+    /// Whether every referenced object is present, reusing closure checks
+    /// already completed during this build.
+    pub fn is_complete_cached(
+        &self,
+        cas: &Cas,
+        verifier: &mut ClosureVerifier,
+    ) -> io::Result<bool> {
+        Ok(cas.has_blob_cached(self.stdout, verifier)
+            && cas.has_blob_cached(self.stderr, verifier)
+            && cas.has_tree_closure_cached(self.outputs, verifier)?)
     }
 }
 

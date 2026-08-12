@@ -36,6 +36,18 @@ pub struct Cas {
     root: PathBuf,
 }
 
+/// Build-scoped memoization for action-result closure validation.
+///
+/// CAS objects are immutable. Once a blob or complete tree closure has been
+/// observed during one build, every later cache result referencing it can
+/// reuse that proof instead of walking the same dependency output again.
+#[derive(Debug, Default)]
+pub struct ClosureVerifier {
+    blobs: BTreeSet<BlobDigest>,
+    trees: BTreeSet<TreeDigest>,
+    visiting: BTreeSet<TreeDigest>,
+}
+
 impl Cas {
     /// Opens (creating if needed) the store at `root`.
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
@@ -66,6 +78,20 @@ impl Cas {
     /// Returns whether a blob is present.
     pub fn has_blob(&self, digest: BlobDigest) -> bool {
         self.blob_path(digest).is_some()
+    }
+
+    /// Returns whether a blob is present, memoizing the result for this
+    /// build when it is present.
+    pub fn has_blob_cached(&self, digest: BlobDigest, verifier: &mut ClosureVerifier) -> bool {
+        if verifier.blobs.contains(&digest) {
+            return true;
+        }
+        if self.has_blob(digest) {
+            verifier.blobs.insert(digest);
+            true
+        } else {
+            false
+        }
     }
 
     /// Reads a blob into memory.
@@ -236,23 +262,44 @@ impl Cas {
     /// closure are present. Action-cache hits use this before exposing a
     /// recorded result to downstream actions.
     pub fn has_tree_closure(&self, root: TreeDigest) -> io::Result<bool> {
-        let mut pending = vec![root];
-        let mut seen = BTreeSet::new();
-        while let Some(digest) = pending.pop() {
-            if !seen.insert(digest) {
-                continue;
-            }
-            let Some(tree) = self.get_tree(digest)? else {
-                return Ok(false);
-            };
-            for entry in tree.entries().values() {
-                match entry {
-                    TreeEntry::File { digest, .. } if !self.has_blob(*digest) => return Ok(false),
-                    TreeEntry::Directory(subtree) => pending.push(*subtree),
-                    TreeEntry::File { .. } | TreeEntry::Symlink { .. } => {}
+        self.has_tree_closure_cached(root, &mut ClosureVerifier::default())
+    }
+
+    /// Returns whether a tree closure is present, reusing proofs accumulated
+    /// earlier in the same build.
+    pub fn has_tree_closure_cached(
+        &self,
+        root: TreeDigest,
+        verifier: &mut ClosureVerifier,
+    ) -> io::Result<bool> {
+        if verifier.trees.contains(&root) {
+            return Ok(true);
+        }
+        if !verifier.visiting.insert(root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tree closure contains a cycle at {}", root.digest()),
+            ));
+        }
+        let Some(tree) = self.get_tree(root)? else {
+            verifier.visiting.remove(&root);
+            return Ok(false);
+        };
+        for entry in tree.entries().values() {
+            let complete = match entry {
+                TreeEntry::File { digest, .. } => self.has_blob_cached(*digest, verifier),
+                TreeEntry::Directory(subtree) => {
+                    self.has_tree_closure_cached(*subtree, verifier)?
                 }
+                TreeEntry::Symlink { .. } => true,
+            };
+            if !complete {
+                verifier.visiting.remove(&root);
+                return Ok(false);
             }
         }
+        verifier.visiting.remove(&root);
+        verifier.trees.insert(root);
         Ok(true)
     }
 
@@ -519,74 +566,101 @@ impl Cas {
     /// directories create intermediate directories as needed; conflicting
     /// non-directory entries are an error.
     pub fn assemble(&self, mounts: &[(RelativePath, TreeDigest)]) -> io::Result<TreeDigest> {
-        // Build an in-memory nested structure, then store bottom-up.
-        #[derive(Default)]
-        struct Node {
-            file: Option<TreeEntry>,
-            children: std::collections::BTreeMap<String, Node>,
+        // Trees are persistent values. Overlay only the directory nodes on
+        // mount paths and at actual directory conflicts; expanding the
+        // complete source tree for every action made warm cache checks do
+        // filesystem work proportional to all source files, even when a
+        // mount merely added `deps/foo` beside them.
+        fn load(cas: &Cas, digest: TreeDigest) -> io::Result<Tree> {
+            cas.get_tree(digest)?
+                .ok_or_else(|| not_found(format!("tree {}", digest.digest())))
         }
 
-        fn insert(
-            node: &mut Node,
-            components: &[String],
-            tree: TreeDigest,
-            cas: &Cas,
-        ) -> io::Result<()> {
-            match components.split_first() {
-                None => {
-                    // Merge this tree's entries into the current node.
-                    let tree = cas
-                        .get_tree(tree)?
-                        .ok_or_else(|| not_found("assembled tree"))?;
-                    for (name, entry) in tree.entries() {
-                        match entry {
-                            TreeEntry::Directory(sub) => {
-                                let child = node.children.entry(name.clone()).or_default();
-                                insert(child, &[], *sub, cas)?;
-                            }
-                            other => {
-                                if node.children.contains_key(name) {
-                                    return Err(conflict(name));
-                                }
-                                node.children.entry(name.clone()).or_default().file =
-                                    Some(other.clone());
-                            }
-                        }
+        fn merge(cas: &Cas, base: TreeDigest, overlay: TreeDigest) -> io::Result<TreeDigest> {
+            if base == overlay {
+                return Ok(base);
+            }
+            let mut entries = load(cas, base)?.entries().clone();
+            for (name, incoming) in load(cas, overlay)?.entries() {
+                let next = match (entries.get(name), incoming) {
+                    (Some(TreeEntry::Directory(left)), TreeEntry::Directory(right)) => {
+                        TreeEntry::Directory(merge(cas, *left, *right)?)
                     }
-                    Ok(())
-                }
-                Some((first, rest)) => {
-                    let child = node.children.entry(first.clone()).or_default();
-                    insert(child, rest, tree, cas)
-                }
-            }
-        }
-
-        fn store(node: &Node, cas: &Cas) -> io::Result<TreeDigest> {
-            let mut entries = std::collections::BTreeMap::new();
-            for (name, child) in &node.children {
-                let entry = match &child.file {
-                    Some(file) if child.children.is_empty() => file.clone(),
-                    Some(_) => return Err(conflict(name)),
-                    None => TreeEntry::Directory(store(child, cas)?),
+                    (Some(TreeEntry::Directory(_)), _) | (Some(_), TreeEntry::Directory(_)) => {
+                        return Err(conflict(name));
+                    }
+                    // As in the old assembler, a later non-directory mount
+                    // replaces an earlier non-directory entry.
+                    (_, entry) => entry.clone(),
                 };
-                entries.insert(name.clone(), entry);
+                entries.insert(name.clone(), next);
             }
-            let tree = Tree::new(entries)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-            cas.put_tree(&tree)
+            cas.put_tree(
+                &Tree::new(entries)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?,
+            )
         }
 
-        let mut root = Node::default();
+        #[derive(Default)]
+        struct MountNode {
+            roots: Vec<TreeDigest>,
+            children: BTreeMap<String, MountNode>,
+        }
+
+        fn add(node: &mut MountNode, components: &[&str], mounted: TreeDigest) {
+            if let Some((name, rest)) = components.split_first() {
+                add(
+                    node.children.entry((*name).to_owned()).or_default(),
+                    rest,
+                    mounted,
+                );
+            } else {
+                node.roots.push(mounted);
+            }
+        }
+
+        fn store(cas: &Cas, node: &MountNode) -> io::Result<TreeDigest> {
+            let mut base = None;
+            for root in &node.roots {
+                base = Some(match base {
+                    Some(base) => merge(cas, base, *root)?,
+                    None => *root,
+                });
+            }
+            if node.children.is_empty() {
+                return base.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "empty mount node")
+                });
+            }
+            let mut entries = match base {
+                Some(base) => load(cas, base)?.entries().clone(),
+                None => BTreeMap::new(),
+            };
+            for (name, child_node) in &node.children {
+                let child = store(cas, child_node)?;
+                let child = match entries.get(name) {
+                    Some(TreeEntry::Directory(existing)) => merge(cas, *existing, child)?,
+                    Some(_) => return Err(conflict(name)),
+                    None => child,
+                };
+                entries.insert(name.clone(), TreeEntry::Directory(child));
+            }
+            cas.put_tree(
+                &Tree::new(entries)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?,
+            )
+        }
+
+        let mut root = MountNode::default();
         for (mount, tree) in mounts {
-            let components: Vec<String> = if mount.as_str() == RelativePath::ROOT {
+            let components: Vec<&str> = if mount.as_str() == RelativePath::ROOT {
                 Vec::new()
             } else {
-                mount.as_str().split('/').map(str::to_owned).collect()
+                mount.as_str().split('/').collect()
             };
-            insert(&mut root, &components, *tree, self)?;
+            add(&mut root, &components, *tree);
         }
-        store(&root, self)
+        store(self, &root)
     }
 }
 
