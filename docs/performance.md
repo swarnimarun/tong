@@ -146,12 +146,20 @@ The improvement path on `01-calc` (same machine, same code):
 
 ## Where the time goes
 
-Collect per-phase metrics with the built-in tracing (stderr, so it can be
-forwarded separately):
+Collect per-phase metrics for lock, fetch, and build with the built-in tracing
+(stderr, so it can be forwarded separately):
 
 ```sh
-RUST_LOG=tong::perf=debug tong build 2> perf.log
+RUST_LOG=tong::perf=debug tong lock 2> lock-perf.log
+RUST_LOG=tong::perf=debug tong fetch 2> fetch-perf.log
+RUST_LOG=tong::perf=debug tong build 2> build-perf.log
 ```
+
+Human output also prints a duration for each command phase. With
+`--message-format json`, phase and command completion events include
+`duration_ms`; fetch additionally emits one timed `fetch-finished` event per
+source. Locked registry and git sources are fetched concurrently, bounded by
+the lesser of the host's available parallelism and eight workers.
 
 `01-calc`, cold-workspace build with a warm capture cache (ms):
 

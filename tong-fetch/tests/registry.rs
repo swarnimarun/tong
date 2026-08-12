@@ -277,6 +277,46 @@ fn fetch_crate_verifies_and_rejects_corruption() {
     );
 }
 
+#[test]
+fn independent_crates_can_be_fetched_concurrently() {
+    let registry = build_fixture();
+    let store = tempfile::tempdir().unwrap();
+    let cas = Cas::open(store.path().join("store")).unwrap();
+    let client = client(&registry);
+    let packages = resolve(
+        &client,
+        &[root(vec![edge("alpha", "^1"), edge("beta", "*")])],
+        &TongLock::default(),
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    let alpha = packages.iter().find(|pkg| pkg.name == "alpha").unwrap();
+    let beta = packages.iter().find(|pkg| pkg.name == "beta").unwrap();
+
+    std::thread::scope(|scope| {
+        let alpha_fetch = scope.spawn(|| {
+            let mut config = registry.config.clone();
+            tong_fetch::fetch_crate(&cas, &mut config, alpha)
+        });
+        let beta_fetch = scope.spawn(|| {
+            let mut config = registry.config.clone();
+            tong_fetch::fetch_crate(&cas, &mut config, beta)
+        });
+        alpha_fetch.join().unwrap().unwrap();
+        beta_fetch.join().unwrap().unwrap();
+    });
+
+    for package in [alpha, beta] {
+        let checksum = package.checksum.as_deref().unwrap();
+        assert!(tong_fetch::crate_blob_path(cas.root(), checksum).is_file());
+        assert!(
+            tong_fetch::materialize_source(cas.root(), &package.name, &package.version, checksum,)
+                .unwrap()
+                .is_dir()
+        );
+    }
+}
+
 /// A whole-checkout helper for the driver-level e2e test in `tong`.
 pub fn fixture_registry() -> (PathBuf, RegistryConfig) {
     let registry = build_fixture();

@@ -293,6 +293,105 @@ fn offline_commands_never_fetch() {
 }
 
 #[test]
+fn fetch_reports_stale_lockfile_and_phase_timings() {
+    let (_registry, workspace, registry_root) = setup();
+    let ws = workspace.path();
+    let index = registry_root.join("index");
+
+    let lock = run_tong_registry(ws, &index, &["lock"]);
+    assert!(
+        lock.status.success(),
+        "lock failed: {}{}",
+        stdout_of(&lock),
+        stderr_of(&lock)
+    );
+    let lock_stderr = stderr_of(&lock);
+    for phase in [
+        "Analyzing manifests",
+        "Resolving lockfile",
+        "Writing lockfile",
+    ] {
+        assert!(
+            lock_stderr.contains(phase),
+            "missing {phase:?} timing: {lock_stderr}"
+        );
+    }
+
+    for (command, expected_event) in [
+        (
+            &["--message-format", "json", "lock"][..],
+            "command-finished",
+        ),
+        (&["--message-format", "json", "fetch"][..], "fetch-finished"),
+    ] {
+        let output = run_tong_registry(ws, &index, command);
+        assert!(
+            output.status.success(),
+            "JSON command failed: {}{}",
+            stdout_of(&output),
+            stderr_of(&output)
+        );
+        let events: Vec<serde_json::Value> = stdout_of(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap_or_else(|err| panic!("{err}: {line}")))
+            .collect();
+        assert!(
+            events.iter().any(|event| event["type"] == expected_event),
+            "missing {expected_event}: {events:?}"
+        );
+        assert!(events.iter().all(|event| event["schema_version"] == 1));
+    }
+
+    let manifest = fs::read_to_string(ws.join("Cargo.toml")).unwrap();
+    fs::write(
+        ws.join("Cargo.toml"),
+        manifest.replace("version = \"0.1.0\"", "version = \"0.2.0\""),
+    )
+    .unwrap();
+
+    let fetch = run_tong_registry(ws, &index, &["fetch"]);
+    assert!(
+        fetch.status.success(),
+        "fetch failed: {}{}",
+        stdout_of(&fetch),
+        stderr_of(&fetch)
+    );
+    let fetch_stderr = stderr_of(&fetch);
+    assert!(
+        fetch_stderr.contains("Tong.lock appears stale")
+            && fetch_stderr.contains("run `tong lock`"),
+        "missing stale-lock warning: {fetch_stderr}"
+    );
+    for phase in ["Inspecting lockfile", "Fetching sources"] {
+        assert!(
+            fetch_stderr.contains(phase),
+            "missing {phase:?} timing: {fetch_stderr}"
+        );
+    }
+
+    let build = run_tong_registry(ws, &index, &["build"]);
+    assert!(
+        build.status.success(),
+        "ordinary stale-lock build failed: {}{}",
+        stdout_of(&build),
+        stderr_of(&build)
+    );
+    assert!(
+        stderr_of(&build).contains("Tong.lock appears stale"),
+        "ordinary build did not warn about stale lock: {}",
+        stderr_of(&build)
+    );
+
+    let build = run_tong_registry(ws, &index, &["build", "--locked"]);
+    assert!(!build.status.success(), "stale locked build must fail");
+    assert!(
+        stderr_of(&build).contains("Tong.lock appears stale"),
+        "missing stale locked-build diagnostic: {}",
+        stderr_of(&build)
+    );
+}
+
+#[test]
 fn offline_build_rejects_missing_pinned_toolchain() {
     // A `[toolchain.rust] kind = "dist"` version that was never fetched:
     // `prepare` must fail with the fetch remedy before any download, with

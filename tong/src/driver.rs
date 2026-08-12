@@ -7,6 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tong_core::action::{ActionId, CachePolicy};
 use tong_core::artifact::TreeDigest;
@@ -145,6 +146,23 @@ impl Progress {
             }),
         );
     }
+
+    fn command_finished(
+        &self,
+        command: &str,
+        duration: std::time::Duration,
+        fields: serde_json::Value,
+    ) {
+        let mut detail = serde_json::json!({
+            "command": command,
+            "duration_ms": duration.as_millis() as u64,
+            "outcome": "success",
+        });
+        if let (Some(detail), Some(fields)) = (detail.as_object_mut(), fields.as_object()) {
+            detail.extend(fields.clone());
+        }
+        self.event("command-finished", detail);
+    }
 }
 
 fn display_duration(duration: std::time::Duration) -> String {
@@ -152,6 +170,48 @@ fn display_duration(duration: std::time::Duration) -> String {
         format!("{}ms", duration.as_millis())
     } else {
         format!("{:.2}s", duration.as_secs_f64())
+    }
+}
+
+/// Returns path/workspace packages whose current Cargo manifest no longer
+/// matches the fingerprint recorded in `Tong.lock`. This is deliberately an
+/// "appears stale" check: it catches changed and removed known manifests,
+/// while full dependency-graph validation still happens during analysis.
+fn stale_lockfile_packages(root: &Path, lock: &tong_fetch::TongLock) -> Vec<String> {
+    lock.packages
+        .iter()
+        .filter_map(|package| {
+            let rel = package.source.strip_prefix("path+")?;
+            let expected = package.manifest_checksum.as_deref()?;
+            let manifest = root.join(rel).join("Cargo.toml");
+            let current = fs::read(&manifest)
+                .ok()
+                .map(|bytes| tong_core::digest::Hasher::digest(&bytes).to_hex());
+            (current.as_deref() != Some(expected)).then(|| package.name.clone())
+        })
+        .collect()
+}
+
+fn stale_lockfile_message(packages: &[String]) -> String {
+    format!(
+        "Tong.lock appears stale (changed manifests: {}); run `tong lock`",
+        packages.join(", ")
+    )
+}
+
+fn report_stale_lockfile(progress: &Progress, packages: &[String]) {
+    if packages.is_empty() {
+        return;
+    }
+    progress.event(
+        "lockfile-stale",
+        serde_json::json!({
+            "packages": packages,
+            "remedy": "run `tong lock`",
+        }),
+    );
+    if matches!(output_options().message_format, MessageFormat::Human) {
+        eprintln!("tong: warning: {}", stale_lockfile_message(packages));
     }
 }
 
@@ -1077,6 +1137,17 @@ fn prepare(
         }
         println!("tong: no Tong.lock — running `tong lock` first");
         lock(root, false)?;
+    }
+    if root.join("Tong.lock").is_file() {
+        let lock = tong_fetch::TongLock::load(root)
+            .map_err(|err| BuildError::Manifest(err.to_string()))?;
+        let stale = stale_lockfile_packages(root, &lock);
+        if !stale.is_empty() && (options.offline || options.locked) {
+            return Err(BuildError::Offline(stale_lockfile_message(&stale)));
+        }
+        if !stale.is_empty() {
+            eprintln!("tong: warning: {}", stale_lockfile_message(&stale));
+        }
     }
     let store = store_dir(root, manifest.as_ref())?;
     let exec = tong_dir.join("exec");
@@ -3043,6 +3114,10 @@ fn seed_from_cargo_lock(
 }
 
 fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Result<(), BuildError> {
+    let t_total = std::time::Instant::now();
+    let progress = Progress::new();
+    let t_analyze = std::time::Instant::now();
+    progress.phase_started("Analyzing manifests");
     let manifest = load_manifest(root)?;
     let store = store_dir(root, manifest.as_ref())?;
     let cas = Cas::open(&store)?;
@@ -3211,13 +3286,28 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
             deps,
         });
     }
-    println!(
-        "resolving {} packages ({} registry edges) against {}",
-        locals.len(),
-        registry_edges,
-        registry.index_url
+    if !json_output() {
+        println!(
+            "resolving {} packages ({} registry edges) against {}",
+            locals.len(),
+            registry_edges,
+            registry.index_url
+        );
+    }
+    let analyze_duration = t_analyze.elapsed();
+    progress.phase_finished(
+        "Analyzing manifests",
+        analyze_duration,
+        &format!("{} local packages", locals.len()),
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "lock.analyze",
+        packages = locals.len(),
+        duration_ms = analyze_duration.as_millis() as u64,
     );
     let t_resolve = std::time::Instant::now();
+    progress.phase_started("Resolving lockfile");
     // `[patch]` applies to Cargo workspaces only (`manifest` is `None`
     // for Cargo mode); native Tong.toml roots have no Cargo.toml.
     let patched: std::collections::BTreeSet<String> = if manifest.is_none() {
@@ -3236,11 +3326,25 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
         packages = resolved.len(),
         duration_ms = t_resolve.elapsed().as_millis() as u64,
     );
+    let resolve_duration = t_resolve.elapsed();
+    progress.phase_finished(
+        "Resolving lockfile",
+        resolve_duration,
+        &format!("{} packages", resolved.len()),
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "lock.resolve",
+        packages = resolved.len(),
+        duration_ms = resolve_duration.as_millis() as u64,
+    );
 
     // Assemble the lock: every resolved package, registry or local, with
     // exact per-edge identities (a name may resolve to several versions or
     // sources). Sources come from the resolver — a local `foo` and a
     // registry `foo` never alias.
+    let t_write = std::time::Instant::now();
+    progress.phase_started("Writing lockfile");
     let mut locked = tong_fetch::TongLock {
         version: tong_fetch::LOCKFILE_VERSION,
         packages: Vec::new(),
@@ -3330,7 +3434,35 @@ fn lock_with(root: &Path, offline: bool, drop_preference: Option<&str>) -> Resul
     for checkout in git_checkouts {
         let _ = fs::remove_dir_all(checkout);
     }
-    println!("wrote Tong.lock ({} packages)", locked.packages.len());
+    let write_duration = t_write.elapsed();
+    progress.phase_finished(
+        "Writing lockfile",
+        write_duration,
+        &format!("{} packages", locked.packages.len()),
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "lock.write",
+        packages = locked.packages.len(),
+        duration_ms = write_duration.as_millis() as u64,
+    );
+    if !json_output() {
+        println!("wrote Tong.lock ({} packages)", locked.packages.len());
+    }
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "lock.total",
+        duration_ms = t_total.elapsed().as_millis() as u64,
+    );
+    progress.command_finished(
+        if drop_preference.is_some() {
+            "update"
+        } else {
+            "lock"
+        },
+        t_total.elapsed(),
+        serde_json::json!({ "packages": locked.packages.len() }),
+    );
     Ok(())
 }
 
@@ -3348,11 +3480,120 @@ pub fn toolchain_fetch(root: &Path, version: &str, target: Option<&str>) -> Resu
     Ok(())
 }
 
+enum SourceFetchKind {
+    Registry(tong_fetch::ResolvedPackage),
+    Git {
+        url: String,
+        commit: String,
+        tree: TreeDigest,
+    },
+}
+
+struct SourceFetchTask {
+    name: String,
+    version: semver::Version,
+    kind: SourceFetchKind,
+}
+
+/// Avoid overwhelming registries with one connection per logical CPU on
+/// large machines while still keeping typical developer links saturated.
+const MAX_FETCH_WORKERS: usize = 8;
+
+/// Fetches independent locked sources concurrently. Results are reported by
+/// the caller thread as workers finish so output remains line-oriented, while
+/// errors are returned in lockfile order for deterministic diagnostics.
+fn fetch_sources_parallel(
+    cas: &Cas,
+    store: &Path,
+    registry: &tong_fetch::RegistryConfig,
+    tasks: &[SourceFetchTask],
+    progress: &Progress,
+) -> Result<(), BuildError> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .min(MAX_FETCH_WORKERS)
+        .min(tasks.len());
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut results = std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(task) = tasks.get(index) else {
+                        break;
+                    };
+                    let started = std::time::Instant::now();
+                    let result = match &task.kind {
+                        SourceFetchKind::Registry(package) => {
+                            let mut registry = registry.clone();
+                            tong_fetch::fetch_crate(cas, &mut registry, package)
+                                .map(|_| ())
+                                .map_err(|err| err.to_string())
+                        }
+                        SourceFetchKind::Git { url, commit, tree } => {
+                            tong_fetch::materialize_tree(cas, *tree, store, url, commit)
+                                .map(|_| ())
+                                .map_err(|err| format!("{err}; run `tong lock`"))
+                        }
+                    };
+                    let _ = sender.send((index, started.elapsed(), result));
+                }
+            });
+        }
+        drop(sender);
+
+        let mut completed = 0usize;
+        let mut results = Vec::with_capacity(tasks.len());
+        while let Ok((index, duration, result)) = receiver.recv() {
+            completed += 1;
+            let task = &tasks[index];
+            let outcome = if result.is_ok() { "success" } else { "failure" };
+            progress.event(
+                "fetch-finished",
+                serde_json::json!({
+                    "package": task.name,
+                    "version": task.version,
+                    "duration_ms": duration.as_millis() as u64,
+                    "outcome": outcome,
+                }),
+            );
+            if matches!(output_options().message_format, MessageFormat::Human) {
+                eprintln!(
+                    "  {} [{completed}/{}] {} {} {}",
+                    if result.is_ok() { "Fetched" } else { "Failed" },
+                    tasks.len(),
+                    task.name,
+                    task.version,
+                    display_duration(duration)
+                );
+            }
+            results.push((index, result));
+        }
+        results
+    });
+    results.sort_by_key(|(index, _)| *index);
+    for (_, result) in results {
+        result.map_err(BuildError::Manifest)?;
+    }
+    Ok(())
+}
+
 /// Downloads every locked registry package into the source store; a no-op
 /// when everything is already stored. `--offline` never touches the
 /// network: missing blobs fail with a targeted diagnostic before any
 /// download is attempted.
 pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
+    let t_total = std::time::Instant::now();
+    let progress = Progress::new();
+    let t_inspect = std::time::Instant::now();
+    progress.phase_started("Inspecting lockfile");
     let manifest = load_manifest(root)?;
     if !root.join("Tong.lock").is_file() {
         if offline {
@@ -3369,6 +3610,8 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
     let cas = Cas::open(&store)?;
     let lock =
         tong_fetch::TongLock::load(root).map_err(|err| BuildError::Manifest(err.to_string()))?;
+    let stale = stale_lockfile_packages(root, &lock);
+    report_stale_lockfile(&progress, &stale);
     let mut registry = registry_config(manifest.as_ref())?;
     let missing: Vec<&tong_fetch::LockedPackage> = lock
         .packages
@@ -3401,27 +3644,21 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
                 .join(", ")
         )));
     }
-    let total = lock
-        .packages
-        .iter()
-        .filter(|package| {
-            (package.source.starts_with("registry+") && package.checksum.is_some())
-                || package.source.starts_with("git+")
-        })
-        .count();
-    let mut fetched = 0usize;
+    let mut tasks = Vec::new();
+    let mut registry_sources = BTreeSet::new();
+    let mut git_sources = BTreeSet::new();
     for package in &lock.packages {
         if package.source.starts_with("registry+") {
             let Some(checksum) = &package.checksum else {
                 continue;
             };
-            println!(
-                "  downloading {}/{} {} {}",
-                fetched + 1,
-                total,
-                package.name,
-                package.version
-            );
+            if !registry_sources.insert((
+                package.name.clone(),
+                package.version.clone(),
+                checksum.clone(),
+            )) {
+                continue;
+            }
             let resolved = tong_fetch::ResolvedPackage {
                 name: package.name.clone(),
                 version: package.version.clone(),
@@ -3431,9 +3668,11 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
                 local: false,
                 dependencies: Vec::new(),
             };
-            tong_fetch::fetch_crate(&cas, &mut registry, &resolved)
-                .map_err(|err| BuildError::Manifest(err.to_string()))?;
-            fetched += 1;
+            tasks.push(SourceFetchTask {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                kind: SourceFetchKind::Registry(resolved),
+            });
         } else if let Some(rest) = package.source.strip_prefix("git+") {
             // Materialize the locked tree from the CAS and verify it.
             let Some((url, commit)) = rest.split_once('#') else {
@@ -3447,19 +3686,80 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
             })?;
             let tree_digest = tong_core::digest::Digest::from_hex(tree_digest)
                 .map_err(|err| BuildError::Manifest(format!("invalid tree digest: {err}")))?;
-            println!(
-                "  materializing {}/{} {} {}",
-                fetched + 1,
-                total,
-                package.name,
-                package.version
-            );
-            tong_fetch::materialize_tree(&cas, TreeDigest::new(tree_digest), &store, url, commit)
-                .map_err(|err| BuildError::Manifest(format!("{err}; run `tong lock`")))?;
-            fetched += 1;
+            if !git_sources.insert((url.to_owned(), commit.to_owned(), tree_digest)) {
+                continue;
+            }
+            tasks.push(SourceFetchTask {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                kind: SourceFetchKind::Git {
+                    url: url.to_owned(),
+                    commit: commit.to_owned(),
+                    tree: TreeDigest::new(tree_digest),
+                },
+            });
         }
     }
-    println!("fetched {fetched} crates");
+    if !offline
+        && tasks.iter().any(|task| {
+            let SourceFetchKind::Registry(package) = &task.kind else {
+                return false;
+            };
+            package
+                .checksum
+                .as_deref()
+                .is_some_and(|checksum| !tong_fetch::crate_blob_path(&store, checksum).is_file())
+        })
+    {
+        registry
+            .ensure_configured()
+            .map_err(|err| BuildError::Manifest(err.to_string()))?;
+    }
+    let inspect_duration = t_inspect.elapsed();
+    progress.phase_finished(
+        "Inspecting lockfile",
+        inspect_duration,
+        &format!("{} sources", tasks.len()),
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "fetch.inspect",
+        sources = tasks.len(),
+        stale = stale.len(),
+        duration_ms = inspect_duration.as_millis() as u64,
+    );
+
+    let t_fetch = std::time::Instant::now();
+    progress.phase_started("Fetching sources");
+    fetch_sources_parallel(&cas, &store, &registry, &tasks, &progress)?;
+    let fetch_duration = t_fetch.elapsed();
+    progress.phase_finished(
+        "Fetching sources",
+        fetch_duration,
+        &format!("{} sources", tasks.len()),
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "fetch.sources",
+        sources = tasks.len(),
+        duration_ms = fetch_duration.as_millis() as u64,
+    );
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "fetch.total",
+        duration_ms = t_total.elapsed().as_millis() as u64,
+    );
+    if !json_output() {
+        println!("fetched {} sources", tasks.len());
+    }
+    progress.command_finished(
+        "fetch",
+        t_total.elapsed(),
+        serde_json::json!({
+            "sources": tasks.len(),
+            "stale_lockfile": !stale.is_empty(),
+        }),
+    );
     Ok(())
 }
 

@@ -767,7 +767,7 @@ pub fn resolve(
 
             let chosen = ctx.activations.len();
             if chosen.is_multiple_of(25) {
-                println!(
+                eprintln!(
                     "  resolved {} packages so far ({} pending)",
                     chosen,
                     remaining_deps.data.len()
@@ -929,7 +929,7 @@ pub fn resolve(
         })
         .collect();
     check_cycles(&out, &cycle_edges)?;
-    println!("  resolved {} packages", out.len());
+    eprintln!("  resolved {} packages", out.len());
     info!(
         target: "tong::lock",
         phase = "resolve.total",

@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use semver::Version;
 
@@ -20,6 +21,7 @@ use crate::registry::{FetchError, RegistryConfig, fetch_crate_bytes};
 use crate::resolve::ResolvedPackage;
 
 const SOURCE_EXTRACTION_SCHEMA_VERSION: u32 = 1;
+static SOURCE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The `.crate` blob path for a checksum.
 pub fn crate_blob_path(store: &Path, checksum: &str) -> PathBuf {
@@ -52,10 +54,7 @@ pub fn record_source_tree(
     let tmp = parent.join(format!(
         ".tmp-tree-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
+        SOURCE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&tmp, tree.digest().to_hex())?;
     match fs::rename(&tmp, &path) {
@@ -190,7 +189,11 @@ fn extract_crate(archive: &Path, dest: &Path) -> Result<(), FetchError> {
     // The archive contains a single top-level dir `<name>-<version>/`;
     // extract to a temp dir and rename the inner dir into place, so a
     // partial extraction never leaves a half-valid checkout.
-    let tmp = parent.join(format!(".tmp-{}", std::process::id()));
+    let tmp = parent.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        SOURCE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
     tar.unpack(&tmp).map_err(|err| {
