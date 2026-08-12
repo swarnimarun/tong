@@ -1,0 +1,13 @@
+[package]
+name = "cache-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cache-leaf-a = { path = "../leaf-a" }
+cache-leaf-b = { path = "../leaf-b" }
+cache-macros = { path = "../macros" }
+
+[[bench]]
+name = "smoke"
+harness = false

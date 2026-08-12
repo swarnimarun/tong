@@ -1,0 +1,41 @@
+version = 2
+
+[[package]]
+name = "cache-app"
+version = "0.1.0"
+source = "path+app"
+manifest_checksum = "e9e70f9ea2682a89fd34191a3bf6f30d0871e323f1d3e23104dbbc3252ca2042"
+yanked = false
+dependencies = ["cache-leaf-a 0.1.0 path+leaf-a", "cache-leaf-b 0.1.0 path+leaf-b", "cache-macros 0.1.0 path+macros"]
+
+[[package]]
+name = "cache-leaf-a"
+version = "0.1.0"
+source = "path+leaf-a"
+manifest_checksum = "b49799ad365a450bc5bc5e914f95e49210982b1ef25408588a598820cf66e24b"
+yanked = false
+dependencies = ["cache-shared 0.1.0 path+shared"]
+
+[[package]]
+name = "cache-leaf-b"
+version = "0.1.0"
+source = "path+leaf-b"
+manifest_checksum = "32ff5ef3a2c702a211f40b6b86126cd6aea7c2b0457337a41a0cb5b0289eeaf3"
+yanked = false
+dependencies = ["cache-shared 0.1.0 path+shared"]
+
+[[package]]
+name = "cache-macros"
+version = "0.1.0"
+source = "path+macros"
+manifest_checksum = "4b18c90ac66d94c0bedad30fe44cfde67db6016e3f3d438daf3a2f5f669edf6d"
+yanked = false
+dependencies = []
+
+[[package]]
+name = "cache-shared"
+version = "0.1.0"
+source = "path+shared"
+manifest_checksum = "b29e6c1fc279f1aed8ff29101da9a8765c066e272752ea14a8183611a90fe581"
+yanked = false
+dependencies = []

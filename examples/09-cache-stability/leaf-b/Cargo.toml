@@ -1,0 +1,10 @@
+[package]
+name = "cache-leaf-b"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cache-shared = { path = "../shared" }
+
+[target.'cfg(unix)'.dependencies]
+cache-shared = { path = "../shared" }
