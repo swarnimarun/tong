@@ -8,17 +8,17 @@ actions and every measured action was a validated cache hit.
 
 | Metric | Before | After |
 |---|---:|---:|
-| Tong internal wall time | 10.12 s | 0.99 s median |
-| Preparing | 3.20 s | ~0.87 s |
+| Tong internal wall time | 10.12 s | 0.90 s median |
+| Preparing | 3.20 s | ~0.80 s |
 | Checking cache | 6.29 s | ~0.10 s |
 | Finishing/state/GC | 0.28 s | ~0 s on unchanged state |
 
-Five release-binary wall-clock samples were 2.03, 1.02, 0.99, 1.00, and
-1.00 seconds. The first sample followed a release link and was retained in the
-raw list; the warmed median is 1.00 seconds. Tong's emitted total for the warm
-samples had a median of roughly 0.99 seconds. This reaches the first milestone
-at timer resolution but does not establish a comfortably sub-second external
-wall-time gate yet.
+After enabling the checksum-sidecar fast path, five release-binary wall-clock
+samples were 1.66, 0.90, 0.90, 0.91, and 0.89 seconds. The first sample
+followed a release link and was retained in the raw list; the warmed median is
+0.90 seconds. Tong's emitted total for the warm samples had a median of 0.896
+seconds. This establishes the first sub-second cached-build milestone on the
+fixture.
 
 The improvement came from build-scoped state/result/closure memoization,
 persistent input-tree assembly, a content-correct source snapshot index,

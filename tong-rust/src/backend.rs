@@ -399,20 +399,39 @@ impl<'a> RustBackend<'a> {
                 continue;
             }
             let mut excludes = CAPTURE_EXCLUDES.iter().copied().collect();
-            let mut tree = if let Some(tree) = pkg.source_tree {
-                if !self
-                    .cas
-                    .has_tree_closure_cached(tree, &mut source_verifier)?
-                {
-                    return Err(PlanError::Message(format!(
-                        "pre-captured source tree {} for {} is incomplete",
-                        tree.digest(),
-                        pkg.id
-                    )));
+            let mut tree = match (&pkg.id.source, pkg.source_tree) {
+                // Registry checkouts remain available for Cargo manifest
+                // import. Snapshot-capture them and compare to the tree made
+                // from the checksum-verified archive during `tong fetch`.
+                (crate::model::SourceId::Registry(_), Some(expected)) => {
+                    let captured = self.cas.capture_dir_filtered(&pkg.dir, &excludes)?;
+                    if captured != expected {
+                        return Err(PlanError::Message(format!(
+                            "locked source checkout for {} changed (expected {}, got {}); \
+                             remove it and run `tong fetch`",
+                            pkg.id,
+                            expected.digest(),
+                            captured.digest()
+                        )));
+                    }
+                    captured
                 }
-                tree
-            } else {
-                self.cas.capture_dir_filtered(&pkg.dir, &excludes)?
+                // Git's lock entry already names the CAS tree itself; do not
+                // materialize and recapture it merely to prove the digest.
+                (_, Some(tree)) => {
+                    if !self
+                        .cas
+                        .has_tree_closure_cached(tree, &mut source_verifier)?
+                    {
+                        return Err(PlanError::Message(format!(
+                            "pre-captured source tree {} for {} is incomplete",
+                            tree.digest(),
+                            pkg.id
+                        )));
+                    }
+                    tree
+                }
+                (_, None) => self.cas.capture_dir_filtered(&pkg.dir, &excludes)?,
             };
 
             // Some archive/cache transports materialize a Git symlink as

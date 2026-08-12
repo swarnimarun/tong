@@ -226,6 +226,15 @@ fn registry_end_to_end_offline_build() {
         fs::read_dir(sources.join("checkout")).unwrap().count() >= 2,
         "expected alpha + beta checkouts"
     );
+    assert!(
+        fs::read_dir(&sources)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tree-v1"))
+            .count()
+            >= 2,
+        "expected versioned source-tree sidecars"
+    );
 
     // `tong build` compiles and links the registry deps.
     let output = run_tong(ws, &index, &["build"]);
@@ -260,6 +269,48 @@ fn registry_end_to_end_offline_build() {
     assert!(
         stdout.trim().ends_with("sum=15"),
         "expected the program output, got: {stdout}"
+    );
+
+    // A build must not trust a modified registry checkout merely because a
+    // fetch-time sidecar exists. An explicit fetch repairs it from the
+    // checksum-verified archive.
+    let alpha_checkout = fs::read_dir(sources.join("checkout"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("alpha-1.0.0-")
+        })
+        .expect("alpha checkout")
+        .path();
+    fs::write(
+        alpha_checkout.join("src/lib.rs"),
+        "pub fn alpha() -> u32 { 99 }\n",
+    )
+    .unwrap();
+    let output = run_tong(ws, &index, &["build"]);
+    assert!(
+        !output.status.success(),
+        "modified checkout must fail build"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("locked source checkout"),
+        "expected a checkout-integrity error, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_tong(ws, &index, &["fetch", "--offline"]);
+    assert!(
+        output.status.success(),
+        "fetch failed to repair checkout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_tong(ws, &index, &["build"]);
+    assert!(
+        output.status.success(),
+        "build after checkout repair failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     // Corrupt a stored .crate blob: `tong fetch` rejects it.

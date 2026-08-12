@@ -19,13 +19,17 @@ use tong_store::Cas;
 use crate::registry::{FetchError, RegistryConfig, fetch_crate_bytes};
 use crate::resolve::ResolvedPackage;
 
+const SOURCE_EXTRACTION_SCHEMA_VERSION: u32 = 1;
+
 /// The `.crate` blob path for a checksum.
 pub fn crate_blob_path(store: &Path, checksum: &str) -> PathBuf {
     store.join("sources").join(format!("{checksum}.crate"))
 }
 
 fn source_tree_path(store: &Path, checksum: &str) -> PathBuf {
-    store.join("sources").join(format!("{checksum}.tree"))
+    store.join("sources").join(format!(
+        "{checksum}.tree-v{SOURCE_EXTRACTION_SCHEMA_VERSION}"
+    ))
 }
 
 /// Reads the canonical source tree captured for a checksum-locked archive.
@@ -103,10 +107,33 @@ pub fn fetch_crate(
     }
 
     let checkout = checkout_dir(cas.root(), &pkg.name, &pkg.version, checksum);
+    let expected_tree = source_tree_digest(cas.root(), checksum);
+    if checkout.is_dir()
+        && expected_tree.is_some_and(|expected| {
+            cas.capture_dir(&checkout)
+                .is_ok_and(|captured| captured != expected)
+        })
+    {
+        // A verified sidecar is authoritative. Repair a modified checkout
+        // from the checksum-verified archive instead of blessing its current
+        // contents with a replacement sidecar.
+        fs::remove_dir_all(&checkout)?;
+    }
     if !checkout.is_dir() {
         extract_crate(&blob_path, &checkout)?;
     }
     let tree = cas.capture_dir(&checkout).map_err(FetchError::Io)?;
+    if let Some(expected) = expected_tree
+        && tree != expected
+    {
+        return Err(FetchError::BadConfig(format!(
+            "source tree for `{} {}` changed after verified extraction (expected {}, got {})",
+            pkg.name,
+            pkg.version,
+            expected.digest(),
+            tree.digest()
+        )));
+    }
     record_source_tree(cas.root(), checksum, tree)?;
     Ok(tree)
 }
@@ -138,8 +165,15 @@ pub fn materialize_source(
             "source archive for `{name} {version}` ({checksum}.crate)"
         )));
     }
-    verify_crate_bytes(&fs::read(&blob_path)?, checksum, name)?;
     let checkout = checkout_dir(store, name, version, checksum);
+    // A fetch-time tree sidecar is produced only after the archive checksum
+    // was verified and extraction captured. Builds validate the checkout's
+    // content tree against this digest, so re-reading every compressed
+    // archive here adds I/O without adding integrity.
+    if checkout.is_dir() && source_tree_digest(store, checksum).is_some() {
+        return Ok(checkout);
+    }
+    verify_crate_bytes(&fs::read(&blob_path)?, checksum, name)?;
     if !checkout.is_dir() {
         extract_crate(&blob_path, &checkout)?;
     }
@@ -268,8 +302,25 @@ mod tests {
         let checkout = checkout_dir(&store, "foo", &pkg.version, checksum);
         assert!(checkout.join("Cargo.toml").is_file());
         assert!(checkout.join("src/lib.rs").is_file());
+        assert_eq!(source_tree_digest(&store, checksum), Some(tree));
+        assert!(
+            store
+                .join("sources")
+                .join(format!("{checksum}.tree-v1"))
+                .is_file()
+        );
         // Idempotent: re-fetch reuses everything.
         let again = fetch_crate(&cas, &mut config, &pkg).unwrap();
         assert_eq!(tree, again);
+
+        // A modified checkout is repaired from the verified archive without
+        // replacing the canonical source-tree sidecar.
+        fs::write(checkout.join("src/lib.rs"), "pub fn tampered() {}\n").unwrap();
+        let repaired = fetch_crate(&cas, &mut config, &pkg).unwrap();
+        assert_eq!(tree, repaired);
+        assert_eq!(
+            fs::read_to_string(checkout.join("src/lib.rs")).unwrap(),
+            "pub fn f() {}\n"
+        );
     }
 }

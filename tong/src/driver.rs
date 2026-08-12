@@ -2678,7 +2678,10 @@ impl tong_rust::LockedSourceProvider for LockfileSource {
                 .map_err(|err| {
                     tong_rust::CargoImportError::Unsupported(format!("{err}; run `tong fetch`"))
                 })?;
-        if tong_fetch::source_tree_digest(&self.store, checksum).is_none() {
+        let source_tree = if let Some(tree) = tong_fetch::source_tree_digest(&self.store, checksum)
+        {
+            tree
+        } else {
             let tree = self.cas.capture_dir(&source_dir).map_err(|err| {
                 tong_rust::CargoImportError::Unsupported(format!(
                     "cannot capture locked source {} {}: {err}",
@@ -2687,7 +2690,8 @@ impl tong_rust::LockedSourceProvider for LockfileSource {
             })?;
             tong_fetch::record_source_tree(&self.store, checksum, tree)
                 .map_err(|err| tong_rust::CargoImportError::Unsupported(err.to_string()))?;
-        }
+            tree
+        };
         let source = tong_rust::model::SourceId::parse_lock_source(&package.source)
             .map_err(tong_rust::CargoImportError::Unsupported)?;
         Ok(Some(tong_rust::LockedSource {
@@ -2697,11 +2701,7 @@ impl tong_rust::LockedSourceProvider for LockfileSource {
                 source,
             },
             source_dir,
-            // The fetch-time tree sidecar avoids recapture once the CAS
-            // integrity index can validate a closure without thousands of
-            // random object stats. Until then, the checkout snapshot is the
-            // faster content-correct path on warm builds.
-            source_tree: None,
+            source_tree: Some(source_tree),
             propagate_source: false,
         }))
     }
