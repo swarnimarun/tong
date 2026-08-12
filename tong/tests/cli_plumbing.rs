@@ -171,6 +171,55 @@ fn json_build_progress_is_versioned_json_lines() {
 }
 
 #[test]
+fn dep_info_exec_paths_survive_build_and_run_reruns() {
+    let work = tempfile::tempdir().unwrap();
+    let ws = work.path();
+    fs::write(
+        ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"schema-macros\"]\nresolver = \"2\"\n\n\
+         [package]\nname = \"dep-info-rerun\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nschema-macros = { path = \"schema-macros\" }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(ws.join("src")).unwrap();
+    fs::create_dir_all(ws.join("migrations")).unwrap();
+    fs::create_dir_all(ws.join("schema-macros/src")).unwrap();
+    fs::write(
+        ws.join("schema-macros/Cargo.toml"),
+        "[package]\nname = \"schema-macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [lib]\nproc-macro = true\n",
+    )
+    .unwrap();
+    fs::write(
+        ws.join("schema-macros/src/lib.rs"),
+        r#"extern crate proc_macro;
+#[proc_macro]
+pub fn schema(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("migrations/schema.sql");
+    format!("include_str!({path:?})").parse().unwrap()
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        ws.join("src/main.rs"),
+        "const SCHEMA: &str = schema_macros::schema!();\n\
+         fn main() { println!(\"{SCHEMA}\"); }\n",
+    )
+    .unwrap();
+    fs::write(ws.join("migrations/schema.sql"), "select 1;\n").unwrap();
+
+    let first = run_tong(ws, &["build"]);
+    assert_success(&first, "first dep-info build");
+    let second = run_tong(ws, &["build"]);
+    assert_success(&second, "second dep-info build");
+    let run = run_tong(ws, &["run", ":dep-info-rerun"]);
+    assert_success(&run, "dep-info run after build");
+    assert!(stdout_of(&run).contains("select 1;"), "{}", stdout_of(&run));
+}
+
+#[test]
 fn concurrent_workspace_build_waits_for_the_active_build() {
     let work = tempfile::tempdir().unwrap();
     fs::write(

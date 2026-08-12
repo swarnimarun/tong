@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 tong-core = { path = "../tong-core" }
 tong-store = { path = "../tong-store" }
+jobserver = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

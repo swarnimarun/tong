@@ -152,6 +152,35 @@ fn concurrent_executors_isolate_identical_actions() {
 }
 
 #[test]
+fn identical_no_cache_actions_use_independent_exec_roots() {
+    let (_dir, cas, executor) = setup();
+    let executor = Arc::new(executor);
+    let mut action = script_action(
+        &cas,
+        "#!/bin/sh\nsleep 0.2\ncp data.txt ../out/copied.txt\n",
+        vec!["copied.txt"],
+        None,
+    );
+    action.cache_policy = CachePolicy::NoCache;
+    let barrier = Arc::new(Barrier::new(2));
+    let first_executor = Arc::clone(&executor);
+    let first_barrier = Arc::clone(&barrier);
+    let first_action = action.clone();
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_executor.execute(&first_action)
+    });
+    let second = std::thread::spawn(move || {
+        barrier.wait();
+        executor.execute(&action)
+    });
+    assert_eq!(
+        first.join().unwrap().unwrap().outputs,
+        second.join().unwrap().unwrap().outputs
+    );
+}
+
+#[test]
 fn missing_declared_output_is_rejected() {
     let (_dir, cas, executor) = setup();
     let action = script_action(

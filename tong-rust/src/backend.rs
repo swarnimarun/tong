@@ -21,6 +21,7 @@ use tong_core::action::{
 };
 use tong_core::artifact::{ArtifactRef, BlobDigest, TreeDigest};
 use tong_core::bundle::BundleRef;
+use tong_core::digest::DIGEST_HEX_LEN;
 use tong_core::paths::{OutputPath, RelativePath};
 use tong_core::tree::{Tree, TreeEntry};
 use tong_exec::EXEC_ROOT_VAR;
@@ -926,7 +927,16 @@ impl<'a> RustBackend<'a> {
         let pkg_dir = fs::canonicalize(&pkg.dir).ok()?;
         let mut paths = Vec::new();
         for path in parse_dep_info(&text) {
-            let relative = if path.is_absolute() {
+            let relative = if let Some(relative) = dep_info_exec_input(&path) {
+                // Proc macros may resolve tracked inputs through
+                // CARGO_MANIFEST_DIR, which points into this invocation's
+                // ephemeral `in/` tree. Persist the stable package-relative
+                // suffix, never the deleted execution-root prefix.
+                if !pkg.dir.join(&relative).exists() {
+                    return None;
+                }
+                relative
+            } else if path.is_absolute() {
                 path.strip_prefix(&pkg_dir).ok()?.to_path_buf()
             } else {
                 // rustc emits paths relative to its working directory (the
@@ -3107,6 +3117,34 @@ fn parse_dep_info(text: &str) -> Vec<PathBuf> {
     out
 }
 
+/// Returns the stable input-tree suffix from a path inside a Tong execution
+/// root: `[...]/.tong/exec/run-<pid>-<n>/<action-digest>/in/<suffix>`.
+///
+/// These paths can be absolute or workspace-relative. They are emitted when
+/// a proc macro tracks a file via execution-time `CARGO_MANIFEST_DIR`; the
+/// invocation directory is removed after success and must never be persisted
+/// as a source path for the next build.
+fn dep_info_exec_input(path: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = path.components().collect();
+    let marker = components.windows(5).position(|window| {
+        let normal = |index: usize| match window[index] {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        };
+        let run = normal(2).is_some_and(|value| value.starts_with("run-"));
+        let digest = normal(3).is_some_and(|value| {
+            value.len() == DIGEST_HEX_LEN && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        normal(0) == Some(".tong")
+            && normal(1) == Some("exec")
+            && run
+            && digest
+            && normal(4) == Some("in")
+    })?;
+    let suffix: PathBuf = components[marker + 5..].iter().collect();
+    (!suffix.as_os_str().is_empty()).then_some(suffix)
+}
+
 /// Dedup state for directive application across transitive scripts.
 #[derive(Default)]
 struct SeenDirectives {
@@ -3273,6 +3311,28 @@ mod tests {
         assert_eq!(
             link_search_arg("native=/workspace/.tong/exec/abc/out", Some(&mount)),
             format!("native={EXEC_ROOT_VAR}/in/build_out")
+        );
+    }
+
+    #[test]
+    fn dep_info_exec_inputs_drop_ephemeral_prefix() {
+        let digest = "a".repeat(DIGEST_HEX_LEN);
+        let relative = PathBuf::from(format!(
+            ".tong/exec/run-42-0/{digest}/in/migrations/schema.sql"
+        ));
+        assert_eq!(
+            dep_info_exec_input(&relative),
+            Some(PathBuf::from("migrations/schema.sql"))
+        );
+        let absolute = PathBuf::from("/workspace").join(&relative);
+        assert_eq!(
+            dep_info_exec_input(&absolute),
+            Some(PathBuf::from("migrations/schema.sql"))
+        );
+        assert_eq!(
+            dep_info_exec_input(Path::new("src/main.rs")),
+            None,
+            "ordinary package-relative inputs must remain untouched"
         );
     }
 

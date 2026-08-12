@@ -106,6 +106,9 @@ struct BuildFlags {
     /// `--locked` plus `--offline` (read-only, fully offline).
     #[arg(long)]
     frozen: bool,
+    /// Number of parallel action jobs (defaults to available CPUs).
+    #[arg(short = 'j', long, value_name = "N")]
+    jobs: Option<usize>,
 }
 
 #[derive(Args, Clone, Default)]
@@ -211,6 +214,7 @@ impl BuildFlags {
             no_run: self.no_run,
             kinds,
             target_triple: self.target.clone(),
+            jobs: self.jobs,
         }
     }
 }
@@ -423,6 +427,7 @@ fn command_root(cwd: &std::path::Path, flags: &BuildFlags) -> Result<PathBuf, St
 }
 
 fn main() -> ExitCode {
+    driver::initialize_jobserver();
     let process_started = std::time::Instant::now();
     // Perf and metrics events go through tracing (target `tong::perf`,
     // controlled by `RUST_LOG`, written to stderr) so they can be forwarded

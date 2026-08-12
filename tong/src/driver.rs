@@ -6,13 +6,14 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
-use tong_core::action::{ActionId, CachePolicy};
+use tong_core::action::{ActionId, ActionSpec, CachePolicy};
 use tong_core::artifact::TreeDigest;
+use tong_core::digest::Digest;
 use tong_core::units::{parse_duration, parse_size};
-use tong_exec::{ExecError, LocalExecutor};
+use tong_exec::{ExecError, ExecOutcome, LocalExecutor};
 use tong_graph::manifest::Manifest;
 use tong_graph::{Completed, PlanError, topological_order};
 use tong_rust::{
@@ -55,6 +56,18 @@ pub const DEFAULT_MAX_SIZE: &str = "10G";
 static STORE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 static OUTPUT_OPTIONS: OnceLock<OutputOptions> = OnceLock::new();
+static INHERITED_JOBSERVER: OnceLock<Option<jobserver::Client>> = OnceLock::new();
+
+/// Captures an upstream GNU-compatible jobserver before the CLI opens files or
+/// starts threads. Builds invoked by make/Cargo then share the parent's global
+/// resource budget; direct invocations create their own server in `prepare`.
+pub fn initialize_jobserver() {
+    // SAFETY: `main` calls this before tracing setup, argument handling,
+    // filesystem access, or thread creation, satisfying jobserver-rs's Unix
+    // requirement that inherited descriptors be claimed at process startup.
+    let inherited = unsafe { jobserver::Client::from_env_ext(true) }.client.ok();
+    let _ = INHERITED_JOBSERVER.set(inherited);
+}
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum MessageFormat {
@@ -145,6 +158,20 @@ impl Progress {
                 "outcome": "success",
             }),
         );
+    }
+
+    fn action_blocked(&self, action: &str, failed_dependency: &str) {
+        self.event(
+            "action-blocked",
+            serde_json::json!({
+                "action": action,
+                "failed_dependency": failed_dependency,
+                "outcome": "blocked",
+            }),
+        );
+        if self.options.verbose && matches!(self.options.message_format, MessageFormat::Human) {
+            eprintln!("  Blocked {action} (dependency {failed_dependency} failed)");
+        }
     }
 
     fn command_finished(
@@ -324,6 +351,9 @@ pub struct BuildOptions {
     pub kinds: u32,
     /// Rust target triple for target units (`--target`; host by default).
     pub target_triple: Option<String>,
+    /// Maximum concurrently executing actions (`-j`/`--jobs`). `None` uses
+    /// the host's available parallelism.
+    pub jobs: Option<usize>,
 }
 
 /// Feature selection for a build (`--features`, `--no-default-features`,
@@ -417,6 +447,735 @@ impl From<tong_rust::ToolchainError> for BuildError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ActionTiming {
+    queue_wait: std::time::Duration,
+    cache_lookup: std::time::Duration,
+    execution: std::time::Duration,
+    publication: std::time::Duration,
+    total: std::time::Duration,
+}
+
+struct PendingAction {
+    index: usize,
+    spec: ActionSpec,
+    digest: Digest,
+    ready_at: std::time::Instant,
+    cache_lookup: std::time::Duration,
+}
+
+struct WorkerTask {
+    pending: PendingAction,
+    queue_wait: std::time::Duration,
+    permit: Option<jobserver::Acquired>,
+}
+
+struct WorkerDone {
+    task: WorkerTask,
+    result: Result<ExecOutcome, ExecError>,
+}
+
+enum ScheduleEvent {
+    Worker(Box<WorkerDone>),
+    Token(io::Result<jobserver::Acquired>),
+}
+
+struct ScheduleResult {
+    completed: CompletedMap,
+    recorded: Vec<tong_store::RecordedAction>,
+    events: Vec<BuildEvent>,
+    graph_pairs: BTreeMap<String, Digest>,
+    sources: Vec<Digest>,
+    toolchains: Vec<Digest>,
+    outcome: BuildOutcome,
+    cache_checked: usize,
+    cache_lookup_duration: std::time::Duration,
+    execute_duration: std::time::Duration,
+}
+
+struct ScheduleState<'a> {
+    progress: &'a Progress,
+    completed: CompletedMap,
+    recorded: Vec<Option<tong_store::RecordedAction>>,
+    events: Vec<Option<BuildEvent>>,
+    graph_pairs: BTreeMap<String, Digest>,
+    sources: Vec<Digest>,
+    toolchains: Vec<Digest>,
+    outcome: BuildOutcome,
+    remaining: Vec<usize>,
+    dependents: Vec<Vec<usize>>,
+    ready: Vec<usize>,
+    ready_at: Vec<Option<std::time::Instant>>,
+    critical_path: Vec<u64>,
+    stable_rank: Vec<usize>,
+    planned_ids: Vec<String>,
+    cache_checked: usize,
+    cache_lookup_duration: std::time::Duration,
+    execute_duration: std::time::Duration,
+}
+
+impl ScheduleState<'_> {
+    fn pop_best(&mut self) -> Option<usize> {
+        let best = self
+            .ready
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                self.critical_path[**left]
+                    .cmp(&self.critical_path[**right])
+                    .then_with(|| self.stable_rank[**right].cmp(&self.stable_rank[**left]))
+            })
+            .map(|(position, _)| position)?;
+        Some(self.ready.swap_remove(best))
+    }
+
+    fn complete(
+        &mut self,
+        index: usize,
+        spec: &ActionSpec,
+        digest: Digest,
+        result: CachedResult,
+        cache: &'static str,
+        timing: ActionTiming,
+    ) {
+        let cached = cache != "executed" && cache != "nocache";
+        if cached {
+            self.outcome.actions_cached += 1;
+        }
+        self.progress
+            .action_finished(&spec.logical_id.0, cached, timing.total);
+        self.events[index] = Some(BuildEvent {
+            action: spec.logical_id.0.clone(),
+            digest,
+            cache,
+            queue_wait_ms: millis(timing.queue_wait),
+            cache_lookup_ms: millis(timing.cache_lookup),
+            execution_ms: millis(timing.execution),
+            publication_ms: millis(timing.publication),
+            total_duration_ms: millis(timing.total),
+            outcome: "success",
+        });
+        self.graph_pairs.insert(spec.logical_id.0.clone(), digest);
+        self.sources.push(spec.input_root.digest());
+        if let Some(reference) = &spec.environment_bundle {
+            self.toolchains.push(reference.digest());
+        }
+        self.recorded[index] = Some(tong_store::RecordedAction {
+            action_digest: digest,
+            logical_id: spec.logical_id.0.clone(),
+            mnemonic: spec.mnemonic.clone(),
+            input_root: spec.input_root,
+            executable: match &spec.executable {
+                tong_core::artifact::ArtifactRef::Blob(blob) => Some(*blob),
+                _ => None,
+            },
+            env_bundle: spec
+                .environment_bundle
+                .as_ref()
+                .map(|reference| reference.digest()),
+            outputs: result.outputs,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            duration_millis: result.duration_millis,
+            queue_wait_millis: millis(timing.queue_wait),
+            cache_lookup_millis: millis(timing.cache_lookup),
+            execution_millis: millis(timing.execution),
+            publication_millis: millis(timing.publication),
+            total_millis: millis(timing.total),
+        });
+        self.completed.0.insert(spec.logical_id.clone(), result);
+        let now = std::time::Instant::now();
+        for &child in &self.dependents[index] {
+            self.remaining[child] -= 1;
+            if self.remaining[child] == 0 {
+                self.ready.push(child);
+                self.ready_at[child] = Some(now);
+            }
+        }
+    }
+
+    fn finish(self) -> ScheduleResult {
+        let mut recorded: Vec<(usize, tong_store::RecordedAction)> = self
+            .recorded
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, action)| action.map(|action| (self.stable_rank[index], action)))
+            .collect();
+        recorded.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.logical_id.cmp(&right.1.logical_id))
+        });
+        let mut events: Vec<(usize, BuildEvent)> = self
+            .events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, event)| event.map(|event| (self.stable_rank[index], event)))
+            .collect();
+        events.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.action.cmp(&right.1.action))
+        });
+        let mut sources = self.sources;
+        sources.sort_unstable();
+        sources.dedup();
+        let mut toolchains = self.toolchains;
+        toolchains.sort_unstable();
+        toolchains.dedup();
+        ScheduleResult {
+            completed: self.completed,
+            recorded: recorded.into_iter().map(|(_, action)| action).collect(),
+            events: events.into_iter().map(|(_, event)| event).collect(),
+            graph_pairs: self.graph_pairs,
+            sources,
+            toolchains,
+            outcome: self.outcome,
+            cache_checked: self.cache_checked,
+            cache_lookup_duration: self.cache_lookup_duration,
+            execute_duration: self.execute_duration,
+        }
+    }
+
+    fn block_descendants(&self, failed: usize) {
+        let failed_id = self.prepared_action_id(failed);
+        let mut blocked = BTreeSet::new();
+        let mut stack = self.dependents[failed].clone();
+        while let Some(index) = stack.pop() {
+            if self.recorded[index].is_some() || !blocked.insert(index) {
+                continue;
+            }
+            self.progress
+                .action_blocked(self.prepared_action_id(index), failed_id);
+            stack.extend(self.dependents[index].iter().copied());
+        }
+    }
+
+    fn prepared_action_id(&self, index: usize) -> &str {
+        &self.planned_ids[index]
+    }
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Registers a cacheable digest as in flight, returning the existing leader
+/// when an equivalent logical action must wait and reuse its result.
+fn register_inflight(
+    in_flight: &mut BTreeMap<Digest, usize>,
+    digest: Digest,
+    index: usize,
+) -> Option<usize> {
+    match in_flight.entry(digest) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(index);
+            None
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => Some(*entry.get()),
+    }
+}
+
+fn critical_path_scores(
+    prepared: &Prepared,
+    selected: &[bool],
+    dependents: &[Vec<usize>],
+) -> Vec<u64> {
+    let mut score = vec![0; prepared.planned.len()];
+    for &index in prepared.order.iter().rev() {
+        if !selected[index] {
+            continue;
+        }
+        let historical = prepared
+            .previous_actions
+            .get(&prepared.planned[index].logical_id.0);
+        let own = historical
+            .map(|action| {
+                if action.execution_millis > 0 {
+                    action
+                        .execution_millis
+                        .saturating_add(action.cache_lookup_millis)
+                        .saturating_add(action.publication_millis)
+                } else if action.cache_lookup_millis > 0 {
+                    action.cache_lookup_millis
+                } else {
+                    // Legacy/default timing records only carried execution.
+                    action.duration_millis
+                }
+                .max(1)
+            })
+            .unwrap_or(1);
+        let downstream = dependents[index]
+            .iter()
+            .map(|child| score[*child])
+            .max()
+            .unwrap_or(0);
+        score[index] = own.saturating_add(downstream);
+    }
+    score
+}
+
+fn make_schedule_state<'a>(
+    prepared: &'a Prepared,
+    options: &BuildOptions,
+    progress: &'a Progress,
+) -> Result<ScheduleState<'a>, BuildError> {
+    let count = prepared.planned.len();
+    let by_id: BTreeMap<&ActionId, usize> = prepared
+        .planned
+        .iter()
+        .enumerate()
+        .map(|(index, action)| (&action.logical_id, index))
+        .collect();
+    let selected: Vec<bool> = prepared
+        .planned
+        .iter()
+        .map(|action| !options.deps_only || action.external)
+        .collect();
+    let mut remaining = vec![0; count];
+    let mut dependents = vec![Vec::new(); count];
+    for (index, action) in prepared.planned.iter().enumerate() {
+        if !selected[index] {
+            continue;
+        }
+        let mut deps: Vec<usize> = action
+            .deps
+            .iter()
+            .filter_map(|dependency| by_id.get(dependency).copied())
+            .filter(|dependency| selected[*dependency])
+            .collect();
+        deps.sort_unstable();
+        deps.dedup();
+        remaining[index] = deps.len();
+        for dependency in deps {
+            dependents[dependency].push(index);
+        }
+    }
+    let stable_rank = {
+        let mut ranks = vec![usize::MAX; count];
+        for (rank, index) in prepared.order.iter().copied().enumerate() {
+            ranks[index] = rank;
+        }
+        ranks
+    };
+    let critical_path = critical_path_scores(prepared, &selected, &dependents);
+    let now = std::time::Instant::now();
+    let ready: Vec<usize> = (0..count)
+        .filter(|index| selected[*index] && remaining[*index] == 0)
+        .collect();
+    let mut ready_at = vec![None; count];
+    for &index in &ready {
+        ready_at[index] = Some(now);
+    }
+    let skipped = selected.iter().filter(|selected| !**selected).count();
+    let mut sources = Vec::new();
+    if options.deps_only {
+        sources.extend(prepared.source_trees.iter().copied());
+    }
+    Ok(ScheduleState {
+        progress,
+        completed: CompletedMap(BTreeMap::new()),
+        recorded: (0..count).map(|_| None).collect(),
+        events: (0..count).map(|_| None).collect(),
+        graph_pairs: BTreeMap::new(),
+        sources,
+        toolchains: Vec::new(),
+        outcome: BuildOutcome {
+            actions_total: count,
+            actions_skipped: skipped,
+            ..Default::default()
+        },
+        remaining,
+        dependents,
+        ready,
+        ready_at,
+        critical_path,
+        stable_rank,
+        planned_ids: prepared
+            .planned
+            .iter()
+            .map(|action| action.logical_id.0.clone())
+            .collect(),
+        cache_checked: 0,
+        cache_lookup_duration: std::time::Duration::ZERO,
+        execute_duration: std::time::Duration::ZERO,
+    })
+}
+
+fn schedule_build(
+    prepared: &Prepared,
+    options: &BuildOptions,
+    progress: &Progress,
+    test_label: Option<&str>,
+) -> Result<ScheduleResult, BuildError> {
+    let mut state = make_schedule_state(prepared, options, progress)?;
+    let mut verifier = ClosureVerifier::default();
+    let mut pending = Vec::<PendingAction>::new();
+    let mut coalesced_by_digest = BTreeMap::<Digest, usize>::new();
+    let mut waiters = BTreeMap::<usize, Vec<PendingAction>>::new();
+    let (task_tx, task_rx) = mpsc::channel::<WorkerTask>();
+    let task_rx = Arc::new(Mutex::new(task_rx));
+    let (event_tx, event_rx) = mpsc::channel::<ScheduleEvent>();
+
+    std::thread::scope(|scope| -> Result<ScheduleResult, BuildError> {
+        for _ in 0..prepared.jobs {
+            let task_rx = Arc::clone(&task_rx);
+            let event_tx = event_tx.clone();
+            let executor = &prepared.executor;
+            scope.spawn(move || {
+                loop {
+                    let task = match task_rx.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(mut task) = task else {
+                        return;
+                    };
+                    let result = executor.execute(&task.pending.spec);
+                    // Return the jobserver token before waking the coordinator,
+                    // so it can immediately admit another ready miss.
+                    drop(task.permit.take());
+                    if event_tx
+                        .send(ScheduleEvent::Worker(Box::new(WorkerDone { task, result })))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+        let token_tx = event_tx.clone();
+        let token_helper = prepared
+            .jobserver
+            .clone()
+            .into_helper_thread(move |token| {
+                let _ = token_tx.send(ScheduleEvent::Token(token));
+            })?;
+        drop(event_tx);
+
+        let mut active = 0usize;
+        let mut token_requested = false;
+        let mut available_permits = Vec::new();
+        let mut first_error: Option<BuildError> = None;
+        loop {
+            // Concretization and cache verification stay coordinator-owned.
+            // Drain the ready queue even when every worker is occupied: hits
+            // can complete immediately and unblock further hits.
+            while first_error.is_none() {
+                let Some(index) = state.pop_best() else {
+                    break;
+                };
+                let ready_at = state.ready_at[index]
+                    .take()
+                    .unwrap_or_else(std::time::Instant::now);
+                let action = &prepared.planned[index];
+                let lookup_started = std::time::Instant::now();
+                let spec = match (action.make)(&state.completed, &prepared.cas) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        first_error = Some(BuildError::Plan(error));
+                        break;
+                    }
+                };
+                if spec.logical_id.0.starts_with("rust:test-run:")
+                    && test_label.is_some_and(|label| !test_run_matches(&spec.logical_id.0, label))
+                {
+                    if !state.dependents[index].is_empty() {
+                        first_error = Some(BuildError::Plan(PlanError::Message(format!(
+                            "filtered test action {} unexpectedly has dependents",
+                            spec.logical_id.0
+                        ))));
+                        break;
+                    }
+                    state.outcome.actions_skipped += 1;
+                    continue;
+                }
+                let digest = spec.digest();
+                state
+                    .progress
+                    .action_started(&spec.logical_id.0, &spec.mnemonic);
+                let cacheable = spec.cache_policy == CachePolicy::Enabled;
+                let cached = if cacheable {
+                    state.cache_checked += 1;
+                    let lookup = match prepared.cache.get(digest) {
+                        Ok(lookup) => lookup,
+                        Err(error) => {
+                            first_error = Some(BuildError::Io(error));
+                            break;
+                        }
+                    };
+                    let mut cached = match lookup {
+                        Some(result) => {
+                            match result.is_complete_cached(&prepared.cas, &mut verifier) {
+                                Ok(true) => Some(result),
+                                Ok(false) => {
+                                    if let Err(error) = prepared.cache.remove(digest) {
+                                        first_error = Some(BuildError::Io(error));
+                                        break;
+                                    }
+                                    None
+                                }
+                                Err(error) => {
+                                    first_error = Some(BuildError::Io(error));
+                                    break;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    if cached.is_none() && action.input_narrowed {
+                        match reuse_narrowed_result(prepared, &spec, digest, &mut verifier) {
+                            Ok(result) => cached = result,
+                            Err(error) => {
+                                first_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    cached
+                } else {
+                    None
+                };
+                let cache_lookup = lookup_started.elapsed();
+                state.cache_lookup_duration += cache_lookup;
+                if let Some(result) = cached {
+                    if output_options().verbose {
+                        eprintln!("  {} ({}) [cached]", spec.logical_id.0, spec.mnemonic);
+                    }
+                    state.complete(
+                        index,
+                        &spec,
+                        digest,
+                        result,
+                        "local",
+                        ActionTiming {
+                            queue_wait: lookup_started.saturating_duration_since(ready_at),
+                            cache_lookup,
+                            total: ready_at.elapsed(),
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
+
+                let pending_action = PendingAction {
+                    index,
+                    spec,
+                    digest,
+                    ready_at,
+                    cache_lookup,
+                };
+                if cacheable {
+                    if let Some(leader) = register_inflight(&mut coalesced_by_digest, digest, index)
+                    {
+                        waiters.entry(leader).or_default().push(pending_action);
+                    } else {
+                        pending.push(pending_action);
+                    }
+                } else {
+                    pending.push(pending_action);
+                }
+            }
+
+            while first_error.is_none() && active < prepared.jobs && !pending.is_empty() {
+                let best = pending
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| {
+                        state.critical_path[left.index]
+                            .cmp(&state.critical_path[right.index])
+                            .then_with(|| {
+                                state.stable_rank[right.index].cmp(&state.stable_rank[left.index])
+                            })
+                    })
+                    .map(|(position, _)| position)
+                    .unwrap();
+                let pending_action = pending.swap_remove(best);
+                let permit = if active == 0 {
+                    None
+                } else if let Some(permit) = available_permits.pop() {
+                    Some(permit)
+                } else {
+                    pending.push(pending_action);
+                    if !token_requested {
+                        token_helper.request_token();
+                        token_requested = true;
+                    }
+                    break;
+                };
+                let queue_wait = pending_action
+                    .ready_at
+                    .elapsed()
+                    .saturating_sub(pending_action.cache_lookup);
+                if task_tx
+                    .send(WorkerTask {
+                        pending: pending_action,
+                        queue_wait,
+                        permit,
+                    })
+                    .is_err()
+                {
+                    first_error = Some(BuildError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "parallel worker pool stopped unexpectedly",
+                    )));
+                    break;
+                }
+                active += 1;
+            }
+
+            if active == 0 {
+                if let Some(error) = first_error.take() {
+                    return Err(error);
+                }
+                if state.ready.is_empty() && pending.is_empty() {
+                    break;
+                }
+                // A newly-created jobserver always permits the implicit first
+                // job, so reaching this branch with pending work is a bug.
+                first_error = Some(BuildError::Plan(PlanError::Message(
+                    "scheduler cannot admit dependency-ready work".to_owned(),
+                )));
+                continue;
+            }
+
+            let event = match event_rx.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    first_error = Some(BuildError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "parallel worker pool ended before all actions completed",
+                    )));
+                    active = 0;
+                    continue;
+                }
+            };
+            let done = match event {
+                ScheduleEvent::Token(token) => {
+                    token_requested = false;
+                    match token {
+                        Ok(permit) if first_error.is_none() => available_permits.push(permit),
+                        Ok(permit) => drop(permit),
+                        Err(error) => {
+                            first_error.get_or_insert(BuildError::Io(error));
+                        }
+                    }
+                    continue;
+                }
+                ScheduleEvent::Worker(done) => *done,
+            };
+            active -= 1;
+            let WorkerDone { task, result } = done;
+            let PendingAction {
+                index,
+                spec,
+                digest,
+                ready_at,
+                cache_lookup,
+            } = task.pending;
+            match result {
+                Ok(executed) => {
+                    let cached = CachedResult {
+                        outputs: executed.outputs,
+                        stdout: executed.stdout,
+                        stderr: executed.stderr,
+                        duration_millis: millis(executed.duration),
+                    };
+                    let publication_started = std::time::Instant::now();
+                    let publication_result = if spec.cache_policy == CachePolicy::Enabled {
+                        prepared.cache.put(digest, &cached)
+                    } else {
+                        Ok(())
+                    };
+                    let publication = publication_started.elapsed();
+                    if let Err(error) = publication_result {
+                        first_error.get_or_insert(BuildError::Io(error));
+                        coalesced_by_digest.remove(&digest);
+                        state.block_descendants(index);
+                        for waiter in waiters.remove(&index).unwrap_or_default() {
+                            state.block_descendants(waiter.index);
+                        }
+                        continue;
+                    }
+                    state.outcome.actions_executed += 1;
+                    state.execute_duration += executed.duration;
+                    if matches!(output_options().message_format, MessageFormat::Human) {
+                        eprintln!(
+                            "  Executed {} ({}) {}",
+                            spec.logical_id.0,
+                            spec.mnemonic,
+                            display_duration(executed.duration)
+                        );
+                    }
+                    state.complete(
+                        index,
+                        &spec,
+                        digest,
+                        cached,
+                        if spec.cache_policy == CachePolicy::Enabled {
+                            "executed"
+                        } else {
+                            "nocache"
+                        },
+                        ActionTiming {
+                            queue_wait: task.queue_wait,
+                            cache_lookup,
+                            execution: executed.duration,
+                            publication,
+                            total: ready_at.elapsed(),
+                        },
+                    );
+                    if spec.cache_policy == CachePolicy::Enabled {
+                        coalesced_by_digest.remove(&digest);
+                        for waiter in waiters.remove(&index).unwrap_or_default() {
+                            let total = waiter.ready_at.elapsed();
+                            state.complete(
+                                waiter.index,
+                                &waiter.spec,
+                                waiter.digest,
+                                cached,
+                                "coalesced",
+                                ActionTiming {
+                                    queue_wait: total.saturating_sub(waiter.cache_lookup),
+                                    cache_lookup: waiter.cache_lookup,
+                                    total,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    coalesced_by_digest.remove(&digest);
+                    state.block_descendants(index);
+                    for waiter in waiters.remove(&index).unwrap_or_default() {
+                        state.block_descendants(waiter.index);
+                    }
+                    if let ExecError::Exit { code, stderr, .. } = &error {
+                        let stderr_text = prepared
+                            .cas
+                            .read_blob(*stderr)
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                            .unwrap_or_default();
+                        eprintln!("action {} failed with exit code {code}", spec.logical_id.0);
+                        eprintln!("{stderr_text}");
+                    }
+                    first_error.get_or_insert(BuildError::Exec(error));
+                }
+            }
+            if first_error.is_some() {
+                // Freeze admission. Successful work that was already running
+                // is still drained and may publish its fully validated result.
+                state.ready.clear();
+                pending.clear();
+            }
+        }
+
+        drop(task_tx);
+        Ok(state.finish())
+    })
+}
+
 /// Builds the workspace at `root` and materializes artifacts under
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
@@ -436,176 +1195,21 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     );
     let tong_dir = &prepared.tong_dir;
     let cas = &prepared.cas;
-    let cache = &prepared.cache;
-    let executor = &prepared.executor;
     let order = &prepared.order;
 
-    // Schedule: concretize, check cache, execute.
-    let mut completed = CompletedMap(BTreeMap::new());
-    let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
-    let mut events: Vec<BuildEvent> = Vec::new();
-    let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
-    let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
-    if options.deps_only {
-        // The deps-only manifest records every captured package tree: the
-        // deps stage captured the local packages' manifest-only trees, and
-        // the app stage re-captures identical digests — GC must keep them
-        // (docs/docker-caching.md Feature 1).
-        sources.extend(prepared.source_trees.iter().copied());
-    }
-    let mut toolchains: Vec<tong_core::digest::Digest> = Vec::new();
-    let mut outcome = BuildOutcome {
-        actions_total: order.len(),
-        ..Default::default()
-    };
-    let mut closure_verifier = ClosureVerifier::default();
-    let mut concretize_duration = std::time::Duration::ZERO;
-    let mut result_lookup_duration = std::time::Duration::ZERO;
-    let mut closure_verify_duration = std::time::Duration::ZERO;
-    let mut execute_duration = std::time::Duration::ZERO;
-    let mut cache_checked = 0usize;
     progress.phase_started("Checking cache");
     progress.phase_started("Executing");
-
-    for index in 0..order.len() {
-        let action = &prepared.planned[order[index]];
-        // `--deps-only`: skip workspace-owned actions entirely — no cache
-        // lookup, no execution, no recording. External actions never
-        // depend on workspace actions, so the topological order stays
-        // valid.
-        if options.deps_only && !action.external {
-            outcome.actions_skipped += 1;
-            continue;
-        }
-        let t_concretize = std::time::Instant::now();
-        let spec = (action.make)(&completed, cas)?;
-        concretize_duration += t_concretize.elapsed();
-        let digest = spec.digest();
-        // `CachePolicy::NoCache` actions (test runs, network-allowed
-        // actions) must bypass the action cache entirely: no lookup, no
-        // insertion. Their digest still covers the policy, so a NoCache
-        // action can never alias a cacheable one.
-        let cacheable = spec.cache_policy == CachePolicy::Enabled;
-        let t_action = std::time::Instant::now();
-        progress.action_started(&spec.logical_id.0, &spec.mnemonic);
-        let mut cache_source = "executed";
-        let mut cached_result = if cacheable {
-            cache_checked += 1;
-            let t_lookup = std::time::Instant::now();
-            let lookup = cache.get(digest)?;
-            result_lookup_duration += t_lookup.elapsed();
-            match lookup {
-                Some(result) => {
-                    let t_verify = std::time::Instant::now();
-                    let complete = result.is_complete_cached(cas, &mut closure_verifier)?;
-                    closure_verify_duration += t_verify.elapsed();
-                    if complete {
-                        Some(result)
-                    } else {
-                        cache.remove(digest)?;
-                        None
-                    }
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        if cached_result.is_none() && cacheable && action.input_narrowed {
-            cached_result = reuse_narrowed_result(&prepared, &spec, digest, &mut closure_verifier)?;
-        }
-        let cached = if let Some(result) = cached_result {
-            outcome.actions_cached += 1;
-            cache_source = "cached";
-            if output_options().verbose {
-                eprintln!(
-                    "  [{}/{}] {} ({}) [cached]",
-                    index + 1,
-                    order.len(),
-                    spec.logical_id.0,
-                    spec.mnemonic
-                );
-            }
-            progress.action_finished(&spec.logical_id.0, true, t_action.elapsed());
-            result
-        } else {
-            let result = match executor.execute(&spec) {
-                Ok(outcome) => outcome,
-                Err(ExecError::Exit { code, stderr, .. }) => {
-                    let stderr_text = cas
-                        .read_blob(stderr)
-                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                        .unwrap_or_default();
-                    eprintln!("action {} failed with exit code {code}", spec.logical_id.0);
-                    eprintln!("{stderr_text}");
-                    return Err(BuildError::Exec(ExecError::Exit {
-                        code,
-                        stderr,
-                        exec_root: PathBuf::new(),
-                    }));
-                }
-                Err(err) => return Err(BuildError::Exec(err)),
-            };
-            execute_duration += result.duration;
-            if matches!(output_options().message_format, MessageFormat::Human) {
-                eprintln!(
-                    "  Executed [{}/{}] {} ({}) {}",
-                    index + 1,
-                    order.len(),
-                    spec.logical_id.0,
-                    spec.mnemonic,
-                    display_duration(result.duration)
-                );
-            }
-            progress.action_finished(&spec.logical_id.0, false, result.duration);
-            tracing::debug!(
-                target: "tong::perf",
-                phase = "action.execute",
-                action = %spec.logical_id.0,
-                duration_ms = result.duration.as_millis() as u64,
-            );
-            let cached = CachedResult {
-                outputs: result.outputs,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_millis: result.duration.as_millis() as u64,
-            };
-            if cacheable {
-                cache.put(digest, &cached)?;
-            }
-            outcome.actions_executed += 1;
-            cached
-        };
-        events.push(BuildEvent {
-            action: spec.logical_id.0.clone(),
-            digest,
-            cache: cache_source,
-            duration_ms: t_action.elapsed().as_millis() as u64,
-            outcome: "success",
-        });
-        // Record for the build-state manifest (GC root set).
-        graph_pairs.insert(spec.logical_id.0.clone(), digest);
-        sources.push(spec.input_root.digest());
-        if let Some(reference) = &spec.environment_bundle {
-            toolchains.push(reference.digest());
-        }
-        recorded.push(tong_store::RecordedAction {
-            action_digest: digest,
-            logical_id: spec.logical_id.0.clone(),
-            mnemonic: spec.mnemonic.clone(),
-            input_root: spec.input_root,
-            executable: match &spec.executable {
-                tong_core::artifact::ArtifactRef::Blob(blob) => Some(*blob),
-                _ => None,
-            },
-            env_bundle: spec.environment_bundle.as_ref().map(|r| r.digest()),
-            outputs: cached.outputs,
-            stdout: cached.stdout,
-            stderr: cached.stderr,
-            duration_millis: cached.duration_millis,
-        });
-        completed.0.insert(spec.logical_id.clone(), cached);
-    }
+    let scheduled = schedule_build(&prepared, options, &progress, None)?;
+    let completed = scheduled.completed;
+    let recorded = scheduled.recorded;
+    let events = scheduled.events;
+    let graph_pairs = scheduled.graph_pairs;
+    let sources = scheduled.sources;
+    let toolchains = scheduled.toolchains;
+    let mut outcome = scheduled.outcome;
+    let cache_checked = scheduled.cache_checked;
+    let cache_duration = scheduled.cache_lookup_duration;
+    let execute_duration = scheduled.execute_duration;
 
     // Assemble requested final artifacts. `--deps-only` assembles nothing:
     // workspace artifacts are not built, and dep artifacts are consumed by
@@ -623,11 +1227,8 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     tracing::debug!(
         target: "tong::perf",
         phase = "schedule.detail",
-        concretize_ms = concretize_duration.as_millis() as u64,
-        result_lookup_ms = result_lookup_duration.as_millis() as u64,
-        closure_verify_ms = closure_verify_duration.as_millis() as u64,
+        cache_lookup_ms = cache_duration.as_millis() as u64,
     );
-    let cache_duration = concretize_duration + result_lookup_duration + closure_verify_duration;
     progress.phase_finished(
         "Checking cache",
         cache_duration,
@@ -723,7 +1324,6 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         },
     );
     let t_cleanup = std::time::Instant::now();
-    drop(closure_verifier);
     drop(prepared);
     drop(_workspace_lock);
     tracing::debug!(
@@ -756,10 +1356,10 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     Ok(outcome)
 }
 
-/// Serializes builds that mutate one workspace's `.tong` state. Action-level
-/// in-flight deduplication needs scheduler coordination; until that exists,
-/// waiting is safer than allowing one build to prune or rewrite files another
-/// live build still needs.
+/// Serializes CLI invocations that mutate one workspace's `.tong` state.
+/// In-process logical actions coalesce by digest, but cross-process claims and
+/// build leases are still needed before independent invocations can safely
+/// publish state, materialize outputs, and garbage-collect concurrently.
 struct WorkspaceBuildLock {
     _file: fs::File,
 }
@@ -806,158 +1406,13 @@ pub fn test(
         &format!("{} actions", prepared.order.len()),
     );
     let cas = &prepared.cas;
-    let cache = &prepared.cache;
-    let executor = &prepared.executor;
-    let order = &prepared.order;
-
-    let mut completed = CompletedMap(BTreeMap::new());
-    let mut recorded: Vec<tong_store::RecordedAction> = Vec::new();
-    let mut events: Vec<BuildEvent> = Vec::new();
-    let mut graph_pairs: BTreeMap<String, tong_core::digest::Digest> = BTreeMap::new();
-    let mut sources: Vec<tong_core::digest::Digest> = Vec::new();
-    let mut toolchains: Vec<tong_core::digest::Digest> = Vec::new();
-    // Executed test runs in (label, stdout blob) order.
-    let mut test_runs: Vec<(String, tong_core::artifact::BlobDigest)> = Vec::new();
-    let mut failed = false;
-    let mut closure_verifier = ClosureVerifier::default();
-    let mut actions_cached = 0usize;
-    let mut actions_executed = 0usize;
-    let mut execute_duration = std::time::Duration::ZERO;
-    let t_schedule = std::time::Instant::now();
     progress.phase_started("Checking cache");
     progress.phase_started("Executing");
-
-    for index in 0..order.len() {
-        let action = &prepared.planned[order[index]];
-        let spec = (action.make)(&completed, cas)?;
-        let digest = spec.digest();
-
-        // Test runs: skipped when they do not match the label filter.
-        let is_test_run = spec.logical_id.0.starts_with("rust:test-run:");
-        let t_action = std::time::Instant::now();
-        let mut cache_source = "executed";
-        if is_test_run
-            && let Some(label) = label
-            && !test_run_matches(&spec.logical_id.0, label)
-        {
-            continue;
-        }
-        progress.action_started(&spec.logical_id.0, &spec.mnemonic);
-
-        // Test runs are `CachePolicy::NoCache`: never look up or insert —
-        // every run re-executes (deterministic native tests opt into
-        // caching via `cache_test_result = true`).
-        let cacheable = spec.cache_policy == CachePolicy::Enabled;
-        let mut cached_result = if cacheable {
-            match cache.get(digest)? {
-                Some(result) if result.is_complete_cached(cas, &mut closure_verifier)? => {
-                    Some(result)
-                }
-                Some(_) => {
-                    cache.remove(digest)?;
-                    None
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        if cached_result.is_none() && cacheable && action.input_narrowed {
-            cached_result = reuse_narrowed_result(&prepared, &spec, digest, &mut closure_verifier)?;
-        }
-        let cached = if let Some(result) = cached_result {
-            cache_source = "cached";
-            actions_cached += 1;
-            if output_options().verbose {
-                eprintln!(
-                    "  [{}/{}] {} ({}) [cached]",
-                    index + 1,
-                    order.len(),
-                    spec.logical_id.0,
-                    spec.mnemonic
-                );
-            }
-            progress.action_finished(&spec.logical_id.0, true, t_action.elapsed());
-            result
-        } else {
-            let result = match executor.execute(&spec) {
-                Ok(outcome) => outcome,
-                Err(ExecError::Exit { code, stderr, .. }) => {
-                    let stderr_text = cas
-                        .read_blob(stderr)
-                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                        .unwrap_or_default();
-                    eprintln!("test {} failed with exit code {code}", spec.logical_id.0);
-                    eprintln!("{stderr_text}");
-                    if is_test_run {
-                        failed = true;
-                        break;
-                    }
-                    return Err(BuildError::Exec(ExecError::Exit {
-                        code,
-                        stderr,
-                        exec_root: PathBuf::new(),
-                    }));
-                }
-                Err(err) => return Err(BuildError::Exec(err)),
-            };
-            actions_executed += 1;
-            execute_duration += result.duration;
-            if matches!(output_options().message_format, MessageFormat::Human) {
-                eprintln!(
-                    "  Executed [{}/{}] {} ({}) {}",
-                    index + 1,
-                    order.len(),
-                    spec.logical_id.0,
-                    spec.mnemonic,
-                    display_duration(result.duration)
-                );
-            }
-            progress.action_finished(&spec.logical_id.0, false, result.duration);
-            let cached = CachedResult {
-                outputs: result.outputs,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_millis: result.duration.as_millis() as u64,
-            };
-            if cacheable {
-                cache.put(digest, &cached)?;
-            }
-            cached
-        };
-        if is_test_run {
-            test_runs.push((spec.logical_id.0.clone(), cached.stdout));
-        }
-        events.push(BuildEvent {
-            action: spec.logical_id.0.clone(),
-            digest,
-            cache: cache_source,
-            duration_ms: t_action.elapsed().as_millis() as u64,
-            outcome: "success",
-        });
-        graph_pairs.insert(spec.logical_id.0.clone(), digest);
-        sources.push(spec.input_root.digest());
-        if let Some(reference) = &spec.environment_bundle {
-            toolchains.push(reference.digest());
-        }
-        recorded.push(tong_store::RecordedAction {
-            action_digest: digest,
-            logical_id: spec.logical_id.0.clone(),
-            mnemonic: spec.mnemonic.clone(),
-            input_root: spec.input_root,
-            executable: match &spec.executable {
-                tong_core::artifact::ArtifactRef::Blob(blob) => Some(*blob),
-                _ => None,
-            },
-            env_bundle: spec.environment_bundle.as_ref().map(|r| r.digest()),
-            outputs: cached.outputs,
-            stdout: cached.stdout,
-            stderr: cached.stderr,
-            duration_millis: cached.duration_millis,
-        });
-        completed.0.insert(spec.logical_id.clone(), cached);
-    }
-    let cache_duration = t_schedule.elapsed().saturating_sub(execute_duration);
+    let scheduled = schedule_build(&prepared, options, &progress, label)?;
+    let actions_cached = scheduled.outcome.actions_cached;
+    let actions_executed = scheduled.outcome.actions_executed;
+    let cache_duration = scheduled.cache_lookup_duration;
+    let execute_duration = scheduled.execute_duration;
     progress.phase_finished(
         "Checking cache",
         cache_duration,
@@ -974,6 +1429,14 @@ pub fn test(
     );
     progress.phase_started("Materializing");
     progress.phase_finished("Materializing", std::time::Duration::ZERO, "0 artifacts");
+
+    // Successful test runs in stable graph order.
+    let test_runs: Vec<(String, tong_core::artifact::BlobDigest)> = scheduled
+        .recorded
+        .iter()
+        .filter(|action| action.logical_id.starts_with("rust:test-run:"))
+        .map(|action| (action.logical_id.clone(), action.stdout))
+        .collect();
 
     // Summary: parse the libtest result lines from each executed suite.
     let mut passed = 0usize;
@@ -1016,15 +1479,15 @@ pub fn test(
     let state_changed = record_state(
         root,
         &prepared,
-        &recorded,
-        &graph_pairs,
-        &sources,
-        &toolchains,
+        &scheduled.recorded,
+        &scheduled.graph_pairs,
+        &scheduled.sources,
+        &scheduled.toolchains,
         &[],
         &options.profile,
         false,
     )?;
-    record_events(root, &prepared.store, &events);
+    record_events(root, &prepared.store, &scheduled.events);
     progress.phase_finished(
         "Finishing",
         t_finish.elapsed(),
@@ -1038,11 +1501,11 @@ pub fn test(
         "build-finished",
         serde_json::json!({
             "profile": options.profile,
-            "actions": recorded.len(),
+            "actions": scheduled.recorded.len(),
             "cached": actions_cached,
             "executed": actions_executed,
             "duration_ms": t_total.elapsed().as_millis() as u64,
-            "outcome": if failed || failed_tests > 0 { "failure" } else { "success" },
+            "outcome": if failed_tests > 0 { "failure" } else { "success" },
         }),
     );
     if matches!(output_options().message_format, MessageFormat::Human) {
@@ -1053,7 +1516,7 @@ pub fn test(
         );
     }
 
-    Ok(if failed || failed_tests > 0 { 1 } else { 0 })
+    Ok(if failed_tests > 0 { 1 } else { 0 })
 }
 
 /// Runs the workspace's benchmark targets (`tong bench`); benchmark runs
@@ -1102,6 +1565,8 @@ struct Prepared {
     cas: Cas,
     cache: ActionCache,
     executor: LocalExecutor,
+    jobserver: jobserver::Client,
+    jobs: usize,
     planned: Vec<tong_graph::PlannedAction>,
     artifacts: Vec<tong_rust::FinalArtifact>,
     /// Captured source-tree digests of every package (used by the
@@ -1119,6 +1584,9 @@ fn prepare(
     include_dev_deps: bool,
     test_args: &[String],
 ) -> Result<Prepared, BuildError> {
+    if options.jobs == Some(0) {
+        return Err(BuildError::Manifest("--jobs must be at least 1".to_owned()));
+    }
     let t_prep = std::time::Instant::now();
     let tong_dir = root.join(".tong");
     let manifest = load_manifest(root)?;
@@ -1296,9 +1764,19 @@ fn prepare(
         })
         .unwrap_or(tong_exec::SandboxLevel::L1);
 
+    let jobs = options.jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    });
+    let jobserver = match INHERITED_JOBSERVER.get().and_then(Clone::clone) {
+        Some(jobserver) => jobserver,
+        None => jobserver::Client::new(jobs.saturating_sub(1))?,
+    };
     let mut executor = LocalExecutor::with_sandbox(cas.clone(), &exec, sandbox_level)?;
     executor.register_system_tool(toolchain.rustc_blob, toolchain.rustc.clone());
     executor.register_bundle_root(toolchain.bundle.digest(), toolchain.root.clone());
+    executor.set_jobserver(jobserver.clone());
 
     // `[policy] network = "allow"`: run actions may reach the network and
     // are uncacheable.
@@ -1412,6 +1890,8 @@ fn prepare(
         cas,
         cache,
         executor,
+        jobserver,
+        jobs,
         planned,
         artifacts,
         source_trees,
@@ -1487,6 +1967,32 @@ fn record_state(
                 }
             }
         }
+        build_manifest.sources.sort_unstable();
+        build_manifest.sources.dedup();
+        build_manifest.toolchains.sort_unstable();
+        build_manifest.toolchains.dedup();
+        let stable_rank: BTreeMap<&str, usize> = prepared
+            .order
+            .iter()
+            .enumerate()
+            .map(|(rank, index)| (prepared.planned[*index].logical_id.0.as_str(), rank))
+            .collect();
+        build_manifest.actions.sort_by(|left, right| {
+            stable_rank
+                .get(left.logical_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &stable_rank
+                        .get(right.logical_id.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .then_with(|| left.logical_id.cmp(&right.logical_id))
+        });
+        build_manifest
+            .artifacts
+            .sort_by(|left, right| left.0.cmp(&right.0));
         if previous
             .as_ref()
             .is_some_and(|previous| same_build_state(previous, &build_manifest))
@@ -1533,8 +2039,32 @@ fn same_build_state(left: &BuildManifest, right: &BuildManifest) -> bool {
         && left.profiles == right.profiles
         && left.sources == right.sources
         && left.toolchains == right.toolchains
-        && left.actions == right.actions
+        && left.actions.len() == right.actions.len()
+        && left
+            .actions
+            .iter()
+            .zip(&right.actions)
+            .all(|(left, right)| same_recorded_action_state(left, right))
         && left.artifacts == right.artifacts
+}
+
+fn same_recorded_action_state(
+    left: &tong_store::RecordedAction,
+    right: &tong_store::RecordedAction,
+) -> bool {
+    left.action_digest == right.action_digest
+        && left.logical_id == right.logical_id
+        && left.mnemonic == right.mnemonic
+        && left.input_root == right.input_root
+        && left.executable == right.executable
+        && left.env_bundle == right.env_bundle
+        && left.outputs == right.outputs
+        && left.stdout == right.stdout
+        && left.stderr == right.stderr
+        && left.duration_millis == right.duration_millis
+    // Queue/cache/publication/total timings are observational and vary on
+    // every run. They feed scheduling when state changes, but must not turn a
+    // semantic no-op into a new GC root and automatic sweep.
 }
 
 /// One structured build event (one action execution/cache hit).
@@ -1542,7 +2072,11 @@ struct BuildEvent {
     action: String,
     digest: tong_core::digest::Digest,
     cache: &'static str,
-    duration_ms: u64,
+    queue_wait_ms: u64,
+    cache_lookup_ms: u64,
+    execution_ms: u64,
+    publication_ms: u64,
+    total_duration_ms: u64,
     outcome: &'static str,
 }
 
@@ -1570,11 +2104,16 @@ fn record_events(root: &Path, store: &Path, events: &[BuildEvent]) {
     for event in events {
         lines.push(format!(
             "{{\"action\":\"{}\",\"digest\":\"{}\",\"cache\":\"{}\",\
-             \"duration_ms\":{},\"outcome\":\"{}\"}}",
+             \"queue_wait_ms\":{},\"cache_lookup_ms\":{},\"execution_ms\":{},\
+             \"publication_ms\":{},\"total_duration_ms\":{},\"outcome\":\"{}\"}}",
             event.action,
             event.digest.to_hex(),
             event.cache,
-            event.duration_ms,
+            event.queue_wait_ms,
+            event.cache_lookup_ms,
+            event.execution_ms,
+            event.publication_ms,
+            event.total_duration_ms,
             event.outcome
         ));
     }
@@ -2226,8 +2765,18 @@ pub fn log(root: &Path, format: &str, _options: &BuildOptions) -> Result<(), Bui
                 let event: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
                 let action = event["action"].as_str().unwrap_or("");
                 let source = event["cache"].as_str().unwrap_or("");
-                let duration = event["duration_ms"].as_u64().unwrap_or(0);
-                println!("{action} cache={source} duration_ms={duration}");
+                let queue = event["queue_wait_ms"].as_u64().unwrap_or(0);
+                let lookup = event["cache_lookup_ms"].as_u64().unwrap_or(0);
+                let execution = event["execution_ms"].as_u64().unwrap_or(0);
+                let publication = event["publication_ms"].as_u64().unwrap_or(0);
+                let total = event["total_duration_ms"]
+                    .as_u64()
+                    .or_else(|| event["duration_ms"].as_u64())
+                    .unwrap_or(0);
+                println!(
+                    "{action} cache={source} queue_ms={queue} lookup_ms={lookup} \
+                     execution_ms={execution} publication_ms={publication} total_ms={total}"
+                );
             }
         }
     }
@@ -3765,7 +4314,9 @@ pub fn fetch(root: &Path, offline: bool) -> Result<(), BuildError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact_name_matches, locked_source_matches_edge};
+    use super::{artifact_name_matches, locked_source_matches_edge, register_inflight};
+    use std::collections::BTreeMap;
+    use tong_core::digest::Hasher;
     use tong_rust::{GitSelector, PackageId, RegistryEdge, SourceId};
 
     #[test]
@@ -3776,6 +4327,16 @@ mod tests {
         assert!(artifact_name_matches("//crates/app:calc-cli", "calc-cli"));
         assert!(artifact_name_matches("calc-cli", "calc-cli"));
         assert!(!artifact_name_matches(":other", "voxel-city"));
+    }
+
+    #[test]
+    fn identical_inflight_digests_keep_one_stable_leader() {
+        let digest = Hasher::digest(b"same semantic action");
+        let mut in_flight = BTreeMap::new();
+        assert_eq!(register_inflight(&mut in_flight, digest, 7), None);
+        assert_eq!(register_inflight(&mut in_flight, digest, 11), Some(7));
+        assert_eq!(register_inflight(&mut in_flight, digest, 3), Some(7));
+        assert_eq!(in_flight.len(), 1);
     }
 
     #[test]

@@ -2795,6 +2795,7 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "flate2",
+ "jobserver",
  "semver",
  "serde",
  "serde_json",
@@ -2837,6 +2838,7 @@ dependencies = [
 name = "tong-exec"
 version = "0.2.0"
 dependencies = [
+ "jobserver",
  "tempfile",
  "tong-core",
  "tong-store",

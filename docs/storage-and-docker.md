@@ -21,6 +21,7 @@ the implementation order.
 | Correct invalidation | Action keys contain content trees, command/environment/platform/toolchain semantics, and narrowed build-script inputs. `explain rebuild` compares recorded actions. |
 | Safe GC | Latest per-project manifests form reachability roots; CAS writes are atomic and immutable; shared-mode clean removes only the caller's roots. |
 | Docker layer reuse | `tong build --deps-only`, `tong dockerfile`, and `docker_stage` tests preserve dependency action hits across the app layer. |
+| Parallel action scheduling | Dependency-ready build/check/run/test actions use `-j` workers, weighted critical-path priority, digest coalescing, and one inherited GNU-compatible jobserver. |
 
 These are useful foundations, but they do not yet prove a storage or
 incremental-speed advantage over Cargo.
@@ -36,7 +37,6 @@ incremental-speed advantage over Cargo.
 | Same-workspace builds are serialized | Parallel CLI invocations are safe, but cannot yet share identical work or independently execute divergent subgraphs. | Digest-aware in-flight action claims, wait/reuse semantics, incompatible-flag tests, and removal of the workspace lock. |
 | Source trees are content-hashed on every analysis | Very large monorepos can spend too long proving unchanged inputs. | Content-correct stat index with racy-clean checks and miss explanations. |
 | Any Rust source edit reruns a whole rustc action without prior incremental state | Edited builds may lose to Cargo even when action lookup is fast. | Bounded local rustc incremental acceleration keyed by canonical unit, with clean-output equivalence checks. |
-| Scheduler is sequential | Large graphs cannot match Cargo wall time despite correct caching. | Dependency-ready `-j` scheduler before performance certification. |
 | Docker support generates files but does not execute actions | Users still assemble and operate the Docker workflow themselves. | `--executor docker`, BuildKit cache transport, capability diagnostics, local/CI parity suite. |
 
 ## Implementation sequence
@@ -66,7 +66,8 @@ incremental-speed advantage over Cargo.
 
 ### C. Match Cargo on edited builds
 
-- Finish the parallel dependency-ready scheduler and `-j` resource accounting.
+- Benchmark and tune the dependency-ready scheduler's historical critical-path
+  weights on large corpus workspaces.
 - Coordinate overlapping same-workspace builds by complete action digest:
   wait for identical in-flight actions, reuse validated results, and execute
   only differing subgraphs when flags or inputs diverge.

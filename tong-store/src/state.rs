@@ -21,7 +21,7 @@ use tong_core::canonical::{self, CanonicalDecode, CanonicalEncode, DecodeError, 
 use tong_core::digest::{Digest, Hasher};
 
 /// Schema version of the build-manifest encoding.
-pub const BUILD_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const BUILD_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Manifests kept per project; older ones are superseded state and are
 /// deleted at write time ("rebuilding clears the old cache").
@@ -75,6 +75,16 @@ pub struct RecordedAction {
     pub stderr: BlobDigest,
     /// Wall-clock execution time, informational.
     pub duration_millis: u64,
+    /// Time spent dependency-ready but waiting for coordinator/worker admission.
+    pub queue_wait_millis: u64,
+    /// Concretization, cache lookup, and cached-closure verification time.
+    pub cache_lookup_millis: u64,
+    /// Time spent executing the action process (zero for reused results).
+    pub execution_millis: u64,
+    /// Time spent publishing the validated action result.
+    pub publication_millis: u64,
+    /// End-to-end duration from dependency readiness through publication.
+    pub total_millis: u64,
 }
 
 impl CanonicalEncode for BuildManifest {
@@ -141,6 +151,11 @@ impl CanonicalEncode for RecordedAction {
         self.stdout.encode(enc);
         self.stderr.encode(enc);
         self.duration_millis.encode(enc);
+        self.queue_wait_millis.encode(enc);
+        self.cache_lookup_millis.encode(enc);
+        self.execution_millis.encode(enc);
+        self.publication_millis.encode(enc);
+        self.total_millis.encode(enc);
     }
 }
 
@@ -157,6 +172,11 @@ impl CanonicalDecode for RecordedAction {
             stdout: BlobDigest::new(Digest::decode(dec)?),
             stderr: BlobDigest::new(Digest::decode(dec)?),
             duration_millis: u64::decode(dec)?,
+            queue_wait_millis: u64::decode(dec)?,
+            cache_lookup_millis: u64::decode(dec)?,
+            execution_millis: u64::decode(dec)?,
+            publication_millis: u64::decode(dec)?,
+            total_millis: u64::decode(dec)?,
         })
     }
 }
@@ -371,6 +391,11 @@ mod tests {
                 stdout: BlobDigest::new(Hasher::digest(b"stdout")),
                 stderr: BlobDigest::new(Hasher::digest(b"stderr")),
                 duration_millis: 7,
+                queue_wait_millis: 1,
+                cache_lookup_millis: 2,
+                execution_millis: 3,
+                publication_millis: 1,
+                total_millis: 7,
             }],
             artifacts: vec![(
                 "app".to_owned(),

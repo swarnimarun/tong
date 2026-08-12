@@ -6,7 +6,8 @@ delivery gates, not features that merely have an implementation path.
 ## Current baseline
 
 The language-neutral action schema, deterministic digests, local CAS, action
-cache, build-state manifests, reachability GC, Rust toolchain capture,
+cache, build-state manifests, reachability GC, dependency-ready parallel
+scheduling with jobserver accounting, Rust toolchain capture,
 `Tong.lock`, registry/git fixed fetching, native `Tong.toml` targets, and a
 Cargo-import frontend are implemented.
 
@@ -37,7 +38,7 @@ Release gates:
 - Promote rustls, sqlx, bevy, Cargo, and rust-analyzer to the required corpus;
   add larger monorepo and performance fixtures.
 - Add Cargo-compatible `metadata` and `tree`, common selection/configuration
-  flags, parallel action scheduling, and certified cross-target Rust builds.
+  flags and certified cross-target Rust builds.
 - Support build-affecting Cargo configuration with explicit handling for
   credentials and home configuration.
 - Publish a field-by-field Cargo manifest, command, and platform matrix.
@@ -73,5 +74,5 @@ Tong goals.
   certification, source-qualified identities, and explicit unsupported errors.
 - **Platform asymmetry:** capability reporting instead of equivalent-level
   claims where operating systems cannot enforce the same isolation.
-- **Large-workspace performance:** dependency-ready parallel scheduling,
-  bounded resources, persistent capture caches, and measured corpus budgets.
+- **Large-workspace performance:** weighted scheduling, bounded jobserver
+  resources, persistent capture caches, and measured corpus budgets.

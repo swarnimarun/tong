@@ -141,6 +141,10 @@ pub struct LocalExecutor {
     keep_exec_roots: bool,
     /// Failed actions keep their root for diagnosis until the next build.
     failed: AtomicBool,
+    /// GNU-compatible jobserver inherited by action children.
+    jobserver: Option<jobserver::Client>,
+    /// Distinguishes independent executions of uncacheable actions.
+    next_no_cache_id: AtomicU64,
 }
 
 impl LocalExecutor {
@@ -191,6 +195,8 @@ impl LocalExecutor {
             bundle_roots: HashMap::new(),
             keep_exec_roots: false,
             failed: AtomicBool::new(false),
+            jobserver: None,
+            next_no_cache_id: AtomicU64::new(0),
         })
     }
 
@@ -211,10 +217,28 @@ impl LocalExecutor {
         self.keep_exec_roots = keep;
     }
 
+    /// Makes the build's GNU-compatible jobserver available to child tools.
+    ///
+    /// This is execution infrastructure, not action semantics, so the
+    /// generated authentication environment is deliberately absent from the
+    /// action digest.
+    pub fn set_jobserver(&mut self, jobserver: jobserver::Client) {
+        self.jobserver = Some(jobserver);
+    }
+
     /// Executes an action. Cache lookup happens in the driver, not here.
     pub fn execute(&self, spec: &ActionSpec) -> Result<ExecOutcome, ExecError> {
         let digest = spec.digest();
-        let exec_root = self.invocation_root.join(digest.to_hex());
+        let directory = if spec.cache_policy == tong_core::action::CachePolicy::NoCache {
+            format!(
+                "{}-nocache-{}",
+                digest.to_hex(),
+                self.next_no_cache_id.fetch_add(1, Ordering::Relaxed)
+            )
+        } else {
+            digest.to_hex()
+        };
+        let exec_root = self.invocation_root.join(directory);
         let started = Instant::now();
 
         // Recreate only this invocation's action directory. Another build may
@@ -302,6 +326,22 @@ impl LocalExecutor {
         for (key, value) in &spec.environment {
             env.push((key.clone(), substitute(value)));
         }
+        if let Some(jobserver) = &self.jobserver {
+            // Extract the authentication value for sandboxes that rebuild the
+            // command environment. `configure` is called again on the final
+            // command below so the underlying handles are inherited too.
+            let mut probe = Command::new("jobserver-environment-probe");
+            jobserver.configure(&mut probe);
+            if let Some(value) = probe
+                .get_envs()
+                .find_map(|(key, value)| (key == "CARGO_MAKEFLAGS").then_some(value).flatten())
+            {
+                env.push((
+                    "CARGO_MAKEFLAGS".to_owned(),
+                    value.to_string_lossy().into_owned(),
+                ));
+            }
+        }
 
         let working_dir = if spec.working_directory.as_str() == RelativePath::ROOT {
             input.to_path_buf()
@@ -343,6 +383,9 @@ impl LocalExecutor {
                 environment: env,
             };
             self.sandbox.wrap_command(child, &spec, exec_root)?;
+        }
+        if let Some(jobserver) = &self.jobserver {
+            jobserver.configure(child);
         }
 
         let mut child = child.spawn().map_err(|err| {

@@ -1324,8 +1324,9 @@ Release only when:
 * Promote the extended corpus to required and add large monorepo/performance
   fixtures.
 * Add Cargo-compatible metadata/tree interfaces, common selection flags,
-  configuration precedence, parallel scheduling, and certified cross-target
-  builds.
+  configuration precedence, and certified cross-target builds. Dependency-ready
+  parallel scheduling with `-j`, digest coalescing, and jobserver accounting is
+  implemented; large-workspace performance certification remains.
 * Publish a field-by-field manifest/configuration compatibility matrix.
 * Make shared backing a first-class CLI/config choice, publish physical-storage
   and incremental-build comparisons with Cargo, and add safe thin-output
@@ -1427,6 +1428,9 @@ tong-store/
 ### Exit criteria
 
 * A synthetic multi-target graph executes incrementally.
+* Dependency-ready actions execute under `-j` accounting, cache hits complete
+  in the coordinator, identical cacheable digests coalesce in flight, and
+  children inherit a GNU-compatible jobserver. *(completed)*
 * Concurrent builds do not lock the whole output tree. *(partial: CAS writes
   are per-digest and execution roots are isolated, but same-workspace builds
   remain serialized until §10.3 in-flight coordination lands.)*

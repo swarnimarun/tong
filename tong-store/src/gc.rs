@@ -437,6 +437,11 @@ mod tests {
                 stdout: BlobDigest::new(Hasher::digest(b"so")),
                 stderr: BlobDigest::new(Hasher::digest(b"se")),
                 duration_millis: 0,
+                queue_wait_millis: 0,
+                cache_lookup_millis: 0,
+                execution_millis: 0,
+                publication_millis: 0,
+                total_millis: 0,
             })
             .collect();
         BuildManifest {
@@ -631,6 +636,11 @@ mod tests {
             stdout: BlobDigest::new(Hasher::digest(b"so")),
             stderr: BlobDigest::new(Hasher::digest(b"se")),
             duration_millis: 9,
+            queue_wait_millis: 1,
+            cache_lookup_millis: 2,
+            execution_millis: 4,
+            publication_millis: 1,
+            total_millis: 8,
         };
         let bytes = canonical::encode_vec(&action);
         let decoded = canonical::decode_all::<crate::state::RecordedAction>(&bytes).unwrap();

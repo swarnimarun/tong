@@ -148,6 +148,9 @@ The current repository includes:
   builds after sources are present;
 - source-qualified package/action identities, content-addressed artifacts,
   build-state manifests, and reachability GC;
+- dependency-ready parallel builds controlled by `-j`/`--jobs`, with
+  critical-path priority, in-flight digest coalescing, and a GNU-compatible
+  jobserver inherited by nested tools;
 - shared backing through `--store-dir` or `TONG_STORE_DIR`, with selected
   outputs materialized under `.tong/out`;
 - `tong build --deps-only` and `tong dockerfile` for Docker layer-cache
@@ -165,9 +168,9 @@ The next implementation stages are:
 
 - compatibility/hermetic execution modes and `Tong.permissions.toml` auditing
   for build scripts and proc macros;
-- dependency-ready parallel scheduling, `-j` resource accounting, and
-  digest-aware sharing of identical in-flight actions across overlapping
-  same-workspace builds (currently serialized for correctness);
+- cross-process digest-aware sharing of identical in-flight actions across
+  overlapping same-workspace builds (CLI invocations remain serialized for
+  correctness);
 - physical/logical store statistics, thin/reflink materialization, and build
   leases for safer shared-store GC;
 - Cargo-compatible `metadata` and `tree` commands, broader configuration and

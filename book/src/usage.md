@@ -39,6 +39,11 @@ workspace packages (selection = `--target` labels, or all members);
 native mode, `Tong.toml` target-level `features`/`default_features` also
 apply.
 
+**Parallelism.** Build-like commands run dependency-ready actions in parallel.
+`-j N` / `--jobs N` sets the action limit; the default is the host's available
+CPU count. Tong exports the same GNU-compatible jobserver to build scripts and
+nested tools, so cooperating subprocesses share the limit.
+
 **Output.** Every build prints a summary:
 
 ```text
@@ -54,7 +59,7 @@ Executed actions are cached per digest, so no-change builds print
 ```sh
 tong build [--profile <name>] [--target <label>]...
            [--features <list>] [--no-default-features] [--all-features]
-           [--deps-only]
+           [--deps-only] [-j <jobs>]
 ```
 
 - `--deps-only` executes only actions owned by non-workspace packages
