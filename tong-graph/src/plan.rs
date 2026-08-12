@@ -43,6 +43,9 @@ pub struct PlannedAction {
     /// executes only external actions, so docker dep layers bust only when
     /// the lockfile or toolchain changes.
     pub external: bool,
+    /// This action's input was narrowed using dependency information from
+    /// its previous successful execution.
+    pub input_narrowed: bool,
     /// Assembles the final `ActionSpec` from completed dependencies.
     pub make: MakeSpec,
 }
@@ -246,6 +249,7 @@ mod tests {
             mnemonic: "Test".to_owned(),
             deps,
             external: false,
+            input_narrowed: false,
             make: Box::new(move |completed, cas| {
                 let mut inputs = vec![(RelativePath::new(".").unwrap(), {
                     let tree = Tree::default();

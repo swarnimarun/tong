@@ -198,7 +198,7 @@ impl StateStore {
             return Ok(());
         }
         let bytes = canonical::encode_vec(manifest);
-        let tmp = self.root.join(format!("tmp-{}", std::process::id()));
+        let tmp = self.root.join(unique_name());
         fs::write(&tmp, &bytes)?;
         match fs::rename(&tmp, &path) {
             Ok(()) => {}
@@ -291,6 +291,16 @@ impl StateStore {
         }
         Ok(())
     }
+}
+
+fn unique_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn newest_in(dir: &Path) -> Option<BuildManifest> {

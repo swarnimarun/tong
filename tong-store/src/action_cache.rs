@@ -104,7 +104,7 @@ impl ActionCache {
         let bytes = canonical::encode_vec(result);
         let path = self.path(action);
         fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = self.root.join(format!("tmp-{}", std::process::id()));
+        let tmp = self.root.join(unique_name());
         fs::write(&tmp, &bytes)?;
         match fs::rename(&tmp, &path) {
             Ok(()) => Ok(()),
@@ -125,6 +125,16 @@ impl ActionCache {
             Err(err) => Err(err),
         }
     }
+}
+
+fn unique_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

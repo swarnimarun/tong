@@ -163,6 +163,8 @@ struct BuildScriptRunSpec {
     cfgs: Vec<(String, String)>,
     /// The package's activated features (`CARGO_FEATURE_*`).
     features: Vec<String>,
+    /// Cargo treats a missing `rerun-if-changed` path as perpetually dirty.
+    force_rerun: bool,
 }
 
 struct TestRunSpec {
@@ -877,6 +879,12 @@ impl<'a> RustBackend<'a> {
     /// missing or malformed, or it names a path outside the package
     /// (keeping the conservative whole-tree input).
     fn previous_dep_info(&self, logical_id: &str, pkg: &Package) -> Option<Vec<PathBuf>> {
+        // Locked external sources are immutable and already content-addressed.
+        // Narrowing them after the first build would create a one-time action
+        // key transition without improving invalidation behavior.
+        if self.pkg_external(pkg) {
+            return None;
+        }
         let action = self.previous_actions.get(logical_id)?;
         let tree = self.cas.get_tree(action.outputs).ok().flatten()?;
         let dep_text = find_dep_blob(&tree, &self.cas)?;
@@ -884,13 +892,30 @@ impl<'a> RustBackend<'a> {
         let pkg_dir = fs::canonicalize(&pkg.dir).ok()?;
         let mut paths = Vec::new();
         for path in parse_dep_info(&text) {
-            let Ok(relative) = path.strip_prefix(&pkg_dir) else {
-                return None;
+            let relative = if path.is_absolute() {
+                path.strip_prefix(&pkg_dir).ok()?.to_path_buf()
+            } else {
+                // rustc emits paths relative to its working directory (the
+                // package root in Tong's exec input), so retain safe relative
+                // paths instead of treating them as outside the package.
+                if path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return None;
+                }
+                path
             };
             if !relative.as_os_str().is_empty() {
-                paths.push(relative.to_path_buf());
+                paths.push(relative);
             }
         }
+        paths.sort();
+        paths.dedup();
         (!paths.is_empty()).then_some(paths)
     }
 
@@ -908,8 +933,9 @@ impl<'a> RustBackend<'a> {
     /// Builds the build-script run action's source tree according to the
     /// previous run's `rerun-if-changed` directives: only the declared
     /// paths (plus the build script itself, which Cargo always tracks) are
-    /// captured; a declared path that no longer exists is an error, like
-    /// Cargo. Without any directives the whole package tree is kept
+    /// captured. A missing declared path keeps the conservative tree and
+    /// marks the run uncacheable, matching Cargo's perpetually-dirty
+    /// behavior. Without any directives the whole package tree is kept
     /// (Cargo's "rerun if anything changes" fallback).
     fn narrowed_script_tree(
         &self,
@@ -1062,11 +1088,6 @@ impl<'a> RustBackend<'a> {
                 let suffix = if feature_host_domain { ":host" } else { "" };
                 let mut run_source_tree = source_tree;
                 let mut run_env: BTreeMap<String, String> = BTreeMap::new();
-                // The previous run's directives narrow BOTH the script's
-                // compile and run inputs: the run's executable comes from the
-                // compile, so a recompile (e.g. triggered by an undeclared
-                // file) would produce a new binary and rerun the script,
-                // defeating rerun-if-changed.
                 let previous = self.previous_directives(pkg, feature_host_domain);
                 // The COMPILE input narrows by the previous script-compile's
                 // dep-info (rustc's own module closure — `mod rustc;` must
@@ -1077,8 +1098,10 @@ impl<'a> RustBackend<'a> {
                     script_tree = self.mount_package_paths(pkg, paths, "dep-info")?;
                 }
                 if let Some(directives) = &previous {
-                    run_source_tree =
-                        self.narrowed_script_tree(pkg, run_source_tree, directives)?;
+                    if !self.pkg_external(pkg) {
+                        run_source_tree =
+                            self.narrowed_script_tree(pkg, run_source_tree, directives)?;
+                    }
                     // rerun-if-env-changed: declared env vars become explicit
                     // run-action inputs (the digest then covers their values).
                     // An unset var stays absent — forcing it to "" would change
@@ -1090,6 +1113,12 @@ impl<'a> RustBackend<'a> {
                         }
                     }
                 }
+                let force_rerun = previous.as_ref().is_some_and(|directives| {
+                    directives
+                        .rerun_if_changed
+                        .iter()
+                        .any(|path| !Path::new(path).is_absolute() && !pkg.dir.join(path).exists())
+                });
                 let script = self.crate_root_for(&pkg.id, script);
                 let binary = format!("{}_build_script", crate_name(&pkg.name));
                 let compile_id = self.plan_compile(
@@ -1110,10 +1139,6 @@ impl<'a> RustBackend<'a> {
                     feature_host_domain,
                     false,
                 )?;
-
-                if previous.is_some() {
-                    run_source_tree = script_tree;
-                }
 
                 let run_id = ActionId(format!("rust:bs-run:{}{suffix}", self.pkg_label(pkg)));
                 // Direct dependencies with a `links` value export their build
@@ -1198,6 +1223,7 @@ impl<'a> RustBackend<'a> {
                             .iter()
                             .cloned()
                             .collect(),
+                        force_rerun,
                     }),
                     source_tree: run_source_tree,
                     rustc: self.toolchain.rustc_blob,
@@ -1531,9 +1557,12 @@ impl<'a> RustBackend<'a> {
         // actually read (dep-info). First builds stay conservative; a
         // malformed or out-of-package dep-info also keeps the whole tree
         // (never cache under an incomplete key).
-        if let Some(paths) = self.previous_dep_info(logical_id, pkg) {
+        let input_narrowed = if let Some(paths) = self.previous_dep_info(logical_id, pkg) {
             source_tree = self.mount_package_paths(pkg, paths, "dep-info")?;
-        }
+            true
+        } else {
+            false
+        };
         // `--check` builds emit metadata only (cargo check); build
         // scripts always compile fully (they run even in check builds).
         let proc_macro_test =
@@ -1692,7 +1721,9 @@ impl<'a> RustBackend<'a> {
         };
         let id = ctx.logical_id.clone();
         self.planned_ids.insert(key.to_owned(), id.clone());
-        actions.push(self.boxed(ctx));
+        let mut action = self.boxed(ctx);
+        action.input_narrowed = input_narrowed;
+        actions.push(action);
         Ok(id)
     }
 
@@ -1883,6 +1914,7 @@ impl<'a> RustBackend<'a> {
             logical_id,
             mnemonic,
             external,
+            input_narrowed: false,
             deps: ctx.deps(),
             make: Box::new(move |completed, cas| concretize(&ctx, completed, cas)),
         }
@@ -2959,6 +2991,7 @@ fn concretize(ctx: &Ctx, completed: &dyn Completed, cas: &Cas) -> Result<ActionS
     let cache_policy = match &ctx.kind {
         CtxKind::TestRun(spec) if spec.cache_test_result => CachePolicy::Enabled,
         CtxKind::TestRun(_) => CachePolicy::NoCache,
+        CtxKind::BuildScriptRun(spec) if spec.force_rerun => CachePolicy::NoCache,
         _ if ctx.network_allow => CachePolicy::NoCache,
         _ => CachePolicy::Enabled,
     };

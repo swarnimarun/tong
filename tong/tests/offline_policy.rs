@@ -131,6 +131,7 @@ fn rustc_path() -> PathBuf {
 fn run_tong(workspace: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(tong());
     command
+        .arg("-v")
         .args(args)
         .current_dir(workspace)
         .env("TONG_RUSTC", rustc_path());
@@ -144,6 +145,7 @@ fn run_tong_registry(
 ) -> std::process::Output {
     let mut command = Command::new(tong());
     command
+        .arg("-v")
         .args(args)
         .current_dir(workspace)
         .env(
@@ -344,7 +346,7 @@ fn no_cache_actions_bypass_action_cache() {
         stdout_of(&first),
         stderr_of(&first)
     );
-    let first_stdout = stdout_of(&first);
+    let first_stdout = format!("{}{}", stdout_of(&first), stderr_of(&first));
     assert!(
         first_stdout.contains("rust:test-run:app:lib:app"),
         "expected the test-run action, got: {first_stdout}"
@@ -368,7 +370,7 @@ fn no_cache_actions_bypass_action_cache() {
         stdout_of(&second),
         stderr_of(&second)
     );
-    let second_stdout = stdout_of(&second);
+    let second_stdout = format!("{}{}", stdout_of(&second), stderr_of(&second));
     assert!(
         second_stdout.contains("[cached]"),
         "compile actions should cache-hit on the second run: {second_stdout}"
@@ -383,9 +385,21 @@ fn no_cache_actions_bypass_action_cache() {
     );
     assert!(second_stdout.contains("1 passed"), "{second_stdout}");
 
+    // The second build may add cache aliases while compile inputs narrow
+    // from the conservative first-build tree to rustc dep-info. Once that
+    // sound transition is recorded, another NoCache test run must leave the
+    // action cache byte-for-byte unchanged.
+    let before_no_cache_only = result_files(&results_root);
+    let third = run_tong(ws, &["test"]);
+    assert!(
+        third.status.success(),
+        "third test run failed: {}{}",
+        stdout_of(&third),
+        stderr_of(&third)
+    );
     let after = result_files(&results_root);
     assert_eq!(
-        before, after,
+        before_no_cache_only, after,
         "a NoCache test run must never be inserted into the action cache"
     );
 }

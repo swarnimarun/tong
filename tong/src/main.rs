@@ -9,7 +9,7 @@ mod dockerfile;
 mod driver;
 mod manifest_mode;
 
-use driver::{BuildOptions, BuildOutcome, TargetSelection};
+use driver::{BuildOptions, BuildOutcome, MessageFormat, TargetSelection};
 
 #[derive(Parser)]
 #[command(
@@ -22,6 +22,12 @@ struct Cli {
     /// reuse builds while keeping each project-local `.tong` directory thin.
     #[arg(long, global = true, value_name = "PATH")]
     store_dir: Option<PathBuf>,
+    /// Print one line for every cache hit and detailed phase diagnostics.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+    /// Select human progress or versioned JSON event output.
+    #[arg(long, global = true, value_enum, default_value_t = MessageFormat::Human)]
+    message_format: MessageFormat,
     #[command(subcommand)]
     command: Command,
 }
@@ -417,19 +423,29 @@ fn command_root(cwd: &std::path::Path, flags: &BuildFlags) -> Result<PathBuf, St
 }
 
 fn main() -> ExitCode {
+    let process_started = std::time::Instant::now();
     // Perf and metrics events go through tracing (target `tong::perf`,
     // controlled by `RUST_LOG`, written to stderr) so they can be forwarded
     // to a file or pipeline separately from the default stdout output.
-    // Default level `warn`: nothing is emitted unless RUST_LOG opts in.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // The subscriber is installed only when RUST_LOG opts in, keeping the
+    // default release hot path free of tracing setup/teardown work.
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
-    let Cli { store_dir, command } = Cli::parse();
+    let Cli {
+        store_dir,
+        verbose,
+        message_format,
+        command,
+    } = Cli::parse();
+    driver::set_output_options(verbose, message_format);
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(store_dir) = store_dir {
         let store_dir = if store_dir.is_absolute() {
@@ -439,7 +455,7 @@ fn main() -> ExitCode {
         };
         driver::set_store_dir_override(store_dir);
     }
-    match command {
+    let exit = match command {
         Command::Build {
             labels,
             targets,
@@ -756,10 +772,19 @@ fn main() -> ExitCode {
                 }
             }
         }
-    }
+    };
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "process.total",
+        duration_ms = process_started.elapsed().as_millis() as u64,
+    );
+    exit
 }
 
 fn print_summary(outcome: &BuildOutcome) {
+    if driver::json_output() {
+        return;
+    }
     println!();
     if outcome.actions_skipped > 0 {
         println!(

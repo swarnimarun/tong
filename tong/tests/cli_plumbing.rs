@@ -19,6 +19,7 @@ fn rustc_path() -> PathBuf {
 
 fn run_tong(workspace: &Path, args: &[&str]) -> std::process::Output {
     Command::new(tong())
+        .arg("-v")
         .args(args)
         .current_dir(workspace)
         .env("TONG_RUSTC", rustc_path())
@@ -129,12 +130,44 @@ fn shared_store_reuses_cargo_workspace_actions() {
         &["--store-dir", store_arg, "build", "--workspace"],
     );
     assert_success(&output, "second shared Cargo build");
-    let stdout = stdout_of(&output);
+    let stdout = stderr_of(&output);
     assert!(
         stdout.contains("[cached]"),
         "second Cargo worktree must reuse shared actions: {stdout}"
     );
     assert!(!second.path().join(".tong/store").exists());
+}
+
+#[test]
+fn json_build_progress_is_versioned_json_lines() {
+    let workspace = cargo_workspace();
+    let lock = run_tong(workspace.path(), &["lock"]);
+    assert_success(&lock, "lock JSON progress fixture");
+    let output = run_tong(
+        workspace.path(),
+        &["--message-format", "json", "build", "--workspace"],
+    );
+    assert_success(&output, "JSON progress build");
+    let events: Vec<serde_json::Value> = stdout_of(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|err| panic!("{err}: {line}")))
+        .collect();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| event["schema_version"] == 1));
+    for kind in [
+        "phase-started",
+        "phase-finished",
+        "action-started",
+        "action-finished",
+        "build-finished",
+    ] {
+        assert!(events.iter().any(|event| event["type"] == kind), "{kind}");
+    }
+    let elapsed: Vec<u64> = events
+        .iter()
+        .map(|event| event["elapsed_ms"].as_u64().unwrap())
+        .collect();
+    assert!(elapsed.windows(2).all(|pair| pair[0] <= pair[1]));
 }
 
 #[test]
@@ -231,12 +264,12 @@ fn cargo_workflow_commands_native_workspace() {
     // Positional label selection builds the app.
     let output = run_tong(ws, &["build", "//app:app"]);
     assert_success(&output, "build //app:app");
-    assert!(stdout_of(&output).contains("rust:bin:web-app:web-app"));
+    assert!(stderr_of(&output).contains("rust:bin:web-app:web-app"));
 
     // check builds metadata-only.
     let output = run_tong(ws, &["check", "//app:app"]);
     assert_success(&output, "check //app:app");
-    assert!(stdout_of(&output).contains("rust:bin:web-app:web-app"));
+    assert!(stderr_of(&output).contains("rust:bin:web-app:web-app"));
 
     // run executes the binary with args after `--`.
     let output = run_tong(ws, &["run", "//app:app", "--", "ignored"]);
@@ -301,7 +334,7 @@ fn cargo_workflow_commands_cargo_workspace() {
     assert_success(&output, "build -p app");
     let output = run_tong(ws, &["check"]);
     assert_success(&output, "check default-members");
-    assert!(!stdout_of(&output).contains("rust:bin:app:app"));
+    assert!(!stderr_of(&output).contains("rust:bin:app:app"));
     let output = run_tong(ws, &["check", "--workspace"]);
     assert_success(&output, "check --workspace");
     let output = run_tong(ws, &["test", "--workspace", "--no-run"]);
@@ -311,7 +344,7 @@ fn cargo_workflow_commands_cargo_workspace() {
 
     let output = run_tong(ws, &["check", "--workspace", "--exclude", "app"]);
     assert_success(&output, "check --workspace --exclude app");
-    assert!(!stdout_of(&output).contains("rust:bin:app:app"));
+    assert!(!stderr_of(&output).contains("rust:bin:app:app"));
 
     let runner = ws.join("runner");
     fs::create_dir(&runner).unwrap();
@@ -329,7 +362,7 @@ fn cargo_workflow_commands_cargo_workspace() {
         let output = run_tong(ws, &["check", selector, name]);
         assert_success(&output, &format!("check {selector} {name}"));
         assert!(
-            stdout_of(&output).contains(action),
+            stderr_of(&output).contains(action),
             "{}",
             stdout_of(&output)
         );

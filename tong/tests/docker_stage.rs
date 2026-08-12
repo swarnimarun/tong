@@ -199,7 +199,7 @@ fn run_tong(
     args: &[&str],
 ) -> std::process::Output {
     let mut command = Command::new(tong());
-    command.args(args).current_dir(workspace);
+    command.arg("-v").args(args).current_dir(workspace);
     if let Some(index) = registry_index {
         command.env("TONG_REGISTRY_INDEX", format!("file://{}", index.display()));
     }
@@ -247,10 +247,10 @@ fn docker_stage_deps_only_then_full_build_hits_cache() {
     );
     // Dep actions executed; the workspace binary was not planned (the
     // manifests-only member has no targets) and nothing else ran.
-    assert!(stdout.contains("rust:lib:alpha:rlib"), "{stdout}");
-    assert!(stdout.contains("rust:lib:beta:rlib"), "{stdout}");
-    assert!(!stdout.contains("rust:bin:app:app"), "{stdout}");
-    assert!(!stdout.contains("[cached]"), "{stdout}");
+    assert!(stderr.contains("rust:lib:alpha:rlib"), "{stderr}");
+    assert!(stderr.contains("rust:lib:beta:rlib"), "{stderr}");
+    assert!(!stderr.contains("rust:bin:app:app"), "{stderr}");
+    assert!(!stderr.contains("[cached]"), "{stderr}");
     // Nothing assembled.
     assert!(
         !dir.join(".tong/out").exists(),
@@ -280,16 +280,16 @@ fn docker_stage_deps_only_then_full_build_hits_cache() {
         "full build failed: {stdout}{stderr}"
     );
     // The workspace binary executed; both dep actions were cache hits.
-    assert!(stdout.contains("rust:bin:app:app"), "{stdout}");
+    assert!(stderr.contains("rust:bin:app:app"), "{stderr}");
     assert!(
-        stdout.contains("rust:lib:alpha:rlib (RustLibrary) [cached]"),
-        "{stdout}"
+        stderr.contains("rust:lib:alpha:rlib (RustLibrary) [cached]"),
+        "{stderr}"
     );
     assert!(
-        stdout.contains("rust:lib:beta:rlib (RustLibrary) [cached]"),
-        "{stdout}"
+        stderr.contains("rust:lib:beta:rlib (RustLibrary) [cached]"),
+        "{stderr}"
     );
-    assert_eq!(stdout.matches("[cached]").count(), 2, "{stdout}");
+    assert_eq!(stderr.matches("[cached]").count(), 2, "{stderr}");
 
     // The assembled binary works.
     let binary = dir.join(".tong/out/dev/app/app");
@@ -348,7 +348,7 @@ fn deps_only_native_mode_skips_everything_then_full_build_works() {
         output.status.success(),
         "native build failed: {stdout}{stderr}"
     );
-    assert!(stdout.contains("rust:bin:app:app"), "{stdout}");
+    assert!(stderr.contains("rust:bin:app:app"), "{stderr}");
     let run = Command::new(dir.join(".tong/out/dev/app/app"))
         .output()
         .unwrap();
@@ -382,7 +382,7 @@ fn deps_only_never_invalidates_the_local_cache() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "build failed: {stdout}{stderr}");
-    assert_eq!(stdout.matches("[cached]").count(), 0, "{stdout}");
+    assert_eq!(stderr.matches("[cached]").count(), 0, "{stderr}");
 
     // Deps-only build in the same store: dep actions are cache hits, the
     // workspace action is skipped — and the recorded manifest must keep
@@ -394,7 +394,7 @@ fn deps_only_never_invalidates_the_local_cache() {
         output.status.success(),
         "deps-only failed: {stdout}{stderr}"
     );
-    assert_eq!(stdout.matches("[cached]").count(), 2, "{stdout}");
+    assert_eq!(stderr.matches("[cached]").count(), 2, "{stderr}");
     assert!(stdout.contains("1 skipped"), "{stdout}");
 
     // Hard GC: unmarked objects die. Nothing the workspace references may
@@ -422,6 +422,6 @@ fn deps_only_never_invalidates_the_local_cache() {
         output.status.success(),
         "full build failed: {stdout}{stderr}"
     );
-    assert_eq!(stdout.matches("[cached]").count(), 3, "{stdout}");
+    assert_eq!(stderr.matches("[cached]").count(), 3, "{stderr}");
     assert!(stdout.contains("0 executed"), "{stdout}");
 }

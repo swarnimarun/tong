@@ -53,6 +53,108 @@ pub const DEFAULT_MAX_SIZE: &str = "10G";
 /// cache location never changes semantic action identity.
 static STORE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+static OUTPUT_OPTIONS: OnceLock<OutputOptions> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub enum MessageFormat {
+    #[default]
+    Human,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OutputOptions {
+    verbose: bool,
+    message_format: MessageFormat,
+}
+
+pub fn set_output_options(verbose: bool, message_format: MessageFormat) {
+    let _ = OUTPUT_OPTIONS.set(OutputOptions {
+        verbose,
+        message_format,
+    });
+}
+
+pub fn json_output() -> bool {
+    matches!(output_options().message_format, MessageFormat::Json)
+}
+
+fn output_options() -> OutputOptions {
+    OUTPUT_OPTIONS.get().copied().unwrap_or_default()
+}
+
+struct Progress {
+    started: std::time::Instant,
+    options: OutputOptions,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            options: output_options(),
+        }
+    }
+
+    fn event(&self, kind: &str, fields: serde_json::Value) {
+        if matches!(self.options.message_format, MessageFormat::Json) {
+            let mut event = serde_json::json!({
+                "schema_version": 1,
+                "type": kind,
+                "elapsed_ms": self.started.elapsed().as_millis() as u64,
+            });
+            if let (Some(event), Some(fields)) = (event.as_object_mut(), fields.as_object()) {
+                event.extend(fields.clone());
+            }
+            println!("{event}");
+        }
+    }
+
+    fn phase_started(&self, phase: &str) {
+        self.event("phase-started", serde_json::json!({ "phase": phase }));
+    }
+
+    fn phase_finished(&self, phase: &str, duration: std::time::Duration, detail: &str) {
+        self.event(
+            "phase-finished",
+            serde_json::json!({
+                "phase": phase,
+                "duration_ms": duration.as_millis() as u64,
+            }),
+        );
+        if matches!(self.options.message_format, MessageFormat::Human) {
+            eprintln!("{phase} {detail} {}", display_duration(duration));
+        }
+    }
+
+    fn action_started(&self, action: &str, mnemonic: &str) {
+        self.event(
+            "action-started",
+            serde_json::json!({ "action": action, "mnemonic": mnemonic }),
+        );
+    }
+
+    fn action_finished(&self, action: &str, cached: bool, duration: std::time::Duration) {
+        self.event(
+            "action-finished",
+            serde_json::json!({
+                "action": action,
+                "cached": cached,
+                "duration_ms": duration.as_millis() as u64,
+                "outcome": "success",
+            }),
+        );
+    }
+}
+
+fn display_duration(duration: std::time::Duration) -> String {
+    if duration.as_millis() < 1_000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{:.2}s", duration.as_secs_f64())
+    }
+}
+
 /// Sets the process-wide store directory selected by the CLI.
 pub fn set_store_dir_override(dir: PathBuf) {
     let _ = STORE_DIR_OVERRIDE.set(dir);
@@ -258,12 +360,20 @@ impl From<tong_rust::ToolchainError> for BuildError {
 /// Builds the workspace at `root` and materializes artifacts under
 /// `.tong/out/<profile>/`.
 pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildError> {
-    let _workspace_lock = WorkspaceBuildLock::acquire(root)?;
     let t_build = std::time::Instant::now();
+    let _workspace_lock = WorkspaceBuildLock::acquire(root)?;
+    let progress = Progress::new();
+    progress.phase_started("Preparing");
     // Test/bench/example targets pull in dev-dependencies (cargo's
     // `--all-targets` semantics); plain builds exclude them.
     let include_dev = options.kinds & (KIND_TEST | KIND_EXAMPLE | KIND_BENCH) != 0;
     let prepared = prepare(root, options, include_dev, &[])?;
+    let prepare_duration = t_build.elapsed();
+    progress.phase_finished(
+        "Preparing",
+        prepare_duration,
+        &format!("{} actions", prepared.order.len()),
+    );
     let tong_dir = &prepared.tong_dir;
     let cas = &prepared.cas;
     let cache = &prepared.cache;
@@ -292,6 +402,10 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
     let mut concretize_duration = std::time::Duration::ZERO;
     let mut result_lookup_duration = std::time::Duration::ZERO;
     let mut closure_verify_duration = std::time::Duration::ZERO;
+    let mut execute_duration = std::time::Duration::ZERO;
+    let mut cache_checked = 0usize;
+    progress.phase_started("Checking cache");
+    progress.phase_started("Executing");
 
     for index in 0..order.len() {
         let action = &prepared.planned[order[index]];
@@ -313,8 +427,10 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         // action can never alias a cacheable one.
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
         let t_action = std::time::Instant::now();
+        progress.action_started(&spec.logical_id.0, &spec.mnemonic);
         let mut cache_source = "executed";
-        let cached_result = if cacheable {
+        let mut cached_result = if cacheable {
+            cache_checked += 1;
             let t_lookup = std::time::Instant::now();
             let lookup = cache.get(digest)?;
             result_lookup_duration += t_lookup.elapsed();
@@ -335,25 +451,24 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         } else {
             None
         };
+        if cached_result.is_none() && cacheable && action.input_narrowed {
+            cached_result = reuse_narrowed_result(&prepared, &spec, digest, &mut closure_verifier)?;
+        }
         let cached = if let Some(result) = cached_result {
             outcome.actions_cached += 1;
             cache_source = "cached";
-            println!(
-                "  [{}/{}] {} ({}) [cached]",
-                index + 1,
-                order.len(),
-                spec.logical_id.0,
-                spec.mnemonic
-            );
+            if output_options().verbose {
+                eprintln!(
+                    "  [{}/{}] {} ({}) [cached]",
+                    index + 1,
+                    order.len(),
+                    spec.logical_id.0,
+                    spec.mnemonic
+                );
+            }
+            progress.action_finished(&spec.logical_id.0, true, t_action.elapsed());
             result
         } else {
-            println!(
-                "  [{}/{}] {} ({})",
-                index + 1,
-                order.len(),
-                spec.logical_id.0,
-                spec.mnemonic
-            );
             let result = match executor.execute(&spec) {
                 Ok(outcome) => outcome,
                 Err(ExecError::Exit { code, stderr, .. }) => {
@@ -371,6 +486,18 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
                 }
                 Err(err) => return Err(BuildError::Exec(err)),
             };
+            execute_duration += result.duration;
+            if matches!(output_options().message_format, MessageFormat::Human) {
+                eprintln!(
+                    "  Executed [{}/{}] {} ({}) {}",
+                    index + 1,
+                    order.len(),
+                    spec.logical_id.0,
+                    spec.mnemonic,
+                    display_duration(result.duration)
+                );
+            }
+            progress.action_finished(&spec.logical_id.0, false, result.duration);
             tracing::debug!(
                 target: "tong::perf",
                 phase = "action.execute",
@@ -440,6 +567,21 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         result_lookup_ms = result_lookup_duration.as_millis() as u64,
         closure_verify_ms = closure_verify_duration.as_millis() as u64,
     );
+    let cache_duration = concretize_duration + result_lookup_duration + closure_verify_duration;
+    progress.phase_finished(
+        "Checking cache",
+        cache_duration,
+        &format!(
+            "{cache_checked}/{cache_checked} · {} hits · {} misses",
+            outcome.actions_cached, outcome.actions_executed
+        ),
+    );
+    progress.phase_finished(
+        "Executing",
+        execute_duration,
+        &format!("{} actions", outcome.actions_executed),
+    );
+    progress.phase_started("Materializing");
     let t_assemble = std::time::Instant::now();
     let mut artifact_pairs: Vec<(String, TreeDigest)> = Vec::new();
     if !options.deps_only {
@@ -481,9 +623,15 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         phase = "assemble",
         duration_ms = t_assemble.elapsed().as_millis() as u64,
     );
+    progress.phase_finished(
+        "Materializing",
+        t_assemble.elapsed(),
+        &format!("{} artifacts", artifact_pairs.len()),
+    );
     let t_record = std::time::Instant::now();
+    progress.phase_started("Finishing");
 
-    record_state(
+    let state_changed = record_state(
         root,
         &prepared,
         &recorded,
@@ -505,6 +653,45 @@ pub fn build(root: &Path, options: &BuildOptions) -> Result<BuildOutcome, BuildE
         phase = "build.total",
         duration_ms = t_build.elapsed().as_millis() as u64,
     );
+    progress.phase_finished(
+        "Finishing",
+        t_record.elapsed(),
+        if state_changed {
+            "state updated"
+        } else {
+            "state unchanged"
+        },
+    );
+    let t_cleanup = std::time::Instant::now();
+    drop(closure_verifier);
+    drop(prepared);
+    drop(_workspace_lock);
+    tracing::debug!(
+        target: "tong::perf",
+        phase = "cleanup",
+        duration_ms = t_cleanup.elapsed().as_millis() as u64,
+    );
+    progress.event(
+        "build-finished",
+        serde_json::json!({
+            "profile": options.profile,
+            "actions": outcome.actions_total,
+            "cached": outcome.actions_cached,
+            "executed": outcome.actions_executed,
+            "skipped": outcome.actions_skipped,
+            "duration_ms": t_build.elapsed().as_millis() as u64,
+            "outcome": "success",
+        }),
+    );
+    if matches!(output_options().message_format, MessageFormat::Human) {
+        eprintln!(
+            "Finished {} · {} cached, {} executed {}",
+            options.profile,
+            outcome.actions_cached,
+            outcome.actions_executed,
+            display_duration(t_build.elapsed())
+        );
+    }
 
     Ok(outcome)
 }
@@ -548,7 +735,16 @@ pub fn test(
     libtest_args: &[String],
     options: &BuildOptions,
 ) -> Result<i32, BuildError> {
+    let t_total = std::time::Instant::now();
+    let _workspace_lock = WorkspaceBuildLock::acquire(root)?;
+    let progress = Progress::new();
+    progress.phase_started("Preparing");
     let prepared = prepare(root, options, true, libtest_args)?;
+    progress.phase_finished(
+        "Preparing",
+        t_total.elapsed(),
+        &format!("{} actions", prepared.order.len()),
+    );
     let cas = &prepared.cas;
     let cache = &prepared.cache;
     let executor = &prepared.executor;
@@ -564,6 +760,12 @@ pub fn test(
     let mut test_runs: Vec<(String, tong_core::artifact::BlobDigest)> = Vec::new();
     let mut failed = false;
     let mut closure_verifier = ClosureVerifier::default();
+    let mut actions_cached = 0usize;
+    let mut actions_executed = 0usize;
+    let mut execute_duration = std::time::Duration::ZERO;
+    let t_schedule = std::time::Instant::now();
+    progress.phase_started("Checking cache");
+    progress.phase_started("Executing");
 
     for index in 0..order.len() {
         let action = &prepared.planned[order[index]];
@@ -580,12 +782,13 @@ pub fn test(
         {
             continue;
         }
+        progress.action_started(&spec.logical_id.0, &spec.mnemonic);
 
         // Test runs are `CachePolicy::NoCache`: never look up or insert —
         // every run re-executes (deterministic native tests opt into
         // caching via `cache_test_result = true`).
         let cacheable = spec.cache_policy == CachePolicy::Enabled;
-        let cached_result = if cacheable {
+        let mut cached_result = if cacheable {
             match cache.get(digest)? {
                 Some(result) if result.is_complete_cached(cas, &mut closure_verifier)? => {
                     Some(result)
@@ -599,24 +802,24 @@ pub fn test(
         } else {
             None
         };
+        if cached_result.is_none() && cacheable && action.input_narrowed {
+            cached_result = reuse_narrowed_result(&prepared, &spec, digest, &mut closure_verifier)?;
+        }
         let cached = if let Some(result) = cached_result {
             cache_source = "cached";
-            println!(
-                "  [{}/{}] {} ({}) [cached]",
-                index + 1,
-                order.len(),
-                spec.logical_id.0,
-                spec.mnemonic
-            );
+            actions_cached += 1;
+            if output_options().verbose {
+                eprintln!(
+                    "  [{}/{}] {} ({}) [cached]",
+                    index + 1,
+                    order.len(),
+                    spec.logical_id.0,
+                    spec.mnemonic
+                );
+            }
+            progress.action_finished(&spec.logical_id.0, true, t_action.elapsed());
             result
         } else {
-            println!(
-                "  [{}/{}] {} ({})",
-                index + 1,
-                order.len(),
-                spec.logical_id.0,
-                spec.mnemonic
-            );
             let result = match executor.execute(&spec) {
                 Ok(outcome) => outcome,
                 Err(ExecError::Exit { code, stderr, .. }) => {
@@ -638,6 +841,19 @@ pub fn test(
                 }
                 Err(err) => return Err(BuildError::Exec(err)),
             };
+            actions_executed += 1;
+            execute_duration += result.duration;
+            if matches!(output_options().message_format, MessageFormat::Human) {
+                eprintln!(
+                    "  Executed [{}/{}] {} ({}) {}",
+                    index + 1,
+                    order.len(),
+                    spec.logical_id.0,
+                    spec.mnemonic,
+                    display_duration(result.duration)
+                );
+            }
+            progress.action_finished(&spec.logical_id.0, false, result.duration);
             let cached = CachedResult {
                 outputs: result.outputs,
                 stdout: result.stdout,
@@ -681,6 +897,23 @@ pub fn test(
         });
         completed.0.insert(spec.logical_id.clone(), cached);
     }
+    let cache_duration = t_schedule.elapsed().saturating_sub(execute_duration);
+    progress.phase_finished(
+        "Checking cache",
+        cache_duration,
+        &format!(
+            "{}/{} · {actions_cached} hits · {actions_executed} misses",
+            actions_cached + actions_executed,
+            actions_cached + actions_executed
+        ),
+    );
+    progress.phase_finished(
+        "Executing",
+        execute_duration,
+        &format!("{actions_executed} actions"),
+    );
+    progress.phase_started("Materializing");
+    progress.phase_finished("Materializing", std::time::Duration::ZERO, "0 artifacts");
 
     // Summary: parse the libtest result lines from each executed suite.
     let mut passed = 0usize;
@@ -694,7 +927,11 @@ pub fn test(
             .lines()
             .find(|line| line.trim_start().starts_with("test result:"))
             .unwrap_or("test result: (no summary)");
-        println!("{result_line} ({id})");
+        if json_output() {
+            eprintln!("{result_line} ({id})");
+        } else {
+            println!("{result_line} ({id})");
+        }
         let tokens: Vec<&str> = result_line.split_whitespace().collect();
         for (index, token) in tokens.iter().enumerate() {
             let number = tokens
@@ -707,10 +944,16 @@ pub fn test(
             }
         }
     }
-    println!();
-    println!("tests: {passed} passed, {failed_tests} failed");
+    if json_output() {
+        eprintln!("tests: {passed} passed, {failed_tests} failed");
+    } else {
+        println!();
+        println!("tests: {passed} passed, {failed_tests} failed");
+    }
 
-    record_state(
+    let t_finish = std::time::Instant::now();
+    progress.phase_started("Finishing");
+    let state_changed = record_state(
         root,
         &prepared,
         &recorded,
@@ -722,6 +965,33 @@ pub fn test(
         false,
     )?;
     record_events(root, &prepared.store, &events);
+    progress.phase_finished(
+        "Finishing",
+        t_finish.elapsed(),
+        if state_changed {
+            "state updated"
+        } else {
+            "state unchanged"
+        },
+    );
+    progress.event(
+        "build-finished",
+        serde_json::json!({
+            "profile": options.profile,
+            "actions": recorded.len(),
+            "cached": actions_cached,
+            "executed": actions_executed,
+            "duration_ms": t_total.elapsed().as_millis() as u64,
+            "outcome": if failed || failed_tests > 0 { "failure" } else { "success" },
+        }),
+    );
+    if matches!(output_options().message_format, MessageFormat::Human) {
+        eprintln!(
+            "Finished {} · {actions_cached} cached, {actions_executed} executed {}",
+            options.profile,
+            display_duration(t_total.elapsed())
+        );
+    }
 
     Ok(if failed || failed_tests > 0 { 1 } else { 0 })
 }
@@ -777,6 +1047,7 @@ struct Prepared {
     /// Captured source-tree digests of every package (used by the
     /// deps-only manifest so GC keeps the local packages' trees).
     source_trees: Vec<tong_core::digest::Digest>,
+    previous_actions: BTreeMap<String, tong_store::RecordedAction>,
     /// Topological order as indices into `planned`.
     order: Vec<usize>,
 }
@@ -991,6 +1262,17 @@ fn prepare(
     // Plan.
     let state = tong_store::StateStore::open(&store)?;
     let project_hash = tong_store::project_hash(root).ok();
+    let previous_actions = project_hash
+        .as_ref()
+        .and_then(|project_hash| state.latest(project_hash))
+        .map(|manifest| {
+            manifest
+                .actions
+                .into_iter()
+                .map(|action| (action.logical_id.clone(), action))
+                .collect()
+        })
+        .unwrap_or_default();
     let tests_enabled = options.kinds & (KIND_TEST | KIND_BENCH) != 0;
     let examples_enabled = options.kinds & (KIND_EXAMPLE | KIND_BENCH) != 0;
     let mut backend = RustBackend::with_tests_state(
@@ -1062,6 +1344,7 @@ fn prepare(
         planned,
         artifacts,
         source_trees,
+        previous_actions,
         order,
     })
 }
@@ -1085,9 +1368,10 @@ fn record_state(
     artifact_pairs: &[(String, TreeDigest)],
     profile: &str,
     deps_only: bool,
-) -> Result<(), BuildError> {
+) -> Result<bool, BuildError> {
     if let Ok(project_hash) = project_hash(root) {
         let state = StateStore::open(&prepared.store)?;
+        let previous = state.latest(&project_hash);
         let mut build_manifest = BuildManifest {
             schema_version: tong_store::BUILD_MANIFEST_SCHEMA_VERSION,
             project_hash,
@@ -1102,35 +1386,41 @@ fn record_state(
             actions: recorded.to_vec(),
             artifacts: artifact_pairs.to_vec(),
         };
-        if deps_only && let Some(previous) = state.latest(&project_hash) {
+        if deps_only && let Some(previous) = &previous {
             // Union with the previous closure (dedup by digest): the
             // deps-only build re-verified nothing local, so the previous
             // graph's objects are still reachable from the current
             // sources and must not be swept.
-            for digest in previous.sources {
-                if !build_manifest.sources.contains(&digest) {
-                    build_manifest.sources.push(digest);
+            for digest in &previous.sources {
+                if !build_manifest.sources.contains(digest) {
+                    build_manifest.sources.push(*digest);
                 }
             }
-            for digest in previous.toolchains {
-                if !build_manifest.toolchains.contains(&digest) {
-                    build_manifest.toolchains.push(digest);
+            for digest in &previous.toolchains {
+                if !build_manifest.toolchains.contains(digest) {
+                    build_manifest.toolchains.push(*digest);
                 }
             }
-            for action in previous.actions {
+            for action in &previous.actions {
                 if !build_manifest
                     .actions
                     .iter()
                     .any(|recorded| recorded.action_digest == action.action_digest)
                 {
-                    build_manifest.actions.push(action);
+                    build_manifest.actions.push(action.clone());
                 }
             }
-            for (name, tree) in previous.artifacts {
-                if !build_manifest.artifacts.iter().any(|(n, _)| n == &name) {
-                    build_manifest.artifacts.push((name, tree));
+            for (name, tree) in &previous.artifacts {
+                if !build_manifest.artifacts.iter().any(|(n, _)| n == name) {
+                    build_manifest.artifacts.push((name.clone(), *tree));
                 }
             }
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|previous| same_build_state(previous, &build_manifest))
+        {
+            return Ok(false);
         }
         match state.write(&build_manifest) {
             Ok(()) => {
@@ -1150,7 +1440,8 @@ fn record_state(
                     },
                 );
                 match report {
-                    Ok(report) => println!("{report}"),
+                    Ok(report) if output_options().verbose => eprintln!("{report}"),
+                    Ok(_) => {}
                     Err(err) => eprintln!("tong: warning: automatic GC failed: {err}"),
                 }
             }
@@ -1159,8 +1450,20 @@ fn record_state(
                 err
             ),
         }
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
+}
+
+fn same_build_state(left: &BuildManifest, right: &BuildManifest) -> bool {
+    left.schema_version == right.schema_version
+        && left.project_hash == right.project_hash
+        && left.graph_digest == right.graph_digest
+        && left.profiles == right.profiles
+        && left.sources == right.sources
+        && left.toolchains == right.toolchains
+        && left.actions == right.actions
+        && left.artifacts == right.artifacts
 }
 
 /// One structured build event (one action execution/cache hit).
@@ -1189,9 +1492,9 @@ fn record_events(root: &Path, store: &Path, events: &[BuildEvent]) {
     }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = dir.join(format!("{timestamp}.jsonl"));
+    let path = dir.join(format!("{timestamp}-{}.jsonl", std::process::id()));
     let mut lines = Vec::new();
     for event in events {
         lines.push(format!(
@@ -2075,6 +2378,42 @@ pub struct GcCli {
     pub max_size: Option<String>,
     /// Report without deleting.
     pub dry_run: bool,
+}
+
+/// Reuses a previous result across the one-time transition from a
+/// conservative input root to a dep-info-narrowed root. Replacing the new
+/// root with the recorded old root must reproduce the exact old action
+/// digest, proving every other semantic field is unchanged; the retained
+/// tree must also be an exact projection of the old tree.
+fn reuse_narrowed_result(
+    prepared: &Prepared,
+    spec: &tong_core::action::ActionSpec,
+    digest: tong_core::digest::Digest,
+    verifier: &mut ClosureVerifier,
+) -> Result<Option<CachedResult>, BuildError> {
+    let Some(previous) = prepared.previous_actions.get(&spec.logical_id.0) else {
+        return Ok(None);
+    };
+    let mut old_root_spec = spec.clone();
+    old_root_spec.input_root = previous.input_root;
+    if old_root_spec.digest() != previous.action_digest
+        || !prepared
+            .cas
+            .tree_contains(previous.input_root, spec.input_root)?
+    {
+        return Ok(None);
+    }
+    let result = CachedResult {
+        outputs: previous.outputs,
+        stdout: previous.stdout,
+        stderr: previous.stderr,
+        duration_millis: previous.duration_millis,
+    };
+    if !result.is_complete_cached(&prepared.cas, verifier)? {
+        return Ok(None);
+    }
+    prepared.cache.put(digest, &result)?;
+    Ok(Some(result))
 }
 
 impl Completed for CompletedMap {

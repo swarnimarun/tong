@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,6 +37,7 @@ const SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 #[derive(Clone, Debug)]
 pub struct Cas {
     root: PathBuf,
+    decoded_trees: Arc<Mutex<HashMap<TreeDigest, Tree>>>,
 }
 
 /// Build-scoped memoization for action-result closure validation.
@@ -58,7 +60,10 @@ impl Cas {
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("trees"))?;
         fs::create_dir_all(root.join("bundles"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            decoded_trees: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// Returns the store root.
@@ -241,17 +246,42 @@ impl Cas {
     /// followed by the canonical tree encoding.
     pub fn put_tree(&self, tree: &Tree) -> io::Result<TreeDigest> {
         let digest = tree.digest();
+        if self.object_path("trees", digest.digest()).is_file() {
+            self.decoded_trees
+                .lock()
+                .unwrap()
+                .insert(digest, tree.clone());
+            return Ok(digest);
+        }
         let mut enc = canonical::Encoder::new();
         enc.write_u32(tong_core::tree::TREE_SCHEMA_VERSION);
         tree.encode(&mut enc);
         let bytes = enc.into_bytes();
         let len = bytes.len() as u64;
         self.write_object("trees", digest.digest(), len, |w| w.write_all(&bytes))?;
+        self.decoded_trees
+            .lock()
+            .unwrap()
+            .insert(digest, tree.clone());
         Ok(digest)
     }
 
     /// Reads a stored tree by digest.
     pub fn get_tree(&self, digest: TreeDigest) -> io::Result<Option<Tree>> {
+        if let Some(tree) = self.decoded_trees.lock().unwrap().get(&digest).cloned() {
+            return Ok(Some(tree));
+        }
+        let tree = self.read_tree(digest)?;
+        if let Some(tree) = &tree {
+            self.decoded_trees
+                .lock()
+                .unwrap()
+                .insert(digest, tree.clone());
+        }
+        Ok(tree)
+    }
+
+    fn read_tree(&self, digest: TreeDigest) -> io::Result<Option<Tree>> {
         let path = self.object_path("trees", digest.digest());
         if !path.exists() {
             return Ok(None);
@@ -297,7 +327,7 @@ impl Cas {
                 format!("tree closure contains a cycle at {}", root.digest()),
             ));
         }
-        let Some(tree) = self.get_tree(root)? else {
+        let Some(tree) = self.read_tree(root)? else {
             verifier.visiting.remove(&root);
             return Ok(false);
         };
@@ -316,6 +346,37 @@ impl Cas {
         }
         verifier.visiting.remove(&root);
         verifier.trees.insert(root);
+        Ok(true)
+    }
+
+    /// Returns whether `projection` is an exact entry-wise subset of
+    /// `base`. Used when a later build narrows an action input with dep-info:
+    /// omitted entries may differ, but every retained input must be exactly
+    /// the content that the previous execution observed.
+    pub fn tree_contains(&self, base: TreeDigest, projection: TreeDigest) -> io::Result<bool> {
+        if base == projection {
+            return Ok(true);
+        }
+        let Some(base) = self.get_tree(base)? else {
+            return Ok(false);
+        };
+        let Some(projection) = self.get_tree(projection)? else {
+            return Ok(false);
+        };
+        for (name, expected) in projection.entries() {
+            let Some(actual) = base.entries().get(name) else {
+                return Ok(false);
+            };
+            match (actual, expected) {
+                (TreeEntry::Directory(actual), TreeEntry::Directory(expected)) => {
+                    if !self.tree_contains(*actual, *expected)? {
+                        return Ok(false);
+                    }
+                }
+                _ if actual == expected => {}
+                _ => return Ok(false),
+            }
+        }
         Ok(true)
     }
 

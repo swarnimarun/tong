@@ -19,6 +19,7 @@ fn rustc_path() -> PathBuf {
 fn run_tong(workspace: &Path, store: Option<&Path>, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(tong());
     command
+        .arg("-v")
         .args(args)
         .current_dir(workspace)
         .env("TONG_RUSTC", rustc_path());
@@ -166,7 +167,7 @@ fn native_label_rename_is_digest_stable() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    let stdout = stdout_of(&output);
+    let stdout = stderr_of(&output);
     assert!(
         stdout.contains("[cached]"),
         "renaming the label must not invalidate compile actions: {stdout}"
@@ -222,7 +223,7 @@ fn global_store_dir_shares_backing_between_worktrees() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    let stdout = stdout_of(&output);
+    let stdout = stderr_of(&output);
     assert!(
         stdout.contains("[cached]"),
         "second worktree must reuse shared actions: {stdout}"
