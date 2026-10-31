@@ -5,5 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
+# The optional assembly backend uses GNU assembly, unsupported by MSVC.
+# Both backends implement the same SHA-256 algorithm and digest format.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
+[target.'cfg(target_env = "msvc")'.dependencies]
 sha2.workspace = true

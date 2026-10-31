@@ -161,6 +161,12 @@ fn tong() -> &'static str {
     env!("CARGO_BIN_EXE_tong")
 }
 
+fn rustc_path() -> PathBuf {
+    std::env::var_os("TONG_RUSTC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("rustc"))
+}
+
 fn run_tong(workspace: &Path, registry_index: &Path, args: &[&str]) -> std::process::Output {
     Command::new(tong())
         .args(args)
@@ -169,7 +175,7 @@ fn run_tong(workspace: &Path, registry_index: &Path, args: &[&str]) -> std::proc
             "TONG_REGISTRY_INDEX",
             format!("file://{}", registry_index.display()),
         )
-        .env("TONG_RUSTC", "/Users/swarnim/.cargo/bin/rustc")
+        .env("TONG_RUSTC", rustc_path())
         .output()
         .unwrap()
 }

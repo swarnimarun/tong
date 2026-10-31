@@ -20,9 +20,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# `asm` enables SHA-NI/ARMv8 SHA-256 hardware acceleration (sha2-asm).
-# Same algorithm, identical digests — throughput only.
-sha2 = { version = "0.10", features = ["asm"] }
+sha2 = "0.10"
 tempfile = "3"
 serde = "1"
 toml = "0.8"
