@@ -2,7 +2,6 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 fn tong() -> &'static str {
     env!("CARGO_BIN_EXE_tong")
@@ -14,7 +13,7 @@ fn rustc_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("rustc"))
 }
 
-fn write_workspace(root: &Path, tag: &str, sleep_ms: u64) {
+fn write_workspace(root: &Path, tag: &str, signals: &Path, parallel: bool) {
     fs::write(
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
@@ -31,13 +30,32 @@ fn write_workspace(root: &Path, tag: &str, sleep_ms: u64) {
         )
         .unwrap();
         fs::write(package.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+        let started = signals.join(format!("{name}-started"));
+        let finished = signals.join(format!("{name}-finished"));
+        let peer = if name == "a" { "b" } else { "a" };
+        let peer_started = signals.join(format!("{peer}-started"));
+        let serial_lock = signals.join("serial-lock");
         fs::write(
             package.join("build.rs"),
             format!(
                 r#"fn main() {{
     let flags = std::env::var("CARGO_MAKEFLAGS").expect("Tong must export its jobserver");
     assert!(flags.contains("--jobserver-auth="), "{{flags}}");
-    std::thread::sleep(std::time::Duration::from_millis({sleep_ms}));
+    if !{parallel} {{
+        std::fs::create_dir({serial_lock:?}).expect("serial actions must not overlap");
+    }}
+    std::fs::write({started:?}, b"started").unwrap();
+    if {parallel} {{
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !std::path::Path::new({peer_started:?}).exists() {{
+            assert!(std::time::Instant::now() < deadline, "parallel actions never overlapped");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }}
+    }} else {{
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::remove_dir({serial_lock:?}).unwrap();
+    }}
+    std::fs::write({finished:?}, b"finished").unwrap();
     println!("cargo:rerun-if-changed=build.rs");
 }}
 // {tag}-{name}
@@ -48,9 +66,8 @@ fn write_workspace(root: &Path, tag: &str, sleep_ms: u64) {
     }
 }
 
-fn timed_build(root: &Path, store: &Path, jobs: usize) -> (Duration, std::process::Output) {
-    let started = Instant::now();
-    let output = Command::new(tong())
+fn build(root: &Path, store: &Path, jobs: usize) -> std::process::Output {
+    Command::new(tong())
         .args([
             "--store-dir",
             store.to_str().unwrap(),
@@ -62,8 +79,7 @@ fn timed_build(root: &Path, store: &Path, jobs: usize) -> (Duration, std::proces
         .current_dir(root)
         .env("TONG_RUSTC", rustc_path())
         .output()
-        .unwrap();
-    (started.elapsed(), output)
+        .unwrap()
 }
 
 #[test]
@@ -71,25 +87,30 @@ fn jobs_run_independent_actions_in_parallel_and_export_jobserver() {
     let store = tempfile::tempdir().unwrap();
     let serial = tempfile::tempdir().unwrap();
     let parallel = tempfile::tempdir().unwrap();
-    write_workspace(serial.path(), "serial", 1_000);
-    write_workspace(parallel.path(), "parallel", 1_000);
+    let serial_signals = tempfile::tempdir().unwrap();
+    let parallel_signals = tempfile::tempdir().unwrap();
+    write_workspace(serial.path(), "serial", serial_signals.path(), false);
+    write_workspace(parallel.path(), "parallel", parallel_signals.path(), true);
 
-    let (serial_duration, serial_output) = timed_build(serial.path(), store.path(), 1);
+    let serial_output = build(serial.path(), store.path(), 1);
     assert!(
         serial_output.status.success(),
         "serial build failed: {}",
         String::from_utf8_lossy(&serial_output.stderr)
     );
-    let (parallel_duration, parallel_output) = timed_build(parallel.path(), store.path(), 2);
+    let parallel_output = build(parallel.path(), store.path(), 2);
     assert!(
         parallel_output.status.success(),
         "parallel build failed: {}",
         String::from_utf8_lossy(&parallel_output.stderr)
     );
-    assert!(
-        parallel_duration + Duration::from_millis(500) < serial_duration,
-        "-j2 should overlap the independent one-second build scripts: serial={serial_duration:?}, parallel={parallel_duration:?}"
-    );
+    // The parallel barrier proves overlapping execution; the serial lock
+    // rejects overlap. Compiler startup speed is irrelevant to both checks.
+    for signals in [serial_signals.path(), parallel_signals.path()] {
+        for marker in ["a-started", "b-started", "a-finished", "b-finished"] {
+            assert!(signals.join(marker).is_file(), "missing {marker}");
+        }
+    }
 
     let log = Command::new(tong())
         .args([
@@ -207,6 +228,10 @@ fn failure_stops_admission_but_drains_and_publishes_running_successes() {
         let line = line.unwrap();
         events.push_str(&line);
         events.push('\n');
+        // Auto-lock notices may precede the JSON event stream.
+        if !line.starts_with('{') {
+            continue;
+        }
         let event: serde_json::Value = serde_json::from_str(&line).unwrap();
         if event["type"] == "action-blocked" && event["failed_dependency"] == "rust:bs-run:bad" {
             assert!(
@@ -219,13 +244,19 @@ fn failure_stops_admission_but_drains_and_publishes_running_successes() {
             fs::write(&release_slow, b"release").unwrap();
         }
         if event["type"] == "action-finished" && event["action"] == "rust:bs-run:slow" {
-            assert!(blocked, "slow finished before failure was observed: {events}");
+            assert!(
+                blocked,
+                "slow finished before failure was observed: {events}"
+            );
             assert_eq!(event["outcome"], "success");
             drained = true;
         }
     }
     assert!(!failed.wait().unwrap().success());
-    assert!(blocked, "failed descendants were not marked blocked: {events}");
+    assert!(
+        blocked,
+        "failed descendants were not marked blocked: {events}"
+    );
     assert!(
         drained,
         "the running successful action was not drained: {events}"
