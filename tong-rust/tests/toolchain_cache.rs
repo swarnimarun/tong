@@ -3,7 +3,8 @@
 //! on content and stat changes, corruption self-healing.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -23,7 +24,9 @@ fn real_rustc() -> PathBuf {
         .expect("rustc must be available to run this test");
     assert!(output.status.success(), "rustc --print sysroot failed");
     let sysroot = String::from_utf8(output.stdout).expect("sysroot not UTF-8");
-    PathBuf::from(sysroot.trim()).join("bin").join("rustc")
+    PathBuf::from(sysroot.trim())
+        .join("bin")
+        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// A fake sysroot. Capture stats and hashes its files; the wrapper answers
@@ -34,7 +37,13 @@ fn fake_sysroot(dir: &Path) -> PathBuf {
     let sysroot = dir.join("sysroot");
     fs::create_dir_all(sysroot.join("bin")).unwrap();
     fs::create_dir_all(sysroot.join("lib").join("rustlib")).unwrap();
-    fs::copy(real_rustc(), sysroot.join("bin").join("rustc")).unwrap();
+    fs::copy(
+        real_rustc(),
+        sysroot
+            .join("bin")
+            .join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
     fs::write(sysroot.join("bin").join("rust-lld"), b"fake lld").unwrap();
     fs::write(
         sysroot.join("lib").join("rustlib").join("libstd.rlib"),
@@ -52,17 +61,38 @@ fn fake_sysroot(dir: &Path) -> PathBuf {
 /// A rustc shim: answers `--print sysroot` with the fake sysroot and
 /// passes everything else through to the real rustc (`-vV`).
 fn rustc_wrapper(sysroot: &Path, dir: &Path) -> PathBuf {
-    let wrapper = dir.join("rustc-wrapper.sh");
+    let source = dir.join("rustc_wrapper.rs");
+    let wrapper = dir.join(format!("rustc-wrapper{}", std::env::consts::EXE_SUFFIX));
     fs::write(
-        &wrapper,
+        &source,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--print\" ] && [ \"$2\" = \"sysroot\" ]; then\n  echo \"{}\"\n  exit 0\nfi\nexec \"{}\" \"$@\"\n",
-            sysroot.display(),
-            real_rustc().display(),
+            r#"fn main() {{
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args == ["--print", "sysroot"] {{
+        println!("{{}}", {sysroot:?});
+        return;
+    }}
+    let status = std::process::Command::new({rustc:?})
+        .args(args).status().expect("run real rustc");
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#,
+            sysroot = sysroot.to_str().unwrap(),
+            rustc = real_rustc().to_str().unwrap(),
         ),
     )
     .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(real_rustc())
+        .arg(&source)
+        .arg("-o")
+        .arg(&wrapper)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "compile rustc wrapper: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     wrapper
 }
 
@@ -92,8 +122,49 @@ fn capture_manifest(cache_dir: &Path) -> PathBuf {
     entry.path().join("capture")
 }
 
-fn inode(path: &Path) -> u64 {
-    fs::metadata(path).unwrap().ino()
+#[cfg(unix)]
+fn file_identity(path: &Path) -> (u64, u64) {
+    let meta = fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> (u64, u64) {
+    use std::{ffi::c_void, mem::MaybeUninit, os::windows::io::AsRawHandle};
+
+    // BY_HANDLE_FILE_INFORMATION: DWORD fields and three FILETIME pairs.
+    // https://learn.microsoft.com/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information
+    #[repr(C)]
+    struct FileInfo {
+        attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(handle: *mut c_void, info: *mut FileInfo) -> i32;
+    }
+
+    let file = fs::File::open(path).unwrap();
+    let mut info = MaybeUninit::<FileInfo>::uninit();
+    // SAFETY: file owns a live handle and info is aligned, writable storage
+    // matching the documented Windows structure. Success initializes it.
+    let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    assert_ne!(success, 0, "file identity: {}", std::io::Error::last_os_error());
+    // SAFETY: the successful API call initialized every field above.
+    let info = unsafe { info.assume_init() };
+    (
+        u64::from(info.volume_serial),
+        (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+    )
 }
 
 /// Corrupts the cached `lib_tree` object's schema-version byte.
@@ -127,7 +198,7 @@ fn capture_cache_reuse_invalidation_and_self_healing() {
     let cas1 = Cas::open(tmp.path().join("store1")).unwrap();
     let r1 = capture(&cas1, &wrapper, &cache);
     let manifest = capture_manifest(&cache);
-    let manifest_ino = inode(&manifest);
+    let manifest_identity = file_identity(&manifest);
 
     // Fresh store + unchanged sysroot: the cache must restore the exact
     // capture. An untouched manifest proves the hit (no re-capture/store).
@@ -136,7 +207,7 @@ fn capture_cache_reuse_invalidation_and_self_healing() {
     assert_eq!(r2.rustc_blob, r1.rustc_blob);
     assert_eq!(r2.sysroot_tree, r1.sysroot_tree);
     assert_eq!(r2.bundle.digest(), r1.bundle.digest());
-    assert_eq!(inode(&manifest), manifest_ino, "expected a cache hit");
+    assert_eq!(file_identity(&manifest), manifest_identity, "expected a cache hit");
     // The restored objects are present in the fresh store.
     assert!(cas2.blob_path(r2.rustc_blob).is_some());
 
@@ -150,7 +221,7 @@ fn capture_cache_reuse_invalidation_and_self_healing() {
     let r3 = capture(&cas3, &wrapper, &cache);
     assert_ne!(r3.sysroot_tree, r1.sysroot_tree);
     assert_ne!(r3.bundle.digest(), r1.bundle.digest());
-    assert_ne!(inode(&manifest), manifest_ino);
+    assert_ne!(file_identity(&manifest), manifest_identity);
 
     // Stat-only change (restoring the content bumps mtime): re-capture,
     // but the content digests come back identical (safe false-dirty).

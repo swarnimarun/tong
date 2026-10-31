@@ -125,7 +125,9 @@ pub fn capture_system_rust(cas: &Cas) -> Result<SystemRust, ToolchainError> {
     //    under the sysroot — the binary that actually executes.
     let sysroot = run_toolchain(&rustc, &["--print", "sysroot"])?;
     let root = PathBuf::from(sysroot.trim());
-    let real_rustc = root.join("bin").join("rustc");
+    let real_rustc = root
+        .join("bin")
+        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     if !real_rustc.is_file() {
         return Err(ToolchainError::InvalidSysroot(root));
     }
@@ -344,7 +346,7 @@ fn first_line_of(text: &str) -> Option<&str> {
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
+        let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if candidate.is_file() {
             return Some(candidate);
         }
