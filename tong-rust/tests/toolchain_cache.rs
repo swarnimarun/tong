@@ -158,7 +158,12 @@ fn file_identity(path: &Path) -> (u64, u64) {
     // SAFETY: file owns a live handle and info is aligned, writable storage
     // matching the documented Windows structure. Success initializes it.
     let success = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
-    assert_ne!(success, 0, "file identity: {}", std::io::Error::last_os_error());
+    assert_ne!(
+        success,
+        0,
+        "file identity: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: the successful API call initialized every field above.
     let info = unsafe { info.assume_init() };
     (
@@ -207,7 +212,11 @@ fn capture_cache_reuse_invalidation_and_self_healing() {
     assert_eq!(r2.rustc_blob, r1.rustc_blob);
     assert_eq!(r2.sysroot_tree, r1.sysroot_tree);
     assert_eq!(r2.bundle.digest(), r1.bundle.digest());
-    assert_eq!(file_identity(&manifest), manifest_identity, "expected a cache hit");
+    assert_eq!(
+        file_identity(&manifest),
+        manifest_identity,
+        "expected a cache hit"
+    );
     // The restored objects are present in the fresh store.
     assert!(cas2.blob_path(r2.rustc_blob).is_some());
 
