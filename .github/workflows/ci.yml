@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [v1, cleanup/tong-ci-toolchain]
     paths:
       - ".github/workflows/ci.yml"
       - "Cargo.toml"
@@ -41,6 +41,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: clippy, rustfmt
 
       - name: Cache cargo
@@ -69,6 +70,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -88,6 +91,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -148,6 +153,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
