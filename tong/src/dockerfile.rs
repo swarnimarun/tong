@@ -169,12 +169,12 @@ pub fn generate(root: &Path, options: &Options) -> Result<Generated, BuildError>
         // planning captures the manifest-only trees and never executes
         // them in this stage.
         for dir in &member_dirs {
-            let rel = dir.to_string_lossy();
+            let rel = docker_relative_path(dir);
             lines.push(format!("COPY {rel}/Cargo.toml {rel}/Cargo.toml"));
         }
         // Path dependencies: full sources (their actions execute here).
         for (name, dir) in &path_deps {
-            let rel = dir.to_string_lossy();
+            let rel = docker_relative_path(dir);
             lines.push(format!(
                 "# Path dependency `{name}` (source edits bust this layer)."
             ));
@@ -223,6 +223,14 @@ pub fn generate(root: &Path, options: &Options) -> Result<Generated, BuildError>
 
 fn io_err(root: &Path, what: &str, err: std::io::Error) -> std::io::Error {
     std::io::Error::new(err.kind(), format!("{}: {}: {err}", root.display(), what))
+}
+
+// Dockerfile stages run in Linux containers even when generated on Windows.
+fn docker_relative_path(path: &Path) -> String {
+    path.iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]

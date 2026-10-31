@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn tong() -> &'static str {
@@ -159,26 +160,32 @@ fn failure_stops_admission_but_drains_and_publishes_running_successes() {
         .unwrap();
         fs::write(package.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
     }
-    let slow_started = root.join("slow-started");
+    // Synchronization files are outside the captured workspace inputs.
+    let signals = tempfile::tempdir().unwrap();
+    let slow_started = signals.path().join("slow-started");
+    let release_slow = signals.path().join("release-slow");
     fs::write(
         root.join("slow/build.rs"),
         format!(
             "fn main() {{ std::fs::write({slow_started:?}, b\"started\").unwrap(); \
-             std::thread::sleep(std::time::Duration::from_millis(1000)); }}\n"
+             for _ in 0..4800 {{ if std::path::Path::new({release_slow:?}).exists() \
+             {{ return; }} std::thread::sleep(std::time::Duration::from_millis(25)); }} \
+             panic!(\"scheduler did not release slow action\"); }}\n"
         ),
     )
     .unwrap();
     fs::write(
         root.join("bad/build.rs"),
         format!(
-            "fn main() {{ for _ in 0..200 {{ if std::path::Path::new({slow_started:?}).exists() \
+            "fn main() {{ for _ in 0..4800 {{ if std::path::Path::new({slow_started:?}).exists() \
              {{ panic!(\"expected failure\"); }} std::thread::sleep(std::time::Duration::from_millis(25)); }} \
              panic!(\"slow action never started\"); }}\n"
         ),
     )
     .unwrap();
 
-    let failed = Command::new(tong())
+    let stderr_file = tempfile::tempfile().unwrap();
+    let mut failed = Command::new(tong())
         .args([
             "--message-format",
             "json",
@@ -189,13 +196,39 @@ fn failure_stops_admission_but_drains_and_publishes_running_successes() {
         ])
         .current_dir(root)
         .env("TONG_RUSTC", rustc_path())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(stderr_file)
+        .spawn()
         .unwrap();
-    assert!(!failed.status.success());
+    let mut blocked = false;
+    let mut drained = false;
+    let mut events = String::new();
+    for line in BufReader::new(failed.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        events.push_str(&line);
+        events.push('\n');
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if event["type"] == "action-blocked" && event["failed_dependency"] == "rust:bs-run:bad" {
+            assert!(
+                slow_started.is_file(),
+                "failure happened before slow started"
+            );
+            blocked = true;
+            // Only release the successful action once the scheduler has
+            // observed the failure: this tests draining, not a timing race.
+            fs::write(&release_slow, b"release").unwrap();
+        }
+        if event["type"] == "action-finished" && event["action"] == "rust:bs-run:slow" {
+            assert!(blocked, "slow finished before failure was observed: {events}");
+            assert_eq!(event["outcome"], "success");
+            drained = true;
+        }
+    }
+    assert!(!failed.wait().unwrap().success());
+    assert!(blocked, "failed descendants were not marked blocked: {events}");
     assert!(
-        String::from_utf8_lossy(&failed.stdout).contains("\"type\":\"action-blocked\""),
-        "failed descendants were not marked blocked: {}",
-        String::from_utf8_lossy(&failed.stdout)
+        drained,
+        "the running successful action was not drained: {events}"
     );
 
     fs::write(root.join("bad/build.rs"), "fn main() {}\n").unwrap();
